@@ -1,17 +1,21 @@
 // src/kernel/mod.rs
 //
-// Task の状態（Ready / Running）＋ ReadyQueue を持つ簡易スケジューラに、
-// ★ runtime_ticks（累積実行時間）
-// ★ time_slice_used（今回の量子内で消費した tick 数）
-// ★ quantum（1タスクが連続で実行できる最大 tick 数）
-// を導入したバージョン。
+// formal-os: プリエンプティブ＋ReadyQueue＋Blocked状態付きミニカーネル
 //
-// - tick() ごとに Running タスクの runtime_ticks を 1 増やす。
-// - time_slice_used が quantum に達したら QuantumExpired イベントを記録し、
-//   ReadyQueue へ戻して次のタスクを Running にする（プリエンプティブ動作）。
-// - 状態遷移（KernelActivity）は純粋関数 next_activity_and_action() で管理。
-// - 副作用（タイマ更新・フレーム確保・スケジューリング）は tick() 内で実行。
-// - event_log に抽象イベントを保存し、dump_events() で最後に一覧表示する。
+// 機能:
+// - Task: TaskId + TaskState(Ready/Running/Blocked) + runtime_ticks + time_slice_used
+// - ReadyQueue: Ready なタスクのリングバッファ
+// - WaitQueue: Blocked なタスクのリングバッファ
+// - quantum: 1タスクが連続で実行できる最大 tick 数
+// - tick():
+//    1. KernelActivity の純粋状態遷移 (next_activity_and_action)
+//    2. 副作用: Timer / Frame allocation
+//    3. Running タスクの runtime 更新
+//    4. 疑似的な Block 処理（ときどきタスクを待ち状態にする）
+//    5. quantum 消費 → 使い切ったら QuantumExpired → schedule_next_task()
+//    6. Timer tick で Blocked から 1個だけ Wake（WaitQueue → ReadyQueue）
+// - 抽象イベントログ (LogEvent) に、各種状態遷移・スケジューリング・Blocked/Wake を記録し、
+//   dump_events() で最後に一覧表示する。
 
 use bootloader::BootInfo;
 use crate::{arch, logging};
@@ -29,10 +33,11 @@ const EVENT_LOG_CAP: usize = 256;
 #[derive(Clone, Copy)]
 pub struct TaskId(pub u64);
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TaskState {
     Ready,
     Running,
+    Blocked,
 }
 
 #[derive(Clone, Copy)]
@@ -40,7 +45,7 @@ pub struct Task {
     pub id: TaskId,
     pub state: TaskState,
     pub runtime_ticks: u64,   // タスクの累積実行時間
-    pub time_slice_used: u64, // 現在の量子内で使った tick 数
+    pub time_slice_used: u64, // 現在の量子内で消費した tick 数
 }
 
 //
@@ -58,8 +63,10 @@ pub enum LogEvent {
     TaskStateChanged(TaskId, TaskState),
     ReadyQueued(TaskId),
     ReadyDequeued(TaskId),
+    WaitQueued(TaskId),
+    WaitDequeued(TaskId),
     RuntimeUpdated(TaskId, u64),
-    QuantumExpired(TaskId, u64), // ★ quantum 使い切り
+    QuantumExpired(TaskId, u64),
 }
 
 //
@@ -108,11 +115,17 @@ pub struct KernelState {
     rq_tail: usize,
     rq_len: usize,
 
+    // WaitQueue（Blocked なタスク index のリングバッファ）
+    wait_queue: [usize; MAX_TASKS],
+    wq_head: usize,
+    wq_tail: usize,
+    wq_len: usize,
+
     // 抽象イベントログ
     event_log: [Option<LogEvent>; EVENT_LOG_CAP],
     event_log_len: usize,
 
-    // ★ 量子（1タスクが連続して実行できる最大 tick 数）
+    // 量子（1タスクが連続で実行できる最大 tick 数）
     quantum: u64,
 }
 
@@ -120,7 +133,7 @@ impl KernelState {
     pub fn new(boot_info: &'static BootInfo) -> Self {
         let phys_mem = PhysicalMemoryManager::new(boot_info);
 
-        // runtime_ticks = 0, time_slice_used = 0 で初期化。
+        // 全タスク runtime_ticks = 0, time_slice_used = 0 で初期化。
         // Task 1 のみ Running、それ以外は Ready。
         let tasks = [
             Task {
@@ -143,8 +156,8 @@ impl KernelState {
             },
         ];
 
-        // ReadyQueue に「最初は 2, 3 を Ready として入れておく」
-        let ready_queue = [1, 2, 0]; // 実際使うのは rq_len 分だけ。
+        // ReadyQueue: 最初は [2, 3] が Ready
+        let ready_queue = [1, 2, 0];
         let rq_len = 2usize;
 
         KernelState {
@@ -163,10 +176,14 @@ impl KernelState {
             rq_tail: rq_len,
             rq_len,
 
+            wait_queue: [0; MAX_TASKS],
+            wq_head: 0,
+            wq_tail: 0,
+            wq_len: 0,
+
             event_log: [None; EVENT_LOG_CAP],
             event_log_len: 0,
 
-            // ★ 量子（例: 5 tick）
             quantum: 5,
         }
     }
@@ -229,6 +246,37 @@ impl KernelState {
 
     //
     // ──────────────────────────────────────────────
+    // WaitQueue 操作（Blocked タスク）
+    // ──────────────────────────────────────────────
+    //
+
+    fn enqueue_wait(&mut self, idx: usize) {
+        if self.wq_len >= MAX_TASKS {
+            return;
+        }
+        self.wait_queue[self.wq_tail] = idx;
+        self.wq_tail = (self.wq_tail + 1) % MAX_TASKS;
+        self.wq_len += 1;
+
+        let tid = self.tasks[idx].id;
+        self.push_event(LogEvent::WaitQueued(tid));
+    }
+
+    fn dequeue_wait(&mut self) -> Option<usize> {
+        if self.wq_len == 0 {
+            return None;
+        }
+        let idx = self.wait_queue[self.wq_head];
+        self.wq_head = (self.wq_head + 1) % MAX_TASKS;
+        self.wq_len -= 1;
+
+        let tid = self.tasks[idx].id;
+        self.push_event(LogEvent::WaitDequeued(tid));
+        Some(idx)
+    }
+
+    //
+    // ──────────────────────────────────────────────
     // スケジューラ：Running → ReadyQueue, ReadyQueue → Running
     // ──────────────────────────────────────────────
     //
@@ -237,35 +285,30 @@ impl KernelState {
         let prev_idx = self.current_task;
         let prev_id = self.tasks[prev_idx].id;
 
-        // Running → Ready に戻して ReadyQueue へ
-        self.tasks[prev_idx].state = TaskState::Ready;
-        self.tasks[prev_idx].time_slice_used = 0; // 使い切った量子をリセット
-        self.push_event(LogEvent::TaskStateChanged(prev_id, TaskState::Ready));
-        self.enqueue_ready(prev_idx);
+        // ★ Running → Ready に戻して ReadyQueue へ（Block されている場合はここまで来ない前提）
+        if self.tasks[prev_idx].state == TaskState::Running {
+            self.tasks[prev_idx].state = TaskState::Ready;
+            self.tasks[prev_idx].time_slice_used = 0;
+            self.push_event(LogEvent::TaskStateChanged(prev_id, TaskState::Ready));
+            self.enqueue_ready(prev_idx);
+        }
 
-        // ReadyQueue から次のタスクを取り出して Running にする
+        // ReadyQueue → Running
         if let Some(next_idx) = self.dequeue_ready() {
             let next_id = self.tasks[next_idx].id;
 
             self.tasks[next_idx].state = TaskState::Running;
-            self.tasks[next_idx].time_slice_used = 0; // 新たな量子開始
+            self.tasks[next_idx].time_slice_used = 0;
             self.current_task = next_idx;
 
             logging::info(" switched to task");
             logging::info_u64(" task_id", next_id.0);
 
             self.push_event(LogEvent::TaskSwitched(next_id));
-            self.push_event(LogEvent::TaskStateChanged(
-                next_id,
-                TaskState::Running,
-            ));
+            self.push_event(LogEvent::TaskStateChanged(next_id, TaskState::Running));
         } else {
-            // ReadyQueue が空なら、元のタスクを Running に戻す（フォールバック）
-            self.tasks[prev_idx].state = TaskState::Running;
-            self.push_event(LogEvent::TaskStateChanged(
-                prev_id,
-                TaskState::Running,
-            ));
+            // ReadyQueue が空なら、実行可能なタスクが無い → そのまま停止方向
+            logging::info(" no ready tasks; scheduler idle");
         }
     }
 
@@ -306,12 +349,62 @@ impl KernelState {
         logging::info_u64(" time_slice_used", used);
 
         if used >= self.quantum {
-            // 量子を使い切った
             logging::info(" quantum expired; scheduling next task");
             self.push_event(LogEvent::QuantumExpired(tid, used));
-
-            // 次のタスクへ切り替え
             self.schedule_next_task();
+        }
+    }
+
+    //
+    // ──────────────────────────────────────────────
+    // 疑似的な Blocked 処理:
+    //   - 特定条件で現在のタスクを Blocked にする
+    //   - Block されたタスクは WaitQueue へ送る
+    // ──────────────────────────────────────────────
+    //
+
+    fn maybe_block_current_task(&mut self) {
+        // デモ用ルール:
+        // - tick_count が 0 でなく、かつ 7 の倍数のとき
+        // - かつ 現在の task_id が 2 のとき
+        if self.tick_count != 0
+            && self.tick_count % 7 == 0
+            && self.tasks[self.current_task].id.0 == 2
+        {
+            let idx = self.current_task;
+            let tid = self.tasks[idx].id;
+
+            logging::info(" blocking current task (fake I/O wait)");
+            self.tasks[idx].state = TaskState::Blocked;
+            self.tasks[idx].time_slice_used = 0;
+
+            self.push_event(LogEvent::TaskStateChanged(tid, TaskState::Blocked));
+
+            // WaitQueue に入れて、次のタスクへ切り替え
+            self.enqueue_wait(idx);
+            self.schedule_next_task();
+        }
+    }
+
+    //
+    // ──────────────────────────────────────────────
+    // 疑似的な Wake 処理:
+    //   - Timer 更新のタイミングで WaitQueue から 1タスクだけ取り出し、
+    //     Ready 状態に戻す
+    // ──────────────────────────────────────────────
+    //
+
+    fn maybe_wake_one_task(&mut self) {
+        if let Some(idx) = self.dequeue_wait() {
+            let tid = self.tasks[idx].id;
+
+            logging::info(" waking 1 blocked task");
+            self.tasks[idx].state = TaskState::Ready;
+
+            self.push_event(LogEvent::TaskStateChanged(tid, TaskState::Ready));
+
+            // ReadyQueue に戻しておく
+            self.enqueue_ready(idx);
         }
     }
 
@@ -338,7 +431,7 @@ impl KernelState {
 
         let (next_activity, action) = next_activity_and_action(self.activity);
 
-        // 副作用：タイマ / フレーム割当
+        // 副作用：タイマ / フレーム割り当て
         match action {
             KernelAction::None => {
                 logging::info(" action = None");
@@ -348,6 +441,9 @@ impl KernelState {
                 self.time_ticks += 1;
                 logging::info_u64(" time_ticks", self.time_ticks);
                 self.push_event(LogEvent::TimerUpdated(self.time_ticks));
+
+                // Timer 更新のタイミングで 1タスクだけ Wake してみる
+                self.maybe_wake_one_task();
             }
             KernelAction::AllocateFrame => {
                 logging::info(" action = AllocateFrame");
@@ -361,10 +457,13 @@ impl KernelState {
             }
         }
 
-        // ★ Running タスクの累積 runtime を更新
+        // Running タスクの累積 runtime を更新
         self.update_runtime();
 
-        // ★ time_slice を 1 tick 消費し、量子に達したらスケジューリング
+        // 疑似的に「時々 Blocked にする」
+        self.maybe_block_current_task();
+
+        // quantum 消費と、必要ならスケジューラ発動
         self.update_time_slice_and_maybe_schedule();
 
         // 次の KernelActivity へ
@@ -421,6 +520,7 @@ fn log_event_to_vga(ev: LogEvent) {
             match state {
                 TaskState::Ready => logging::info(" to READY"),
                 TaskState::Running => logging::info(" to RUNNING"),
+                TaskState::Blocked => logging::info(" to BLOCKED"),
             }
         }
         LogEvent::ReadyQueued(tid) => {
@@ -429,6 +529,14 @@ fn log_event_to_vga(ev: LogEvent) {
         }
         LogEvent::ReadyDequeued(tid) => {
             logging::info("EVENT: ReadyDequeued");
+            logging::info_u64(" task", tid.0);
+        }
+        LogEvent::WaitQueued(tid) => {
+            logging::info("EVENT: WaitQueued");
+            logging::info_u64(" task", tid.0);
+        }
+        LogEvent::WaitDequeued(tid) => {
+            logging::info("EVENT: WaitDequeued");
             logging::info_u64(" task", tid.0);
         }
         LogEvent::RuntimeUpdated(tid, rt) => {
