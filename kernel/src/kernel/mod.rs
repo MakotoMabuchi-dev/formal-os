@@ -1,21 +1,23 @@
 // src/kernel/mod.rs
 //
-// formal-os: プリエンプティブ＋ReadyQueue＋Blocked状態付きミニカーネル
+// formal-os: 優先度付きプリエンプティブ＋ReadyQueue＋Blocked状態付きミニカーネル
 //
-// 機能:
-// - Task: TaskId + TaskState(Ready/Running/Blocked) + runtime_ticks + time_slice_used
-// - ReadyQueue: Ready なタスクのリングバッファ
-// - WaitQueue: Blocked なタスクのリングバッファ
+// 機能概要:
+// - Task: TaskId + TaskState(Ready/Running/Blocked) + runtime_ticks + time_slice_used + priority
+// - ReadyQueue: Ready なタスク index のリングバッファ（順序は抽象化される）
+// - WaitQueue: Blocked なタスク index のリングバッファ
 // - quantum: 1タスクが連続で実行できる最大 tick 数
+// - 優先度付きスケジューリング:
+//   - ReadyQueue の中から「priority が最大」のタスクを選んで Running にする
 // - tick():
 //    1. KernelActivity の純粋状態遷移 (next_activity_and_action)
-//    2. 副作用: Timer / Frame allocation
+//    2. タイマ / フレーム割当（副作用）
 //    3. Running タスクの runtime 更新
-//    4. 疑似的な Block 処理（ときどきタスクを待ち状態にする）
-//    5. quantum 消費 → 使い切ったら QuantumExpired → schedule_next_task()
-//    6. Timer tick で Blocked から 1個だけ Wake（WaitQueue → ReadyQueue）
-// - 抽象イベントログ (LogEvent) に、各種状態遷移・スケジューリング・Blocked/Wake を記録し、
-//   dump_events() で最後に一覧表示する。
+//    4. 疑似的 Blocked 処理（ときどき TaskState::Blocked にする）
+//    5. quantum 消費と QuantumExpired イベント
+//    6. 必要に応じてスケジューラ発動（優先度を考慮）
+//    7. Timer tick で Blocked から 1タスクだけ Wake (WaitQueue → ReadyQueue)
+// - 抽象イベントログ(LogEvent) にすべての状態遷移・スケジューリングを記録し、dump_events() でダンプ。
 
 use bootloader::BootInfo;
 use crate::{arch, logging};
@@ -46,6 +48,7 @@ pub struct Task {
     pub state: TaskState,
     pub runtime_ticks: u64,   // タスクの累積実行時間
     pub time_slice_used: u64, // 現在の量子内で消費した tick 数
+    pub priority: u8,         // ★ 優先度（大きいほど優先）
 }
 
 //
@@ -133,30 +136,32 @@ impl KernelState {
     pub fn new(boot_info: &'static BootInfo) -> Self {
         let phys_mem = PhysicalMemoryManager::new(boot_info);
 
-        // 全タスク runtime_ticks = 0, time_slice_used = 0 で初期化。
-        // Task 1 のみ Running、それ以外は Ready。
+        // ★ priority を付与（例: Task1=1, Task2=3, Task3=2）
         let tasks = [
             Task {
                 id: TaskId(1),
                 state: TaskState::Running,
                 runtime_ticks: 0,
                 time_slice_used: 0,
+                priority: 1,
             },
             Task {
                 id: TaskId(2),
                 state: TaskState::Ready,
                 runtime_ticks: 0,
                 time_slice_used: 0,
+                priority: 3, // 一番高い
             },
             Task {
                 id: TaskId(3),
                 state: TaskState::Ready,
                 runtime_ticks: 0,
                 time_slice_used: 0,
+                priority: 2,
             },
         ];
 
-        // ReadyQueue: 最初は [2, 3] が Ready
+        // ReadyQueue: 最初は [2, 3] が Ready（順序は後で priority で再解釈）
         let ready_queue = [1, 2, 0];
         let rq_len = 2usize;
 
@@ -231,17 +236,42 @@ impl KernelState {
         self.push_event(LogEvent::ReadyQueued(tid));
     }
 
-    fn dequeue_ready(&mut self) -> Option<usize> {
+    /// ReadyQueue から「priority が最大のタスク index」を選んで取り出す。
+    fn dequeue_ready_highest_priority(&mut self) -> Option<usize> {
         if self.rq_len == 0 {
             return None;
         }
-        let idx = self.ready_queue[self.rq_head];
-        self.rq_head = (self.rq_head + 1) % MAX_TASKS;
+
+        // ReadyQueue 内から最も priority の高いタスクを探す
+        let mut best_pos: usize = self.rq_head;
+        let mut best_idx: usize = self.ready_queue[self.rq_head];
+        let mut best_prio: u8 = self.tasks[best_idx].priority;
+
+        for offset in 1..self.rq_len {
+            let pos = (self.rq_head + offset) % MAX_TASKS;
+            let idx = self.ready_queue[pos];
+            let prio = self.tasks[idx].priority;
+
+            if prio > best_prio {
+                best_prio = prio;
+                best_idx = idx;
+                best_pos = pos;
+            }
+        }
+
+        // best_pos から 1 要素取り出す。
+        // 「最後の要素」を best_pos に移して穴を埋める簡易実装。
+        let last_pos = (self.rq_head + self.rq_len - 1) % MAX_TASKS;
+        self.ready_queue[best_pos] = self.ready_queue[last_pos];
+
+        // tail と長さを更新
+        self.rq_tail = (self.rq_head + self.rq_len - 1) % MAX_TASKS;
         self.rq_len -= 1;
 
-        let tid = self.tasks[idx].id;
+        let tid = self.tasks[best_idx].id;
         self.push_event(LogEvent::ReadyDequeued(tid));
-        Some(idx)
+
+        Some(best_idx)
     }
 
     //
@@ -277,7 +307,7 @@ impl KernelState {
 
     //
     // ──────────────────────────────────────────────
-    // スケジューラ：Running → ReadyQueue, ReadyQueue → Running
+    // スケジューラ：Running → ReadyQueue, ReadyQueue → Running（優先度付き）
     // ──────────────────────────────────────────────
     //
 
@@ -285,7 +315,7 @@ impl KernelState {
         let prev_idx = self.current_task;
         let prev_id = self.tasks[prev_idx].id;
 
-        // ★ Running → Ready に戻して ReadyQueue へ（Block されている場合はここまで来ない前提）
+        // Running → Ready に戻して ReadyQueue へ（Block されている場合はここまで来ない前提）
         if self.tasks[prev_idx].state == TaskState::Running {
             self.tasks[prev_idx].state = TaskState::Ready;
             self.tasks[prev_idx].time_slice_used = 0;
@@ -293,8 +323,8 @@ impl KernelState {
             self.enqueue_ready(prev_idx);
         }
 
-        // ReadyQueue → Running
-        if let Some(next_idx) = self.dequeue_ready() {
+        // ReadyQueue から「priority 最大」のタスクを選ぶ
+        if let Some(next_idx) = self.dequeue_ready_highest_priority() {
             let next_id = self.tasks[next_idx].id;
 
             self.tasks[next_idx].state = TaskState::Running;
@@ -303,11 +333,15 @@ impl KernelState {
 
             logging::info(" switched to task");
             logging::info_u64(" task_id", next_id.0);
+            logging::info_u64(" priority", self.tasks[next_idx].priority as u64);
 
             self.push_event(LogEvent::TaskSwitched(next_id));
-            self.push_event(LogEvent::TaskStateChanged(next_id, TaskState::Running));
+            self.push_event(LogEvent::TaskStateChanged(
+                next_id,
+                TaskState::Running,
+            ));
         } else {
-            // ReadyQueue が空なら、実行可能なタスクが無い → そのまま停止方向
+            // ReadyQueue が空なら、実行可能なタスクが無い
             logging::info(" no ready tasks; scheduler idle");
         }
     }
@@ -358,8 +392,6 @@ impl KernelState {
     //
     // ──────────────────────────────────────────────
     // 疑似的な Blocked 処理:
-    //   - 特定条件で現在のタスクを Blocked にする
-    //   - Block されたタスクは WaitQueue へ送る
     // ──────────────────────────────────────────────
     //
 
@@ -389,8 +421,6 @@ impl KernelState {
     //
     // ──────────────────────────────────────────────
     // 疑似的な Wake 処理:
-    //   - Timer 更新のタイミングで WaitQueue から 1タスクだけ取り出し、
-    //     Ready 状態に戻す
     // ──────────────────────────────────────────────
     //
 
@@ -463,7 +493,7 @@ impl KernelState {
         // 疑似的に「時々 Blocked にする」
         self.maybe_block_current_task();
 
-        // quantum 消費と、必要ならスケジューラ発動
+        // quantum 消費と、必要ならスケジューラ発動（優先度付き）
         self.update_time_slice_and_maybe_schedule();
 
         // 次の KernelActivity へ
