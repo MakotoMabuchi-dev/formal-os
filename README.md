@@ -1,29 +1,37 @@
-# formal-os
+## formal-os – build & run
 
-A minimal x86_64 OS kernel written in Rust.  
-Boots successfully on QEMU using a custom target specification and the `bootloader` crate.
+This project uses bootloader v0.9 + bootimage to build a bootable disk image
+and runs on QEMU as a BIOS-boot x86_64 environment.
 
-## Features
-- Custom target (`x86_64-formal-os.json`)
-- Rust `no_std` + `no_main` environment
-- Bootloader integration (bootimage)
-- Runs on QEMU (macOS native)
-
-## How to build
-
+### Build requirements
 ```bash
-rustup toolchain install nightly
-rustup +nightly target add x86_64-unknown-none
-rustup +nightly component add llvm-tools-preview rust-src
-
-cargo +nightly bootimage
+rustup component add rust-src
+cargo install bootimage
 ```
 
-## How to run
+### Build (kernel + bootloader)
+```bash
+cargo bootimage -p kernel --target x86_64-formal-os-local.json
+```
+
+The bootable image is generated at:
 
 ```bash
+target/x86_64-formal-os-local/debug/bootimage-kernel.bin
+```
+
+### Run on QEMU
+```bash
 qemu-system-x86_64 \
-  -drive format=raw,file=target/x86_64-formal-os/debug/bootimage-kernel.bin \
-  -m 512M \
-  -serial stdio
+-drive format=raw,file=target/x86_64-formal-os-local/debug/bootimage-kernel.bin \
+-m 512M \
+-serial stdio
+```
+
+### Automated scripts
+
+For convenience:
+```bash
+scripts/build-kernel.sh
+scripts/run-qemu-debug.sh
 ```

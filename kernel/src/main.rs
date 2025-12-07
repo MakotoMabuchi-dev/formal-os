@@ -1,26 +1,30 @@
 #![no_std]
 #![no_main]
 
-use core::panic::PanicInfo;
+// ───────────────────────────────────────────────────────────
+// formal-os: pre-formal verification kernel (前身版)
+//
+// - フォーマル検証しやすい構造だけを残す
+// - unsafe を arch 層に封じ込める
+// - カーネルロジック(kernel/)は純粋で単純な形を維持する
+// ───────────────────────────────────────────────────────────
 
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    loop {}
-}
+mod arch;
+mod logging;
+mod kernel;
+mod panic;
 
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
-    let vga_buffer = 0xb8000 as *mut u8;
+use bootloader::{entry_point, BootInfo};
 
-    let message = b"Hello formal-os!";
-    let color: u8 = 0x0f;
+entry_point!(kernel_main);
 
-    unsafe {
-        for (i, &ch) in message.iter().enumerate() {
-            *vga_buffer.add(i * 2) = ch;
-            *vga_buffer.add(i * 2 + 1) = color;
-        }
-    }
+fn kernel_main(boot_info: &'static BootInfo) -> ! {
+    logging::init();
+    arch::init(boot_info);
 
-    loop {}
+    logging::info("formal-os: kernel_main start");
+
+    kernel::start(boot_info);
+
+    arch::halt_loop()
 }
