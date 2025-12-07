@@ -1,33 +1,55 @@
 // src/kernel/mod.rs
 //
-// 【新要素】TaskId と簡易スケジューラを導入。
-// KernelState に「擬似タスク」を追加し、tick ごとに Running タスクを切り替える。
-// これにより、フォーマル検証しやすい “状態機械としての OS” がさらに明確になる。
+// Task の状態（Ready / Running）を導入し、
+// tickごとに Running → Ready → Running … と切り替える簡易スケジューラを構築。
+// LogEvent に TaskStateChanged を追加し、OS の内部状態遷移を可視化する。
 
 use bootloader::BootInfo;
 use crate::{arch, logging};
 use crate::mm::PhysicalMemoryManager;
 
 //
-// ★ TaskId: 擬似タスク
+// ──────────────────────────────────────────────
+// Task, TaskState, TaskId
+// ──────────────────────────────────────────────
 //
+
 #[derive(Clone, Copy)]
 pub struct TaskId(pub u64);
 
+#[derive(Clone, Copy)]
+pub enum TaskState {
+    Ready,
+    Running,
+}
+
+#[derive(Clone, Copy)]
+pub struct Task {
+    pub id: TaskId,
+    pub state: TaskState,
+}
+
 //
-// ★ LogEvent（抽象ログイベント）
+// ──────────────────────────────────────────────
+// LogEvent（抽象イベント）
+// ──────────────────────────────────────────────
 //
+
 #[derive(Clone, Copy)]
 pub enum LogEvent {
     TickStarted(u64),
     TimerUpdated(u64),
     FrameAllocated,
-    TaskSwitched(TaskId),   // ★ 新イベント
+    TaskSwitched(TaskId),
+    TaskStateChanged(TaskId, TaskState),   // ★ 新イベント
 }
 
 //
-// ★ KernelActivity（カーネルが現在行っている活動状態）
+// ──────────────────────────────────────────────
+// KernelActivity（カーネルの状態マシン）
+// ──────────────────────────────────────────────
 //
+
 #[derive(Clone, Copy)]
 pub enum KernelActivity {
     Idle,
@@ -35,8 +57,6 @@ pub enum KernelActivity {
     AllocatingFrame,
 }
 
-//
-// ★ KernelAction（この tick で行うべき副作用）
 #[derive(Clone, Copy)]
 enum KernelAction {
     None,
@@ -45,12 +65,11 @@ enum KernelAction {
 }
 
 //
-// ★ KernelState（カーネル全体の状態）
-//   今回:
-//     - tasks: 擬似タスク一覧
-//     - current_task: 今動作中のタスクインデックス
-//     - TaskSwitched イベントの追加
+// ──────────────────────────────────────────────
+// KernelState（カーネル全体の状態）
+// ──────────────────────────────────────────────
 //
+
 pub struct KernelState {
     phys_mem: PhysicalMemoryManager,
 
@@ -60,13 +79,13 @@ pub struct KernelState {
     should_halt: bool,
     activity: KernelActivity,
 
-    // ★ 擬似タスク
-    tasks: [TaskId; 3],
+    // ★ Task array
+    tasks: [Task; 3],
     num_tasks: usize,
     current_task: usize,
 
     // ★ 抽象イベントログ
-    event_log: [Option<LogEvent>; 128],
+    event_log: [Option<LogEvent>; 256],
     event_log_len: usize,
 }
 
@@ -81,12 +100,16 @@ impl KernelState {
             should_halt: false,
             activity: KernelActivity::Idle,
 
-            // ★ 擬似タスク初期化
-            tasks: [TaskId(1), TaskId(2), TaskId(3)],
+            // ★ Task 初期化：最初のタスクだけ Running
+            tasks: [
+                Task { id: TaskId(1), state: TaskState::Running },
+                Task { id: TaskId(2), state: TaskState::Ready },
+                Task { id: TaskId(3), state: TaskState::Ready },
+            ],
             num_tasks: 3,
-            current_task: 0,
+            current_task: 0, // Task 1 が最初に実行中
 
-            event_log: [None; 128],
+            event_log: [None; 256],
             event_log_len: 0,
         }
     }
@@ -116,19 +139,43 @@ impl KernelState {
         }
     }
 
-    /// ★ 最小スケジューラ：
-    /// current_task を 1 歩進める（ラウンドロビン）
+    //
+    // ──────────────────────────────────────────────
+    // ★ 簡易スケジューラ：状態遷移ベースで Running タスクを切り替える
+    // ──────────────────────────────────────────────
+    //
     fn schedule_next_task(&mut self) {
-        self.current_task = (self.current_task + 1) % self.num_tasks;
-        let next_id = self.tasks[self.current_task];
+        let prev_task = self.current_task;
+
+        // Running → Ready
+        self.tasks[prev_task].state = TaskState::Ready;
+        self.push_event(LogEvent::TaskStateChanged(
+            self.tasks[prev_task].id,
+            TaskState::Ready,
+        ));
+
+        // 次のタスクへ移動（ラウンドロビン）
+        let next = (self.current_task + 1) % self.num_tasks;
+
+        // Ready → Running
+        self.tasks[next].state = TaskState::Running;
+        self.current_task = next;
 
         logging::info(" switched to task");
-        logging::info_u64(" task_id", next_id.0);
+        logging::info_u64(" task_id", self.tasks[next].id.0);
 
-        // ★ 抽象ログにも記録
-        self.push_event(LogEvent::TaskSwitched(next_id));
+        self.push_event(LogEvent::TaskSwitched(self.tasks[next].id));
+        self.push_event(LogEvent::TaskStateChanged(
+            self.tasks[next].id,
+            TaskState::Running,
+        ));
     }
 
+    //
+    // ──────────────────────────────────────────────
+    // tick（OS の 1 ステップ）
+    // ──────────────────────────────────────────────
+    //
     pub fn tick(&mut self) {
         if self.should_halt {
             return;
@@ -136,17 +183,16 @@ impl KernelState {
 
         self.tick_count += 1;
 
-        // ===== Tick メタログ =====
         logging::info("KernelState::tick()");
         logging::info_u64(" tick_count", self.tick_count);
+
         self.push_event(LogEvent::TickStarted(self.tick_count));
 
-        logging::info_u64(" running_task", self.tasks[self.current_task].0);
+        logging::info_u64(" running_task", self.tasks[self.current_task].id.0);
 
-        // ===== 状態遷移 =====
         let (next_activity, action) = next_activity_and_action(self.activity);
 
-        // ===== 副作用 =====
+        // ★ 副作用
         match action {
             KernelAction::None => {
                 logging::info(" action = None");
@@ -174,10 +220,9 @@ impl KernelState {
             }
         }
 
-        // ===== ★ スケジューラの呼び出し =====
+        // ★ タスク切り替え
         self.schedule_next_task();
 
-        // ===== 次の状態へ移行 =====
         self.activity = next_activity;
     }
 
@@ -185,21 +230,19 @@ impl KernelState {
         self.should_halt
     }
 
-    /// ★ 抽象ログを VGA 出力にダンプ
     pub fn dump_events(&self) {
         logging::info("=== KernelState Event Log Dump ===");
-
         for i in 0..self.event_log_len {
             if let Some(ev) = self.event_log[i] {
                 log_event_to_vga(ev);
             }
         }
-
         logging::info("=== End of Event Log ===");
     }
 }
 
-//// LogEvent を VGA に出力（副作用）
+//
+// LogEvent を VGA に出力（副作用）
 //
 fn log_event_to_vga(ev: LogEvent) {
     match ev {
@@ -218,34 +261,46 @@ fn log_event_to_vga(ev: LogEvent) {
             logging::info("EVENT: TaskSwitched");
             logging::info_u64(" task", tid.0);
         }
+        LogEvent::TaskStateChanged(tid, state) => {
+            logging::info("EVENT: TaskStateChanged");
+            logging::info_u64(" task", tid.0);
+            match state {
+                TaskState::Ready => logging::info(" to READY"),
+                TaskState::Running => logging::info(" to RUNNING"),
+            }
+        }
     }
 }
 
-/// ★純粋な状態遷移関数
+//
+// 純粋な状態遷移関数（Next）
+//
 fn next_activity_and_action(current: KernelActivity)
                             -> (KernelActivity, KernelAction)
 {
     match current {
-        KernelActivity::Idle => {
-            (KernelActivity::UpdatingTimer, KernelAction::None)
-        }
-        KernelActivity::UpdatingTimer => {
-            (KernelActivity::AllocatingFrame, KernelAction::UpdateTimer)
-        }
-        KernelActivity::AllocatingFrame => {
-            (KernelActivity::Idle, KernelAction::AllocateFrame)
-        }
+        KernelActivity::Idle =>
+            (KernelActivity::UpdatingTimer, KernelAction::None),
+
+        KernelActivity::UpdatingTimer =>
+            (KernelActivity::AllocatingFrame, KernelAction::UpdateTimer),
+
+        KernelActivity::AllocatingFrame =>
+            (KernelActivity::Idle, KernelAction::AllocateFrame),
     }
 }
 
-/// カーネル開始点
+//
+// カーネル開始点
+//
 pub fn start(boot_info: &'static BootInfo) {
     logging::info("kernel::start()");
+
     let mut kstate = KernelState::new(boot_info);
 
     kstate.bootstrap();
 
-    let max_ticks = 30;
+    let max_ticks = 40;
     for _ in 0..max_ticks {
         if kstate.should_halt() {
             logging::info("KernelState requested halt; stop ticking");
@@ -254,7 +309,6 @@ pub fn start(boot_info: &'static BootInfo) {
         kstate.tick();
     }
 
-    // 終了前に抽象ログを表示
     kstate.dump_events();
 
     arch::halt_loop();
