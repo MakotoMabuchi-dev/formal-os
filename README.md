@@ -17,9 +17,13 @@ rustup +nightly target add x86_64-unknown-none
 rustup +nightly component add llvm-tools-preview rust-src
 
 cargo +nightly bootimage
+```
 
 ## How to run
+
+```bash
 qemu-system-x86_64 \
   -drive format=raw,file=target/x86_64-formal-os/debug/bootimage-kernel.bin \
   -m 512M \
   -serial stdio
+```
