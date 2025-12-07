@@ -1,12 +1,17 @@
 // src/kernel/mod.rs
 //
-// Task の状態（Ready / Running）と ReadyQueue を導入した簡易スケジューラ版。
-// - TaskId / Task / TaskState で擬似タスクを表現。
-// - KernelState に ReadyQueue を持たせ、tick ごとに Running → ReadyQueue → Running を切り替える。
-// - LogEvent に TaskSwitched / TaskStateChanged / ReadyQueued / ReadyDequeued を記録。
-// - 状態遷移（KernelActivity）は純粋関数 next_activity_and_action で管理。
-// - 副作用（タイマ更新・フレーム確保・タスク切り替え）は tick() 内で実行。
-// - event_log に抽象イベントを貯め、dump_events() で最後にまとめて表示する。
+// Task の状態（Ready / Running）＋ ReadyQueue を持つ簡易スケジューラに、
+// ★ runtime_ticks（累積実行時間）
+// ★ time_slice_used（今回の量子内で消費した tick 数）
+// ★ quantum（1タスクが連続で実行できる最大 tick 数）
+// を導入したバージョン。
+//
+// - tick() ごとに Running タスクの runtime_ticks を 1 増やす。
+// - time_slice_used が quantum に達したら QuantumExpired イベントを記録し、
+//   ReadyQueue へ戻して次のタスクを Running にする（プリエンプティブ動作）。
+// - 状態遷移（KernelActivity）は純粋関数 next_activity_and_action() で管理。
+// - 副作用（タイマ更新・フレーム確保・スケジューリング）は tick() 内で実行。
+// - event_log に抽象イベントを保存し、dump_events() で最後に一覧表示する。
 
 use bootloader::BootInfo;
 use crate::{arch, logging};
@@ -34,6 +39,8 @@ pub enum TaskState {
 pub struct Task {
     pub id: TaskId,
     pub state: TaskState,
+    pub runtime_ticks: u64,   // タスクの累積実行時間
+    pub time_slice_used: u64, // 現在の量子内で使った tick 数
 }
 
 //
@@ -51,11 +58,13 @@ pub enum LogEvent {
     TaskStateChanged(TaskId, TaskState),
     ReadyQueued(TaskId),
     ReadyDequeued(TaskId),
+    RuntimeUpdated(TaskId, u64),
+    QuantumExpired(TaskId, u64), // ★ quantum 使い切り
 }
 
 //
 // ──────────────────────────────────────────────
-// KernelActivity（カーネルの活動状態）
+// KernelActivity（カーネル内部の状態マシン）
 // ──────────────────────────────────────────────
 //
 
@@ -75,7 +84,7 @@ enum KernelAction {
 
 //
 // ──────────────────────────────────────────────
-// KernelState（カーネル全体の状態）
+// KernelState（OS全体の状態）
 // ──────────────────────────────────────────────
 //
 
@@ -88,35 +97,54 @@ pub struct KernelState {
     should_halt: bool,
     activity: KernelActivity,
 
-    // ★ タスク一覧
+    // タスク一覧
     tasks: [Task; MAX_TASKS],
     num_tasks: usize,
     current_task: usize, // 現在 Running のタスク index
 
-    // ★ ReadyQueue（タスク index のリングバッファ）
+    // ReadyQueue（タスク index のリングバッファ）
     ready_queue: [usize; MAX_TASKS],
     rq_head: usize,
     rq_tail: usize,
     rq_len: usize,
 
-    // ★ 抽象イベントログ
+    // 抽象イベントログ
     event_log: [Option<LogEvent>; EVENT_LOG_CAP],
     event_log_len: usize,
+
+    // ★ 量子（1タスクが連続して実行できる最大 tick 数）
+    quantum: u64,
 }
 
 impl KernelState {
     pub fn new(boot_info: &'static BootInfo) -> Self {
         let phys_mem = PhysicalMemoryManager::new(boot_info);
 
-        // 最初のタスクだけ Running、残りは Ready とする
+        // runtime_ticks = 0, time_slice_used = 0 で初期化。
+        // Task 1 のみ Running、それ以外は Ready。
         let tasks = [
-            Task { id: TaskId(1), state: TaskState::Running },
-            Task { id: TaskId(2), state: TaskState::Ready },
-            Task { id: TaskId(3), state: TaskState::Ready },
+            Task {
+                id: TaskId(1),
+                state: TaskState::Running,
+                runtime_ticks: 0,
+                time_slice_used: 0,
+            },
+            Task {
+                id: TaskId(2),
+                state: TaskState::Ready,
+                runtime_ticks: 0,
+                time_slice_used: 0,
+            },
+            Task {
+                id: TaskId(3),
+                state: TaskState::Ready,
+                runtime_ticks: 0,
+                time_slice_used: 0,
+            },
         ];
 
-        // ReadyQueue には「現在 Running 以外のタスク」を入れておく
-        let ready_queue = [1, 2, 0]; // 実際に使うのは rq_len 分だけ
+        // ReadyQueue に「最初は 2, 3 を Ready として入れておく」
+        let ready_queue = [1, 2, 0]; // 実際使うのは rq_len 分だけ。
         let rq_len = 2usize;
 
         KernelState {
@@ -128,7 +156,7 @@ impl KernelState {
 
             tasks,
             num_tasks: MAX_TASKS,
-            current_task: 0, // Task 1 が最初の Running
+            current_task: 0, // Task 1 が最初に Running
 
             ready_queue,
             rq_head: 0,
@@ -137,6 +165,9 @@ impl KernelState {
 
             event_log: [None; EVENT_LOG_CAP],
             event_log_len: 0,
+
+            // ★ 量子（例: 5 tick）
+            quantum: 5,
         }
     }
 
@@ -171,10 +202,9 @@ impl KernelState {
     // ──────────────────────────────────────────────
     //
 
-    /// ReadyQueue にタスク index を enqueue
     fn enqueue_ready(&mut self, idx: usize) {
         if self.rq_len >= MAX_TASKS {
-            return; // これ以上入らない（今回は無視）
+            return;
         }
         self.ready_queue[self.rq_tail] = idx;
         self.rq_tail = (self.rq_tail + 1) % MAX_TASKS;
@@ -184,7 +214,6 @@ impl KernelState {
         self.push_event(LogEvent::ReadyQueued(tid));
     }
 
-    /// ReadyQueue からタスク index を dequeue
     fn dequeue_ready(&mut self) -> Option<usize> {
         if self.rq_len == 0 {
             return None;
@@ -200,7 +229,7 @@ impl KernelState {
 
     //
     // ──────────────────────────────────────────────
-    // 簡易スケジューラ：Running ↔ ReadyQueue
+    // スケジューラ：Running → ReadyQueue, ReadyQueue → Running
     // ──────────────────────────────────────────────
     //
 
@@ -208,8 +237,9 @@ impl KernelState {
         let prev_idx = self.current_task;
         let prev_id = self.tasks[prev_idx].id;
 
-        // 現在 Running のタスクを Ready に戻し、ReadyQueue へ
+        // Running → Ready に戻して ReadyQueue へ
         self.tasks[prev_idx].state = TaskState::Ready;
+        self.tasks[prev_idx].time_slice_used = 0; // 使い切った量子をリセット
         self.push_event(LogEvent::TaskStateChanged(prev_id, TaskState::Ready));
         self.enqueue_ready(prev_idx);
 
@@ -218,17 +248,70 @@ impl KernelState {
             let next_id = self.tasks[next_idx].id;
 
             self.tasks[next_idx].state = TaskState::Running;
+            self.tasks[next_idx].time_slice_used = 0; // 新たな量子開始
             self.current_task = next_idx;
 
             logging::info(" switched to task");
             logging::info_u64(" task_id", next_id.0);
 
             self.push_event(LogEvent::TaskSwitched(next_id));
-            self.push_event(LogEvent::TaskStateChanged(next_id, TaskState::Running));
+            self.push_event(LogEvent::TaskStateChanged(
+                next_id,
+                TaskState::Running,
+            ));
         } else {
-            // ReadyQueue が空の場合は、前のタスクを Running に戻す（フォールバック）
+            // ReadyQueue が空なら、元のタスクを Running に戻す（フォールバック）
             self.tasks[prev_idx].state = TaskState::Running;
-            self.push_event(LogEvent::TaskStateChanged(prev_id, TaskState::Running));
+            self.push_event(LogEvent::TaskStateChanged(
+                prev_id,
+                TaskState::Running,
+            ));
+        }
+    }
+
+    //
+    // ──────────────────────────────────────────────
+    // Running タスクの runtime を 1 tick 増やす
+    // ──────────────────────────────────────────────
+    //
+
+    fn update_runtime(&mut self) {
+        let idx = self.current_task;
+        let tid = self.tasks[idx].id;
+
+        self.tasks[idx].runtime_ticks += 1;
+
+        logging::info_u64(" runtime_ticks", self.tasks[idx].runtime_ticks);
+
+        self.push_event(LogEvent::RuntimeUpdated(
+            tid,
+            self.tasks[idx].runtime_ticks,
+        ));
+    }
+
+    //
+    // ──────────────────────────────────────────────
+    // Running タスクの time_slice_used を 1 tick 増やし、
+    // quantum を超えたら QuantumExpired イベントを記録してスケジューリングする。
+    // ──────────────────────────────────────────────
+    //
+
+    fn update_time_slice_and_maybe_schedule(&mut self) {
+        let idx = self.current_task;
+        let tid = self.tasks[idx].id;
+
+        self.tasks[idx].time_slice_used += 1;
+        let used = self.tasks[idx].time_slice_used;
+
+        logging::info_u64(" time_slice_used", used);
+
+        if used >= self.quantum {
+            // 量子を使い切った
+            logging::info(" quantum expired; scheduling next task");
+            self.push_event(LogEvent::QuantumExpired(tid, used));
+
+            // 次のタスクへ切り替え
+            self.schedule_next_task();
         }
     }
 
@@ -255,7 +338,7 @@ impl KernelState {
 
         let (next_activity, action) = next_activity_and_action(self.activity);
 
-        // 副作用
+        // 副作用：タイマ / フレーム割当
         match action {
             KernelAction::None => {
                 logging::info(" action = None");
@@ -268,23 +351,23 @@ impl KernelState {
             }
             KernelAction::AllocateFrame => {
                 logging::info(" action = AllocateFrame");
-                match self.phys_mem.allocate_frame() {
-                    Some(_) => {
-                        logging::info(" allocated usable frame (tick)");
-                        self.push_event(LogEvent::FrameAllocated);
-                    }
-                    None => {
-                        logging::error(" no more usable frames; halting later");
-                        self.should_halt = true;
-                    }
+                if let Some(_) = self.phys_mem.allocate_frame() {
+                    logging::info(" allocated usable frame (tick)");
+                    self.push_event(LogEvent::FrameAllocated);
+                } else {
+                    logging::error(" no more usable frames; halting later");
+                    self.should_halt = true;
                 }
             }
         }
 
-        // タスクスケジューラ発動
-        self.schedule_next_task();
+        // ★ Running タスクの累積 runtime を更新
+        self.update_runtime();
 
-        // 次の活動状態へ
+        // ★ time_slice を 1 tick 消費し、量子に達したらスケジューリング
+        self.update_time_slice_and_maybe_schedule();
+
+        // 次の KernelActivity へ
         self.activity = next_activity;
     }
 
@@ -294,23 +377,25 @@ impl KernelState {
 
     //
     // ──────────────────────────────────────────────
-    // 抽象イベントログのダンプ
+    // 抽象イベントログを VGA にダンプ
     // ──────────────────────────────────────────────
     //
 
     pub fn dump_events(&self) {
         logging::info("=== KernelState Event Log Dump ===");
+
         for i in 0..self.event_log_len {
             if let Some(ev) = self.event_log[i] {
                 log_event_to_vga(ev);
             }
         }
+
         logging::info("=== End of Event Log ===");
     }
 }
 
 //
-// LogEvent → VGA 出力
+// LogEvent → VGA 出力（副作用）
 //
 
 fn log_event_to_vga(ev: LogEvent) {
@@ -346,18 +431,31 @@ fn log_event_to_vga(ev: LogEvent) {
             logging::info("EVENT: ReadyDequeued");
             logging::info_u64(" task", tid.0);
         }
+        LogEvent::RuntimeUpdated(tid, rt) => {
+            logging::info("EVENT: RuntimeUpdated");
+            logging::info_u64(" task", tid.0);
+            logging::info_u64(" runtime", rt);
+        }
+        LogEvent::QuantumExpired(tid, used) => {
+            logging::info("EVENT: QuantumExpired");
+            logging::info_u64(" task", tid.0);
+            logging::info_u64(" used_ticks", used);
+        }
     }
 }
 
 //
-// 純粋な状態遷移関数（KernelActivity → (次状態, アクション))
+// 純粋な KernelActivity → (次状態, アクション)
 //
 
 fn next_activity_and_action(current: KernelActivity) -> (KernelActivity, KernelAction) {
     match current {
-        KernelActivity::Idle => (KernelActivity::UpdatingTimer, KernelAction::None),
-        KernelActivity::UpdatingTimer => (KernelActivity::AllocatingFrame, KernelAction::UpdateTimer),
-        KernelActivity::AllocatingFrame => (KernelActivity::Idle, KernelAction::AllocateFrame),
+        KernelActivity::Idle =>
+            (KernelActivity::UpdatingTimer, KernelAction::None),
+        KernelActivity::UpdatingTimer =>
+            (KernelActivity::AllocatingFrame, KernelAction::UpdateTimer),
+        KernelActivity::AllocatingFrame =>
+            (KernelActivity::Idle, KernelAction::AllocateFrame),
     }
 }
 
