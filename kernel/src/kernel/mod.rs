@@ -11,20 +11,28 @@
 //   - ReadyQueue の中から「priority が最大」のタスクを選んで Running にする
 // - tick():
 //    1. KernelActivity の純粋状態遷移 (next_activity_and_action)
-//    2. タイマ / フレーム割当（副作用）
+//    2. タイマ / フレーム割当 / メモリ操作（副作用）
 //    3. Running タスクの runtime 更新
 //    4. 疑似的 Blocked 処理（ときどき TaskState::Blocked にする）
 //    5. quantum 消費と QuantumExpired イベント
 //    6. 必要に応じてスケジューラ発動（優先度を考慮）
 //    7. Timer tick で Blocked から 1タスクだけ Wake (WaitQueue → ReadyQueue)
-// - 抽象イベントログ(LogEvent) にすべての状態遷移・スケジューリングを記録し、dump_events() でダンプ。
+// - 抽象イベントログ(LogEvent) にすべての状態遷移・スケジューリング・メモリ操作を記録し、dump_events() でダンプ。
+// - メモリ管理については、MemAction(Map/Unmap) を発行し、apply_mem_action() で実装するための土台を整える。
 
 use bootloader::BootInfo;
 use crate::{arch, logging};
 use crate::mm::PhysicalMemoryManager;
+use crate::mem::addr::{PhysFrame, VirtPage};
+use crate::mem::paging::{MemAction, PageFlags};
 
 const MAX_TASKS: usize = 3;
 const EVENT_LOG_CAP: usize = 256;
+
+// デモ用に使う仮想ページ番号（ざっくり 0x100 番目のページ）
+const DEMO_VIRT_PAGE_INDEX: u64 = 0x100;
+// デモ用に使う物理フレーム番号（実際の物理メモリマップとはまだ連動させていない）
+const DEMO_PHYS_FRAME_INDEX: u64 = 0x200;
 
 //
 // ──────────────────────────────────────────────
@@ -70,6 +78,8 @@ pub enum LogEvent {
     WaitDequeued(TaskId),
     RuntimeUpdated(TaskId, u64),
     QuantumExpired(TaskId, u64),
+    /// メモリ関連の抽象イベント（MemAction）が発生したことを記録する。
+    MemActionApplied(MemAction),
 }
 
 //
@@ -77,12 +87,15 @@ pub enum LogEvent {
 // KernelActivity（カーネル内部の状態マシン）
 // ──────────────────────────────────────────────
 //
+// - Idle → UpdatingTimer → AllocatingFrame → MappingDemoPage → Idle → ... と 4 ステップで回る。
+// - MappingDemoPage のフェーズで、デモ用の MemAction(Map) を 1 回発行する。
 
 #[derive(Clone, Copy)]
 pub enum KernelActivity {
     Idle,
     UpdatingTimer,
     AllocatingFrame,
+    MappingDemoPage,
 }
 
 #[derive(Clone, Copy)]
@@ -90,6 +103,8 @@ enum KernelAction {
     None,
     UpdateTimer,
     AllocateFrame,
+    /// メモリ操作フェーズを表す（どんな MemAction を発行するかは tick() 側で決める）。
+    MemDemo,
 }
 
 //
@@ -133,6 +148,9 @@ pub struct KernelState {
 }
 
 impl KernelState {
+    /// カーネルの初期状態を構築する。
+    /// - 3 つのタスクを用意し、それぞれに priority を設定
+    /// - Task 1 を Running、Task 2,3 を Ready としてスタート
     pub fn new(boot_info: &'static BootInfo) -> Self {
         let phys_mem = PhysicalMemoryManager::new(boot_info);
 
@@ -200,6 +218,7 @@ impl KernelState {
         }
     }
 
+    /// ブート時に物理フレームをいくつか確保してみるデモ処理。
     pub fn bootstrap(&mut self) {
         logging::info("KernelState::bootstrap()");
 
@@ -461,7 +480,7 @@ impl KernelState {
 
         let (next_activity, action) = next_activity_and_action(self.activity);
 
-        // 副作用：タイマ / フレーム割り当て
+        // 副作用：タイマ / フレーム割り当て / メモリ操作
         match action {
             KernelAction::None => {
                 logging::info(" action = None");
@@ -484,6 +503,20 @@ impl KernelState {
                     logging::error(" no more usable frames; halting later");
                     self.should_halt = true;
                 }
+            }
+            KernelAction::MemDemo => {
+                logging::info(" action = MemDemo");
+
+                // ★ ここで実際の MemAction を組み立てる。
+                //   今はデモとして「固定の仮想ページ → 固定の物理フレームに READ/WRITE でマップ」という意味にする。
+                let page = VirtPage::from_index(DEMO_VIRT_PAGE_INDEX);
+                let frame = PhysFrame::from_index(DEMO_PHYS_FRAME_INDEX);
+                let flags = PageFlags::PRESENT | PageFlags::WRITABLE;
+
+                let mem_action = MemAction::Map { page, frame, flags };
+
+                apply_mem_action(mem_action);
+                self.push_event(LogEvent::MemActionApplied(mem_action));
             }
         }
 
@@ -579,8 +612,42 @@ fn log_event_to_vga(ev: LogEvent) {
             logging::info_u64(" task", tid.0);
             logging::info_u64(" used_ticks", used);
         }
+        LogEvent::MemActionApplied(action) => {
+            logging::info("EVENT: MemActionApplied");
+            match action {
+                MemAction::Map { page, frame, flags } => {
+                    logging::info(" mem_action = Map");
+                    logging::info_u64(" virt_page_index", page.number);
+                    logging::info_u64(" phys_frame_index", frame.number);
+                    logging::info_u64(" flags_bits", flags.bits());
+                }
+                MemAction::Unmap { page } => {
+                    logging::info(" mem_action = Unmap");
+                    logging::info_u64(" virt_page_index", page.number);
+                }
+            }
+        }
     }
 }
+
+//
+// メモリ操作の「実装側」
+//
+// - MemAction は「やりたいことの宣言」。
+// - apply_mem_action() は「実際に何をするか（副作用）」をまとめる場所。
+// - 今はまだログを出すだけのダミー実装。
+//   将来ここでページテーブルを書き換える (unsafe) 処理を集約する。
+
+// kernel/src/kernel/mod.rs 内の、既存の apply_mem_action をこれに差し替え
+
+/// MemAction を実際のページテーブル操作へ渡すラッパ。
+/// - 自身は safe な関数として残し、unsafe は arch::paging 側に閉じ込める。
+fn apply_mem_action(action: MemAction) {
+    unsafe {
+        crate::arch::paging::apply_mem_action(action);
+    }
+}
+
 
 //
 // 純粋な KernelActivity → (次状態, アクション)
@@ -593,7 +660,10 @@ fn next_activity_and_action(current: KernelActivity) -> (KernelActivity, KernelA
         KernelActivity::UpdatingTimer =>
             (KernelActivity::AllocatingFrame, KernelAction::UpdateTimer),
         KernelActivity::AllocatingFrame =>
-            (KernelActivity::Idle, KernelAction::AllocateFrame),
+            (KernelActivity::MappingDemoPage, KernelAction::AllocateFrame),
+        KernelActivity::MappingDemoPage =>
+        // デモ用に、毎サイクル 1 回だけ MemDemo を発行してみる。
+            (KernelActivity::Idle, KernelAction::MemDemo),
     }
 }
 

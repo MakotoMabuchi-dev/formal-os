@@ -8,6 +8,7 @@ bootloader = "0.9"
 spin = "0.9"
 volatile = "0.2.6"
 x86_64 = "0.15"
+bitflags = { version = "2", default-features = false }
 
 # プロファイル設定はワークスペース側に移すのが正道だが、
 # ひとまず残していても動作には影響しない

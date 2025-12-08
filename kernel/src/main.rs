@@ -13,6 +13,7 @@ mod logging;
 mod kernel;
 mod panic;
 mod mm;    // ★ 物理メモリ管理モジュールを追加
+mod mem;
 
 use bootloader::{entry_point, BootInfo};
 
