@@ -1,56 +1,85 @@
 # formal-os
 
 A pre-formal-verification microkernel written in Rust.  
-Boots via bootloader v0.9 + bootimage on QEMU x86_64.
+Boots via `bootloader` v0.9 + `bootimage`, designed to run cleanly under QEMU x86_64.
 
-This project intentionally keeps the kernel small, structured, and strictly layered
-so that it can evolve into a formally verifiable OS design.
+The project intentionally keeps the kernel small, layered, and analyzable.  
+The long-term goal is to evolve this into a formally verifiable operating system.
 
 ---
 
 ## Current Features (as of 2025-02)
 
-### ✔ Boot Infrastructure
-- Uses `bootloader` v0.9 and `bootimage` to build a bootable image.
+### Boot Infrastructure
+- Uses `bootloader` v0.9 and `bootimage` to construct a bootable image.
 - Runs on QEMU x86_64 in 64-bit long mode.
-- VGA text-mode output with a minimal logging backend.
+- Provides a minimal VGA/serial logging backend.
 
-### ✔ Kernel Architecture Overview
+---
+
+## Kernel Architecture Overview
 
 ```
 KernelState
- ├─ phys_mem              : PhysicalMemoryManager
- ├─ tick_count            : OS logical time
- ├─ time_ticks            : simplified timer counter
- ├─ activity              : KernelActivity (Idle / UpdatingTimer / AllocatingFrame)
- ├─ tasks[]               : simple Task objects (TaskId + TaskState)
- ├─ current_task          : index of currently Running task
- ├─ ready_queue[]         : ring buffer of Ready tasks
- ├─ event_log[]           : abstract execution trace
+ ├─ phys_mem                : PhysicalMemoryManager
+ ├─ activity                : KernelActivity (Idle / UpdatingTimer / AllocatingFrame / MappingDemoPage)
+ ├─ tick_count              : logical time
+ ├─ time_ticks              : simplified timer
+ ├─ tasks[]                 : Task objects (TaskId / TaskState / priority)
+ ├─ current_task            : index of running task
+ ├─ ready_queue[]           : Ready tasks (ring buffer)
+ ├─ wait_queue[]            : Blocked tasks (ring buffer)
+ ├─ address_spaces[]        : logical AddressSpace per task
+ ├─ mem_demo_mapped[]       : demo flag for each task's mapping state
+ ├─ event_log[]             : abstract execution trace
 ```
 
-### ✔ Pure State Machine Design (Formal-Friendly)
+---
+
+## State Machine Design (Formal-Friendly)
+
+The kernel core follows a strictly separated structure:
 
 - `next_activity_and_action()`  
-  → **pure function** representing the kernel's state transition  
-  (no side effects)
+  Pure transition function with **no side effects**.  
+  Defines the next `KernelActivity` and required `KernelAction`.
 
 - `tick()`  
-  → executes side effects *based on* the next transition  
-  (timer update, frame allocation, scheduling)
+  Executes all side effects derived from the above transition (timer update, frame allocation, memory actions, scheduling), and records abstract events.
 
-### ✔ Task Scheduling
+This separation mirrors techniques used in formally verified kernels such as seL4.
 
-- Tasks have states: **Ready / Running**
-- A **ReadyQueue** (ring buffer) implements a minimal round-robin scheduler
-- Each tick performs:
-    1. pure kernel activity transition
-    2. timer/frame side effects
-    3. **task scheduling:** Running → ReadyQueue → Running
+---
 
-### ✔ Abstract Event Log
+## Task Scheduling
 
-The kernel records "logical events" (not tied to VGA output):
+- Task states: `Ready`, `Running`, `Blocked`.
+- Round-robin scheduling with per-task priorities.
+- Quantum accounting per task (time slice).
+- Periodic synthetic blocking/waking for demonstration.
+- ReadyQueue and WaitQueue implemented as fixed-size ring buffers.
+
+---
+
+## Memory Model (Abstract AddressSpace)
+
+The kernel implements a clean, architecture-independent memory model:
+
+- `MemAction` represents abstract mapping operations:  
+  `Map { page, frame, flags }` / `Unmap { page }`
+- Each task has its own `AddressSpace`, storing logical mappings  
+  (`VirtPage ↔ PhysFrame` + flags).
+- Integrity checks prevent double-mapping or unmapping unmapped pages.
+- `MemActionApplied { task, action }` is recorded in the event log.
+- All AddressSpace contents can be dumped at shutdown.
+
+This model provides a verifiable “specification layer” decoupled from hardware page tables.
+
+---
+
+## Event Log
+
+All logical events generated during execution are recorded:
 
 - `TickStarted(n)`
 - `TimerUpdated(n)`
@@ -59,17 +88,20 @@ The kernel records "logical events" (not tied to VGA output):
 - `TaskStateChanged(TaskId, State)`
 - `ReadyQueued(TaskId)`
 - `ReadyDequeued(TaskId)`
+- `WaitQueued(TaskId)`
+- `WaitDequeued(TaskId)`
+- `MemActionApplied { task, action }`
 
-This trace is later dumped with:
+The resulting trace can be inspected via:
 
 ```
 === KernelState Event Log Dump ===
-EVENT: TickStarted
-EVENT: TaskSwitched
-…
+...
+=== AddressSpace Dump (per task) ===
+...
 ```
 
-This structure is intentionally designed for future **formal verification** (e.g., TLA+).
+This design enables later modeling with TLA+, Coq, or other verification tools.
 
 ---
 
@@ -82,25 +114,28 @@ rustup component add rust-src
 cargo install bootimage
 ```
 
-### Build (kernel + bootloader)
+### Build
 
 ```
 cargo bootimage -p kernel --target x86_64-formal-os-local.json
 ```
 
-Boot image will be created at:
+Generates the image:
 
 ```
 target/x86_64-formal-os-local/debug/bootimage-kernel.bin
 ```
 
-### Run on QEMU
+### Run under QEMU
 
 ```
-qemu-system-x86_64   -drive format=raw,file=target/x86_64-formal-os-local/debug/bootimage-kernel.bin   -m 512M   -serial stdio
+qemu-system-x86_64 \
+  -drive format=raw,file=target/x86_64-formal-os-local/debug/bootimage-kernel.bin \
+  -m 512M \
+  -serial stdio
 ```
 
-### Scripts
+Or use the provided scripts:
 
 ```
 scripts/build-kernel.sh
@@ -109,13 +144,14 @@ scripts/run-qemu-debug.sh
 
 ---
 
-## Roadmap (Planned)
+## Roadmap
 
-- Add **runtime_ticks** per task (toward fair scheduling)
-- Add **Blocked** state → enable wait queues
-- Introduce **SystemCallHandling** for user/task interaction
-- Define **memory mapping abstraction** (Mapper trait)
-- Export abstract event log to host via serial
+- Implement hardware-backed page table mapping (`OffsetPageTable`).
+- Provide real virtual memory per task (CR3 switching).
+- Introduce user-mode execution and system call interface.
+- Serialize event logs externally for formal analysis.
+- Develop formal specifications (TLA+ model of kernel transitions).
+- Expand AddressSpace into a full capability- or rights-based memory system.
 
 ---
 
