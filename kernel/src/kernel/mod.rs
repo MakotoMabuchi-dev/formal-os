@@ -18,13 +18,15 @@
 //    6. 必要に応じてスケジューラ発動（優先度を考慮）
 //    7. Timer tick で Blocked から 1タスクだけ Wake (WaitQueue → ReadyQueue)
 // - 抽象イベントログ(LogEvent) にすべての状態遷移・スケジューリング・メモリ操作を記録し、dump_events() でダンプ。
-// - メモリ管理については、MemAction(Map/Unmap) を発行し、apply_mem_action() で実装するための土台を整える。
+// - メモリ管理については、MemAction(Map/Unmap) を発行し、各タスクごとの AddressSpace で論理整合性をチェックした上で
+//   arch::paging::apply_mem_action() に渡す構造になっている。
 
 use bootloader::BootInfo;
 use crate::{arch, logging};
 use crate::mm::PhysicalMemoryManager;
 use crate::mem::addr::{PhysFrame, VirtPage};
 use crate::mem::paging::{MemAction, PageFlags};
+use crate::mem::address_space::{AddressSpace, AddressSpaceError};
 
 const MAX_TASKS: usize = 3;
 const EVENT_LOG_CAP: usize = 256;
@@ -79,7 +81,11 @@ pub enum LogEvent {
     RuntimeUpdated(TaskId, u64),
     QuantumExpired(TaskId, u64),
     /// メモリ関連の抽象イベント（MemAction）が発生したことを記録する。
-    MemActionApplied(MemAction),
+    /// どのタスク（=どのアドレス空間）がその操作を起こしたかも一緒に残す。
+    MemActionApplied {
+        task: TaskId,
+        action: MemAction,
+    },
 }
 
 //
@@ -88,7 +94,7 @@ pub enum LogEvent {
 // ──────────────────────────────────────────────
 //
 // - Idle → UpdatingTimer → AllocatingFrame → MappingDemoPage → Idle → ... と 4 ステップで回る。
-// - MappingDemoPage のフェーズで、デモ用の MemAction(Map) を 1 回発行する。
+// - MappingDemoPage のフェーズで、デモ用の MemAction(Map/Unmap) を 1 回発行する。
 
 #[derive(Clone, Copy)]
 pub enum KernelActivity {
@@ -103,7 +109,7 @@ enum KernelAction {
     None,
     UpdateTimer,
     AllocateFrame,
-    /// メモリ操作フェーズを表す（どんな MemAction を発行するかは tick() 側で決める）。
+    /// メモリ操作デモ用フェーズを表す。
     MemDemo,
 }
 
@@ -121,6 +127,10 @@ pub struct KernelState {
 
     should_halt: bool,
     activity: KernelActivity,
+
+    /// 各タスクごとのアドレス空間。
+    /// - address_spaces[i] は tasks[i] の論理アドレス空間を表す。
+    address_spaces: [AddressSpace; MAX_TASKS],
 
     // タスク一覧
     tasks: [Task; MAX_TASKS],
@@ -145,6 +155,11 @@ pub struct KernelState {
 
     // 量子（1タスクが連続で実行できる最大 tick 数）
     quantum: u64,
+
+    /// デモ用ページが「タスクごとに論理的にマップされているかどうか」のフラグ。
+    /// - mem_demo_mapped[i] == false のタスクでは MemDemo で Map を発行。
+    /// - true のタスクでは MemDemo で Unmap を発行。
+    mem_demo_mapped: [bool; MAX_TASKS],
 }
 
 impl KernelState {
@@ -190,6 +205,9 @@ impl KernelState {
             should_halt: false,
             activity: KernelActivity::Idle,
 
+            // 各タスクは独自の AddressSpace を持つ（初期状態は全て空）。
+            address_spaces: [AddressSpace::new(); MAX_TASKS],
+
             tasks,
             num_tasks: MAX_TASKS,
             current_task: 0, // Task 1 が最初に Running
@@ -208,6 +226,8 @@ impl KernelState {
             event_log_len: 0,
 
             quantum: 5,
+
+            mem_demo_mapped: [false; MAX_TASKS],
         }
     }
 
@@ -500,23 +520,66 @@ impl KernelState {
                     logging::info(" allocated usable frame (tick)");
                     self.push_event(LogEvent::FrameAllocated);
                 } else {
-                    logging::error(" no more usable frames; halting later");
+                    logging::error(" no more frames; halting later");
                     self.should_halt = true;
                 }
             }
             KernelAction::MemDemo => {
                 logging::info(" action = MemDemo");
 
-                // ★ ここで実際の MemAction を組み立てる。
-                //   今はデモとして「固定の仮想ページ → 固定の物理フレームに READ/WRITE でマップ」という意味にする。
                 let page = VirtPage::from_index(DEMO_VIRT_PAGE_INDEX);
                 let frame = PhysFrame::from_index(DEMO_PHYS_FRAME_INDEX);
                 let flags = PageFlags::PRESENT | PageFlags::WRITABLE;
 
-                let mem_action = MemAction::Map { page, frame, flags };
+                let task_idx = self.current_task;
+                let task_id = self.tasks[task_idx].id;
 
-                apply_mem_action(mem_action);
-                self.push_event(LogEvent::MemActionApplied(mem_action));
+                // ★ タスクごとのフラグに基づき Map / Unmap を切り替える
+                let mem_action = if !self.mem_demo_mapped[task_idx] {
+                    logging::info(" mem_demo: issuing Map (for current task)");
+                    MemAction::Map { page, frame, flags }
+                } else {
+                    logging::info(" mem_demo: issuing Unmap (for current task)");
+                    MemAction::Unmap { page }
+                };
+
+                // 対象のタスクのアドレススペースを取り出す
+                let aspace = &mut self.address_spaces[task_idx];
+
+                // まずは論理アドレス空間に適用して、不整合がないかチェック
+                match aspace.apply(mem_action) {
+                    Ok(()) => {
+                        logging::info(" address_space.apply: OK");
+
+                        // 状態フラグを更新
+                        match mem_action {
+                            MemAction::Map { .. } => {
+                                self.mem_demo_mapped[task_idx] = true;
+                            }
+                            MemAction::Unmap { .. } => {
+                                self.mem_demo_mapped[task_idx] = false;
+                            }
+                        }
+
+                        // 論理的に OK なら、実際のアーキ依存処理へ渡す
+                        apply_mem_action(mem_action);
+
+                        // ★ どのタスクがどの MemAction を起こしたかも一緒に記録
+                        self.push_event(LogEvent::MemActionApplied {
+                            task: task_id,
+                            action: mem_action,
+                        });
+                    }
+                    Err(AddressSpaceError::AlreadyMapped) => {
+                        logging::info(" address_space.apply: AlreadyMapped");
+                    }
+                    Err(AddressSpaceError::NotMapped) => {
+                        logging::info(" address_space.apply: NotMapped");
+                    }
+                    Err(AddressSpaceError::CapacityExceeded) => {
+                        logging::info(" address_space.apply: CapacityExceeded");
+                    }
+                }
             }
         }
 
@@ -539,7 +602,7 @@ impl KernelState {
 
     //
     // ──────────────────────────────────────────────
-    // 抽象イベントログを VGA にダンプ
+    // 抽象イベントログ + 各タスクの AddressSpace の中身を VGA にダンプ
     // ──────────────────────────────────────────────
     //
 
@@ -553,6 +616,28 @@ impl KernelState {
         }
 
         logging::info("=== End of Event Log ===");
+
+        // ★ 各タスクの AddressSpace の中身もダンプする
+        logging::info("=== AddressSpace Dump (per task) ===");
+        for task_idx in 0..self.num_tasks {
+            let task = self.tasks[task_idx];
+
+            logging::info(" Task AddressSpace:");
+            logging::info_u64("  task_index", task_idx as u64);
+            logging::info_u64("  task_id", task.id.0);
+
+            let aspace = &self.address_spaces[task_idx];
+            let count = aspace.mapping_count();
+            logging::info_u64("  mapping_count", count as u64);
+
+            aspace.for_each_mapping(|m| {
+                logging::info("  MAPPING:");
+                logging::info_u64("    virt_page_index", m.page.number);
+                logging::info_u64("    phys_frame_index", m.frame.number);
+                logging::info_u64("    flags_bits", m.flags.bits());
+            });
+        }
+        logging::info("=== End of AddressSpace Dump ===");
     }
 }
 
@@ -612,8 +697,9 @@ fn log_event_to_vga(ev: LogEvent) {
             logging::info_u64(" task", tid.0);
             logging::info_u64(" used_ticks", used);
         }
-        LogEvent::MemActionApplied(action) => {
+        LogEvent::MemActionApplied { task, action } => {
             logging::info("EVENT: MemActionApplied");
+            logging::info_u64(" task", task.0);
             match action {
                 MemAction::Map { page, frame, flags } => {
                     logging::info(" mem_action = Map");
@@ -631,23 +717,15 @@ fn log_event_to_vga(ev: LogEvent) {
 }
 
 //
-// メモリ操作の「実装側」
+// MemAction を実際のページテーブル操作へ渡すラッパ。
+// - 自身は safe な関数として残し、unsafe は arch::paging 側に閉じ込める。
 //
-// - MemAction は「やりたいことの宣言」。
-// - apply_mem_action() は「実際に何をするか（副作用）」をまとめる場所。
-// - 今はまだログを出すだけのダミー実装。
-//   将来ここでページテーブルを書き換える (unsafe) 処理を集約する。
 
-// kernel/src/kernel/mod.rs 内の、既存の apply_mem_action をこれに差し替え
-
-/// MemAction を実際のページテーブル操作へ渡すラッパ。
-/// - 自身は safe な関数として残し、unsafe は arch::paging 側に閉じ込める。
 fn apply_mem_action(action: MemAction) {
     unsafe {
         crate::arch::paging::apply_mem_action(action);
     }
 }
-
 
 //
 // 純粋な KernelActivity → (次状態, アクション)
