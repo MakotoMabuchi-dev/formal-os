@@ -19,7 +19,7 @@
 //    7. Timer tick で Blocked から 1タスクだけ Wake (WaitQueue → ReadyQueue)
 // - 抽象イベントログ(LogEvent) にすべての状態遷移・スケジューリング・メモリ操作を記録し、dump_events() でダンプ。
 // - メモリ管理については、MemAction(Map/Unmap) を発行し、各タスクごとの AddressSpace で論理整合性をチェックした上で
-//   arch::paging::apply_mem_action() に渡す構造になっている。
+//   arch::paging::apply_mem_action() に（今はデモとして Task0 に対してのみ）渡す構造になっている。
 
 use bootloader::BootInfo;
 use crate::{arch, logging};
@@ -31,9 +31,9 @@ use crate::mem::address_space::{AddressSpace, AddressSpaceError};
 const MAX_TASKS: usize = 3;
 const EVENT_LOG_CAP: usize = 256;
 
-// デモ用に使う仮想ページ番号（ざっくり 0x100 番目のページ）
+// デモ用に使う仮想ページ番号（0x100 = 0x0010_0000 = 1MiB）
 const DEMO_VIRT_PAGE_INDEX: u64 = 0x100;
-// デモ用に使う物理フレーム番号（実際の物理メモリマップとはまだ連動させていない）
+// デモ用に使う物理フレーム番号（0x200 = 0x0020_0000 = 2MiB）
 const DEMO_PHYS_FRAME_INDEX: u64 = 0x200;
 
 //
@@ -143,7 +143,7 @@ pub struct KernelState {
     rq_tail: usize,
     rq_len: usize,
 
-    // WaitQueue（Blocked なタスク index のリングバッファ）
+    // WaitQueue（Blocked タスク index のリングバッファ）
     wait_queue: [usize; MAX_TASKS],
     wq_head: usize,
     wq_tail: usize,
@@ -164,8 +164,6 @@ pub struct KernelState {
 
 impl KernelState {
     /// カーネルの初期状態を構築する。
-    /// - 3 つのタスクを用意し、それぞれに priority を設定
-    /// - Task 1 を Running、Task 2,3 を Ready としてスタート
     pub fn new(boot_info: &'static BootInfo) -> Self {
         let phys_mem = PhysicalMemoryManager::new(boot_info);
 
@@ -479,6 +477,20 @@ impl KernelState {
 
     //
     // ──────────────────────────────────────────────
+    // MemAction を実際のページテーブル操作へ渡すラッパ。
+    // - self 内の phys_mem を arch::paging 側に渡す。
+    // - ここ自体は safe なままにしておき、unsafe は arch 側に閉じ込める。
+    // ──────────────────────────────────────────────
+    //
+
+    fn apply_mem_action(&mut self, action: MemAction) {
+        unsafe {
+            arch::paging::apply_mem_action(action, &mut self.phys_mem);
+        }
+    }
+
+    //
+    // ──────────────────────────────────────────────
     // tick（OS の 1 ステップ）
     // ──────────────────────────────────────────────
     //
@@ -561,10 +573,15 @@ impl KernelState {
                             }
                         }
 
-                        // 論理的に OK なら、実際のアーキ依存処理へ渡す
-                        apply_mem_action(mem_action);
+                        // ★ 実ページテーブル操作は「Task0 だけ」で行う（今はカーネル共通アドレス空間のため）
+                        if task_idx == 0 {
+                            logging::info(" mem_demo: applying arch paging (task_idx = 0)");
+                            self.apply_mem_action(mem_action);
+                        } else {
+                            logging::info(" mem_demo: skip arch paging (non-zero task, logical only)");
+                        }
 
-                        // ★ どのタスクがどの MemAction を起こしたかも一緒に記録
+                        // 抽象イベントとしては、全タスク分をちゃんと記録
                         self.push_event(LogEvent::MemActionApplied {
                             task: task_id,
                             action: mem_action,
@@ -713,17 +730,6 @@ fn log_event_to_vga(ev: LogEvent) {
                 }
             }
         }
-    }
-}
-
-//
-// MemAction を実際のページテーブル操作へ渡すラッパ。
-// - 自身は safe な関数として残し、unsafe は arch::paging 側に閉じ込める。
-//
-
-fn apply_mem_action(action: MemAction) {
-    unsafe {
-        crate::arch::paging::apply_mem_action(action);
     }
 }
 
