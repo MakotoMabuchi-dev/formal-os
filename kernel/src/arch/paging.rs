@@ -1,4 +1,4 @@
-// src/arch/paging.rs
+// kernel/src/arch/paging.rs
 //
 // 役割:
 // - x86_64 アーキテクチャ向けのページング処理をまとめる場所。
@@ -6,14 +6,19 @@
 // 現時点:
 // - REAL PAGING を有効にして map_to/unmap を呼び出し、
 //   map_to が成功した場合は実際に仮想アドレスへの read/write テストを行う。
-// - さらに BootInfo の memory_map をログにダンプして、
-//   どの物理アドレス領域が Usable/Reserved かを確認できるようにする。
+// - BootInfo の memory_map をログにダンプして、
+//   物理メモリのレイアウトを観察できるようにする。
+// - 「物理アドレス → 仮想アドレス」変換を phys_to_virt() に集約し、
+//   将来 PHYSICAL_MEMORY_OFFSET を変えてもコード全体を崩さない設計にする。
+// - switch_address_space(root) 抽象APIを定義（今はログを出すだけ）。
+//
 
 use bootloader::BootInfo;
 use bootloader::bootinfo::MemoryRegionType;
 use crate::logging;
 use crate::mm::PhysicalMemoryManager;
 use crate::mem::paging::{MemAction, PageFlags};
+use crate::mem::addr::PhysFrame as MyPhysFrame;
 
 use core::ptr::{read_volatile, write_volatile};
 
@@ -36,12 +41,25 @@ use x86_64::{
 /// 実際にページテーブルを書き換えるかどうかのフラグ。
 const ENABLE_REAL_PAGING: bool = true;
 
-/// 仮の物理メモリオフセット（今は identity map 前提で 0）。
+/// 物理メモリ窓の開始仮想アドレス。
+///
+/// - いまは仮に 0（identity map 前提）。
+/// - 将来 bootloader 側で「物理メモリ全域を高位アドレスにマップ」したとき、
+///   ここを 0xffff_8000_0000_0000 などに変更するだけでよいように、
+///   phys_to_virt() を経由させておく。
 const PHYSICAL_MEMORY_OFFSET: u64 = 0;
 
+/// 物理アドレス → 仮想アドレスへの変換関数。
+///
+/// - 現状は identity map 前提で「virt = phys」のままだが、
+///   すべての物理メモリアクセスは **必ずこの関数を経由**するようにしておく。
+/// - 将来 offset を変えたくなったときは、この関数だけを修正すればよい。
+fn phys_to_virt(phys: PhysAddr) -> VirtAddr {
+    VirtAddr::new(PHYSICAL_MEMORY_OFFSET + phys.as_u64())
+}
+
 /// paging サブシステムの初期化。
-/// - BootInfo の memory_map をダンプして、
-///   どの物理アドレス領域が Usable/Reserved かを確認できるようにする。
+/// BootInfo の memory_map をダンプして、物理メモリレイアウトを観察する。
 pub fn init(boot_info: &'static BootInfo) {
     logging::info("arch::paging::init: start");
 
@@ -58,21 +76,11 @@ pub fn init(boot_info: &'static BootInfo) {
         logging::info_u64("  end_phys", end);
 
         match region.region_type {
-            MemoryRegionType::Usable => {
-                logging::info("  type = Usable");
-            }
-            MemoryRegionType::Reserved => {
-                logging::info("  type = Reserved");
-            }
-            MemoryRegionType::AcpiReclaimable => {
-                logging::info("  type = AcpiReclaimable");
-            }
-            MemoryRegionType::AcpiNvs => {
-                logging::info("  type = AcpiNvs");
-            }
-            MemoryRegionType::BadMemory => {
-                logging::info("  type = BadMemory");
-            }
+            MemoryRegionType::Usable => logging::info("  type = Usable"),
+            MemoryRegionType::Reserved => logging::info("  type = Reserved"),
+            MemoryRegionType::AcpiReclaimable => logging::info("  type = AcpiReclaimable"),
+            MemoryRegionType::AcpiNvs => logging::info("  type = AcpiNvs"),
+            MemoryRegionType::BadMemory => logging::info("  type = BadMemory"),
             other => {
                 logging::info("  type = Other");
                 let _ = other;
@@ -104,19 +112,25 @@ fn to_x86_flags(flags: PageFlags) -> PageTableFlags {
     res
 }
 
-/// 「現在アクティブな L4 ページテーブル」への &mut PageTable を得る。
-unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut PageTable {
+/// 現在アクティブな L4 ページテーブルへの &mut PageTable を得る。
+///
+/// - CR3 から L4 テーブルの物理フレームを取得し、
+///   phys_to_virt() を使って仮想アドレスに変換する。
+/// - これにより「phys → virt」の変換ロジックが1か所に集約され、
+///   PHYSICAL_MEMORY_OFFSET の変更に強くなる。
+unsafe fn active_level_4_table() -> &'static mut PageTable {
     let (level_4_frame, _) = Cr3::read();
     let phys = level_4_frame.start_address();
-    let virt = physical_memory_offset + phys.as_u64();
+    let virt = phys_to_virt(phys);
     let page_table_ptr: *mut PageTable = virt.as_mut_ptr();
     &mut *page_table_ptr
 }
 
 /// OffsetPageTable を初期化するためのヘルパー。
-pub unsafe fn init_offset_page_table(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
-    let level_4_table = active_level_4_table(physical_memory_offset);
-    OffsetPageTable::new(level_4_table, physical_memory_offset)
+pub unsafe fn init_offset_page_table() -> OffsetPageTable<'static> {
+    let level_4_table = active_level_4_table();
+    let offset = VirtAddr::new(PHYSICAL_MEMORY_OFFSET);
+    OffsetPageTable::new(level_4_table, offset)
 }
 
 /// PhysicalMemoryManager を x86_64 の FrameAllocator として使う薄いラッパ。
@@ -160,8 +174,7 @@ pub unsafe fn apply_mem_action(
             if ENABLE_REAL_PAGING {
                 logging::info(" REAL PAGING: map_to() will be executed");
 
-                let phys_offset = VirtAddr::new(PHYSICAL_MEMORY_OFFSET);
-                let mut mapper = init_offset_page_table(phys_offset);
+                let mut mapper = init_offset_page_table();
                 let mut frame_alloc = KernelFrameAllocator::new(phys_mem);
 
                 match mapper.map_to(x86_page, x86_frame, x86_flags, &mut frame_alloc) {
@@ -169,7 +182,7 @@ pub unsafe fn apply_mem_action(
                         flush.flush();
                         logging::info(" map_to: OK (flush done)");
 
-                        // ★ 実際にこの仮想アドレスにアクセスしてみるテスト
+                        // 実際にこの仮想アドレスにアクセスしてみるテスト
                         let ptr = virt_addr_u64 as *mut u64;
                         let test_value: u64 = 0xDEAD_BEEF_DEAD_BEEFu64;
 
@@ -207,8 +220,7 @@ pub unsafe fn apply_mem_action(
             if ENABLE_REAL_PAGING {
                 logging::info(" REAL PAGING: unmap() will be executed");
 
-                let phys_offset = VirtAddr::new(PHYSICAL_MEMORY_OFFSET);
-                let mut mapper = init_offset_page_table(phys_offset);
+                let mut mapper = init_offset_page_table();
 
                 match mapper.unmap(x86_page) {
                     Ok((_frame, flush)) => {
@@ -221,7 +233,7 @@ pub unsafe fn apply_mem_action(
                     }
                 }
 
-                let _ = phys_mem; // 将来 frame を解放するときに使うかも
+                let _ = phys_mem;
             } else {
                 logging::info(" REAL PAGING: disabled (ENABLE_REAL_PAGING = false)");
             }
@@ -259,6 +271,23 @@ fn log_unmap_error(err: UnmapError) {
         }
         UnmapError::ParentEntryHugePage => {
             logging::error("  UnmapError::ParentEntryHugePage");
+        }
+    }
+}
+
+/// 抽象API: アドレス空間を切り替える（今はまだログを出すだけ）
+///
+/// 将来ここに `Cr3::write(new_root, flags)` を実装することで、
+/// 「Task切り替え → アドレス空間切り替え」というフォーマルな関係を保ったまま
+/// 実装を差し替えることができる。
+pub fn switch_address_space(root: Option<MyPhysFrame>) {
+    match root {
+        Some(frame) => {
+            logging::info("switch_address_space: would switch to root_page_frame");
+            logging::info_u64(" root_page_frame_index", frame.number);
+        }
+        None => {
+            logging::info("switch_address_space: no root_page_frame (None)");
         }
     }
 }

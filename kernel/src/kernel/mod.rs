@@ -19,7 +19,7 @@ use crate::mem::addr::{PhysFrame, VirtPage, PAGE_SIZE};
 use crate::mem::paging::{MemAction, PageFlags};
 use crate::mem::address_space::{AddressSpace, AddressSpaceError};
 use x86_64::registers::control::Cr3;
-use self::pagetable_init::allocate_new_l4_table;
+// use self::pagetable_init::allocate_new_l4_table;
 
 const MAX_TASKS: usize = 3;
 const EVENT_LOG_CAP: usize = 256;
@@ -38,6 +38,13 @@ const DEMO_PHYS_FRAME_INDEX: u64 = 0x200;
 #[derive(Clone, Copy)]
 pub struct TaskId(pub u64);
 
+/// 論理アドレス空間のID。
+/// - 今は Task と 1:1 で対応させる（task_index と同じ値）。
+/// - 将来、複数タスクで1つの AddressSpace を共有したり、
+///   Fork で新しい AddressSpace を作るときに、このIDを使って表現できるようにしておく。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct AddressSpaceId(pub usize);
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TaskState {
     Ready,
@@ -52,12 +59,14 @@ pub struct Task {
     pub runtime_ticks: u64,
     pub time_slice_used: u64,
     pub priority: u8,
-
-    /// このタスクが使う L4 ページテーブルの物理フレーム。
-    /// - Task0: 現在 CR3 が指している L4 のフレーム
-    /// - Task1/Task2: いまは None（専用 L4 はまだ未割り当て）
     pub root_page_frame: Option<PhysFrame>,
+
+    /// このタスクが属する論理アドレス空間のID。
+    /// - 今は AddressSpaceId(task_index) と 1:1 対応させておく。
+    /// - 将来、「複数タスクで1つの AddressSpace を共有する」ような設計も、このIDで表現できる。
+    pub address_space_id: AddressSpaceId,
 }
+
 
 //
 // ──────────────────────────────────────────────
@@ -170,8 +179,8 @@ impl KernelState {
         // ★ phys_mem を mutable にして、新しい L4 を Task1/2 用に確保
         let mut phys_mem = phys_mem;
 
-        let root1 = None;
-        let root2 = None;
+        let root1: Option<PhysFrame> = None;
+        let root2: Option<PhysFrame> = None;
 
         let tasks = [
             Task {
@@ -181,14 +190,16 @@ impl KernelState {
                 time_slice_used: 0,
                 priority: 1,
                 root_page_frame: Some(root_frame_for_task0),
+                address_space_id: AddressSpaceId(0),
             },
             Task {
                 id: TaskId(2),
                 state: TaskState::Ready,
                 runtime_ticks: 0,
                 time_slice_used: 0,
-                priority: 3,          // 一番高い
-                root_page_frame: root1, // Some(...) or None
+                priority: 3,
+                root_page_frame: None,
+                address_space_id: AddressSpaceId(1),
             },
             Task {
                 id: TaskId(3),
@@ -196,7 +207,8 @@ impl KernelState {
                 runtime_ticks: 0,
                 time_slice_used: 0,
                 priority: 2,
-                root_page_frame: root2,
+                root_page_frame: None,
+                address_space_id: AddressSpaceId(2),
             },
         ];
 
@@ -364,6 +376,8 @@ impl KernelState {
             logging::info(" switched to task");
             logging::info_u64(" task_id", next_id.0);
 
+            arch::paging::switch_address_space(self.tasks[next_idx].root_page_frame);
+
             self.push_event(LogEvent::TaskSwitched(next_id));
             self.push_event(LogEvent::TaskStateChanged(next_id, TaskState::Running));
         } else {
@@ -501,7 +515,8 @@ impl KernelState {
                 let flags = PageFlags::PRESENT | PageFlags::WRITABLE;
 
                 let task_idx = self.current_task;
-                let task_id = self.tasks[task_idx].id;
+                let task = self.tasks[task_idx];
+                let task_id = task.id;
 
                 let mem_action = if !self.mem_demo_mapped[task_idx] {
                     logging::info(" mem_demo: issuing Map (for current task)");
@@ -511,15 +526,17 @@ impl KernelState {
                     MemAction::Unmap { page }
                 };
 
-                let aspace = &mut self.address_spaces[task_idx];
+                // ★ Task が属する AddressSpaceId を使って参照する形に変更
+                let as_id = task.address_space_id;  // AddressSpaceId
+                let as_idx = as_id.0;               // usize
+                let aspace = &mut self.address_spaces[as_idx];
 
                 match aspace.apply(mem_action) {
                     Ok(()) => {
                         logging::info(" address_space.apply: OK");
-                        // Map/Unmap 状態をトグル
                         self.mem_demo_mapped[task_idx] = !self.mem_demo_mapped[task_idx];
 
-                        // ★ Task0 だけ実ページテーブル操作
+                        // ★ Task0 のときだけ実ページテーブル操作
                         if task_idx == 0 {
                             logging::info(" mem_demo: applying arch paging (task_idx = 0)");
                             self.apply_mem_action(mem_action);
@@ -543,6 +560,7 @@ impl KernelState {
                     }
                 }
             }
+
         }
 
         self.update_runtime();
@@ -587,6 +605,8 @@ impl KernelState {
                     logging::info("  root_page_frame_index = None");
                 }
             }
+
+            logging::info_u64("  address_space_id", task.address_space_id.0 as u64);
 
             let aspace = &self.address_spaces[i];
             logging::info_u64("  mapping_count", aspace.mapping_count() as u64);
