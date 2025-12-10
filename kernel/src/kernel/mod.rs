@@ -2,38 +2,31 @@
 //
 // formal-os: 優先度付きプリエンプティブ＋ReadyQueue＋Blocked状態付きミニカーネル
 //
-// 機能概要:
-// - Task: TaskId + TaskState(Ready/Running/Blocked) + runtime_ticks + time_slice_used + priority
-// - ReadyQueue: Ready なタスク index のリングバッファ（順序は抽象化される）
-// - WaitQueue: Blocked なタスク index のリングバッファ
-// - quantum: 1タスクが連続で実行できる最大 tick 数
-// - 優先度付きスケジューリング:
-//   - ReadyQueue の中から「priority が最大」のタスクを選んで Running にする
-// - tick():
-//    1. KernelActivity の純粋状態遷移 (next_activity_and_action)
-//    2. タイマ / フレーム割当 / メモリ操作（副作用）
-//    3. Running タスクの runtime 更新
-//    4. 疑似的 Blocked 処理（ときどき TaskState::Blocked にする）
-//    5. quantum 消費と QuantumExpired イベント
-//    6. 必要に応じてスケジューラ発動（優先度を考慮）
-//    7. Timer tick で Blocked から 1タスクだけ Wake (WaitQueue → ReadyQueue)
-// - 抽象イベントログ(LogEvent) にすべての状態遷移・スケジューリング・メモリ操作を記録し、dump_events() でダンプ。
-// - メモリ管理については、MemAction(Map/Unmap) を発行し、各タスクごとの AddressSpace で論理整合性をチェックした上で
-//   arch::paging::apply_mem_action() に（今はデモとして Task0 に対してのみ）渡す構造になっている。
+// - Task: TaskId + TaskState + runtime_ticks + time_slice_used + priority + root_page_frame
+// - ReadyQueue / WaitQueue
+// - Task ごとの AddressSpace（論理）
+// - Task0 のみ実ページテーブル操作（arch::paging）
+// - Task1/Task2 は論理 AddressSpace のみ（今は root_page_frame = None）
+//
 
 use bootloader::BootInfo;
+
+mod pagetable_init;
+
 use crate::{arch, logging};
 use crate::mm::PhysicalMemoryManager;
-use crate::mem::addr::{PhysFrame, VirtPage};
+use crate::mem::addr::{PhysFrame, VirtPage, PAGE_SIZE};
 use crate::mem::paging::{MemAction, PageFlags};
 use crate::mem::address_space::{AddressSpace, AddressSpaceError};
+use x86_64::registers::control::Cr3;
+use self::pagetable_init::allocate_new_l4_table;
 
 const MAX_TASKS: usize = 3;
 const EVENT_LOG_CAP: usize = 256;
 
-// デモ用に使う仮想ページ番号（0x100 = 0x0010_0000 = 1MiB）
+// デモ用: 0x0010_0000 (1MiB) → 仮想ページ index
 const DEMO_VIRT_PAGE_INDEX: u64 = 0x100;
-// デモ用に使う物理フレーム番号（0x200 = 0x0020_0000 = 2MiB）
+// デモ用: 0x0020_0000 (2MiB) → 物理フレーム index
 const DEMO_PHYS_FRAME_INDEX: u64 = 0x200;
 
 //
@@ -56,9 +49,14 @@ pub enum TaskState {
 pub struct Task {
     pub id: TaskId,
     pub state: TaskState,
-    pub runtime_ticks: u64,   // タスクの累積実行時間
-    pub time_slice_used: u64, // 現在の量子内で消費した tick 数
-    pub priority: u8,         // ★ 優先度（大きいほど優先）
+    pub runtime_ticks: u64,
+    pub time_slice_used: u64,
+    pub priority: u8,
+
+    /// このタスクが使う L4 ページテーブルの物理フレーム。
+    /// - Task0: 現在 CR3 が指している L4 のフレーム
+    /// - Task1/Task2: いまは None（専用 L4 はまだ未割り当て）
+    pub root_page_frame: Option<PhysFrame>,
 }
 
 //
@@ -80,8 +78,7 @@ pub enum LogEvent {
     WaitDequeued(TaskId),
     RuntimeUpdated(TaskId, u64),
     QuantumExpired(TaskId, u64),
-    /// メモリ関連の抽象イベント（MemAction）が発生したことを記録する。
-    /// どのタスク（=どのアドレス空間）がその操作を起こしたかも一緒に残す。
+    /// どのタスクがどの MemAction を起こしたか
     MemActionApplied {
         task: TaskId,
         action: MemAction,
@@ -90,11 +87,9 @@ pub enum LogEvent {
 
 //
 // ──────────────────────────────────────────────
-// KernelActivity（カーネル内部の状態マシン）
+// KernelActivity / KernelAction
 // ──────────────────────────────────────────────
 //
-// - Idle → UpdatingTimer → AllocatingFrame → MappingDemoPage → Idle → ... と 4 ステップで回る。
-// - MappingDemoPage のフェーズで、デモ用の MemAction(Map/Unmap) を 1 回発行する。
 
 #[derive(Clone, Copy)]
 pub enum KernelActivity {
@@ -109,7 +104,6 @@ enum KernelAction {
     None,
     UpdateTimer,
     AllocateFrame,
-    /// メモリ操作デモ用フェーズを表す。
     MemDemo,
 }
 
@@ -124,18 +118,16 @@ pub struct KernelState {
 
     tick_count: u64,
     time_ticks: u64,
-
     should_halt: bool,
     activity: KernelActivity,
 
-    /// 各タスクごとのアドレス空間。
-    /// - address_spaces[i] は tasks[i] の論理アドレス空間を表す。
+    // 論理アドレス空間（タスクごと）
     address_spaces: [AddressSpace; MAX_TASKS],
 
     // タスク一覧
     tasks: [Task; MAX_TASKS],
     num_tasks: usize,
-    current_task: usize, // 現在 Running のタスク index
+    current_task: usize,
 
     // ReadyQueue（タスク index のリングバッファ）
     ready_queue: [usize; MAX_TASKS],
@@ -156,18 +148,31 @@ pub struct KernelState {
     // 量子（1タスクが連続で実行できる最大 tick 数）
     quantum: u64,
 
-    /// デモ用ページが「タスクごとに論理的にマップされているかどうか」のフラグ。
-    /// - mem_demo_mapped[i] == false のタスクでは MemDemo で Map を発行。
-    /// - true のタスクでは MemDemo で Unmap を発行。
+    /// MemDemo の Map/Unmap 状態（タスクごと）
     mem_demo_mapped: [bool; MAX_TASKS],
 }
 
 impl KernelState {
-    /// カーネルの初期状態を構築する。
+    ///
+    /// new() — カーネル初期化
+    ///
     pub fn new(boot_info: &'static BootInfo) -> Self {
         let phys_mem = PhysicalMemoryManager::new(boot_info);
 
-        // ★ priority を付与（例: Task1=1, Task2=3, Task3=2）
+        // 現在アクティブな L4 ページテーブルの物理フレームを取得
+        let root_frame_for_task0: PhysFrame = {
+            let (level_4_frame, _) = Cr3::read();
+            let phys_u64 = level_4_frame.start_address().as_u64();
+            let frame_index = phys_u64 / PAGE_SIZE;
+            PhysFrame::from_index(frame_index)
+        };
+
+        // ★ phys_mem を mutable にして、新しい L4 を Task1/2 用に確保
+        let mut phys_mem = phys_mem;
+
+        let root1 = None;
+        let root2 = None;
+
         let tasks = [
             Task {
                 id: TaskId(1),
@@ -175,13 +180,15 @@ impl KernelState {
                 runtime_ticks: 0,
                 time_slice_used: 0,
                 priority: 1,
+                root_page_frame: Some(root_frame_for_task0),
             },
             Task {
                 id: TaskId(2),
                 state: TaskState::Ready,
                 runtime_ticks: 0,
                 time_slice_used: 0,
-                priority: 3, // 一番高い
+                priority: 3,          // 一番高い
+                root_page_frame: root1, // Some(...) or None
             },
             Task {
                 id: TaskId(3),
@@ -189,12 +196,13 @@ impl KernelState {
                 runtime_ticks: 0,
                 time_slice_used: 0,
                 priority: 2,
+                root_page_frame: root2,
             },
         ];
 
-        // ReadyQueue: 最初は [2, 3] が Ready（順序は後で priority で再解釈）
+        // （以下は今まで通り）
         let ready_queue = [1, 2, 0];
-        let rq_len = 2usize;
+        let rq_len = 2;
 
         KernelState {
             phys_mem,
@@ -203,12 +211,11 @@ impl KernelState {
             should_halt: false,
             activity: KernelActivity::Idle,
 
-            // 各タスクは独自の AddressSpace を持つ（初期状態は全て空）。
             address_spaces: [AddressSpace::new(); MAX_TASKS],
 
             tasks,
             num_tasks: MAX_TASKS,
-            current_task: 0, // Task 1 が最初に Running
+            current_task: 0,
 
             ready_queue,
             rq_head: 0,
@@ -224,22 +231,26 @@ impl KernelState {
             event_log_len: 0,
 
             quantum: 5,
-
             mem_demo_mapped: [false; MAX_TASKS],
         }
     }
 
+
+    ///
+    /// イベントをログに積む
+    ///
     fn push_event(&mut self, ev: LogEvent) {
-        if self.event_log_len < self.event_log.len() {
+        if self.event_log_len < EVENT_LOG_CAP {
             self.event_log[self.event_log_len] = Some(ev);
             self.event_log_len += 1;
         }
     }
 
-    /// ブート時に物理フレームをいくつか確保してみるデモ処理。
+    ///
+    /// bootstrap — 物理フレームをいくつか確保
+    ///
     pub fn bootstrap(&mut self) {
         logging::info("KernelState::bootstrap()");
-
         for _ in 0..5 {
             match self.phys_mem.allocate_frame() {
                 Some(_) => {
@@ -268,27 +279,22 @@ impl KernelState {
         self.ready_queue[self.rq_tail] = idx;
         self.rq_tail = (self.rq_tail + 1) % MAX_TASKS;
         self.rq_len += 1;
-
-        let tid = self.tasks[idx].id;
-        self.push_event(LogEvent::ReadyQueued(tid));
+        self.push_event(LogEvent::ReadyQueued(self.tasks[idx].id));
     }
 
-    /// ReadyQueue から「priority が最大のタスク index」を選んで取り出す。
     fn dequeue_ready_highest_priority(&mut self) -> Option<usize> {
         if self.rq_len == 0 {
             return None;
         }
 
-        // ReadyQueue 内から最も priority の高いタスクを探す
-        let mut best_pos: usize = self.rq_head;
-        let mut best_idx: usize = self.ready_queue[self.rq_head];
-        let mut best_prio: u8 = self.tasks[best_idx].priority;
+        let mut best_pos = self.rq_head;
+        let mut best_idx = self.ready_queue[self.rq_head];
+        let mut best_prio = self.tasks[best_idx].priority;
 
         for offset in 1..self.rq_len {
             let pos = (self.rq_head + offset) % MAX_TASKS;
             let idx = self.ready_queue[pos];
             let prio = self.tasks[idx].priority;
-
             if prio > best_prio {
                 best_prio = prio;
                 best_idx = idx;
@@ -296,24 +302,18 @@ impl KernelState {
             }
         }
 
-        // best_pos から 1 要素取り出す。
-        // 「最後の要素」を best_pos に移して穴を埋める簡易実装。
         let last_pos = (self.rq_head + self.rq_len - 1) % MAX_TASKS;
         self.ready_queue[best_pos] = self.ready_queue[last_pos];
-
-        // tail と長さを更新
-        self.rq_tail = (self.rq_head + self.rq_len - 1) % MAX_TASKS;
+        self.rq_tail = last_pos;
         self.rq_len -= 1;
 
-        let tid = self.tasks[best_idx].id;
-        self.push_event(LogEvent::ReadyDequeued(tid));
-
+        self.push_event(LogEvent::ReadyDequeued(self.tasks[best_idx].id));
         Some(best_idx)
     }
 
     //
     // ──────────────────────────────────────────────
-    // WaitQueue 操作（Blocked タスク）
+    // WaitQueue 操作
     // ──────────────────────────────────────────────
     //
 
@@ -324,9 +324,7 @@ impl KernelState {
         self.wait_queue[self.wq_tail] = idx;
         self.wq_tail = (self.wq_tail + 1) % MAX_TASKS;
         self.wq_len += 1;
-
-        let tid = self.tasks[idx].id;
-        self.push_event(LogEvent::WaitQueued(tid));
+        self.push_event(LogEvent::WaitQueued(self.tasks[idx].id));
     }
 
     fn dequeue_wait(&mut self) -> Option<usize> {
@@ -336,15 +334,13 @@ impl KernelState {
         let idx = self.wait_queue[self.wq_head];
         self.wq_head = (self.wq_head + 1) % MAX_TASKS;
         self.wq_len -= 1;
-
-        let tid = self.tasks[idx].id;
-        self.push_event(LogEvent::WaitDequeued(tid));
+        self.push_event(LogEvent::WaitDequeued(self.tasks[idx].id));
         Some(idx)
     }
 
     //
     // ──────────────────────────────────────────────
-    // スケジューラ：Running → ReadyQueue, ReadyQueue → Running（優先度付き）
+    // スケジューラ
     // ──────────────────────────────────────────────
     //
 
@@ -352,7 +348,6 @@ impl KernelState {
         let prev_idx = self.current_task;
         let prev_id = self.tasks[prev_idx].id;
 
-        // Running → Ready に戻して ReadyQueue へ（Block されている場合はここまで来ない前提）
         if self.tasks[prev_idx].state == TaskState::Running {
             self.tasks[prev_idx].state = TaskState::Ready;
             self.tasks[prev_idx].time_slice_used = 0;
@@ -360,126 +355,93 @@ impl KernelState {
             self.enqueue_ready(prev_idx);
         }
 
-        // ReadyQueue から「priority 最大」のタスクを選ぶ
         if let Some(next_idx) = self.dequeue_ready_highest_priority() {
             let next_id = self.tasks[next_idx].id;
-
             self.tasks[next_idx].state = TaskState::Running;
             self.tasks[next_idx].time_slice_used = 0;
             self.current_task = next_idx;
 
             logging::info(" switched to task");
             logging::info_u64(" task_id", next_id.0);
-            logging::info_u64(" priority", self.tasks[next_idx].priority as u64);
 
             self.push_event(LogEvent::TaskSwitched(next_id));
-            self.push_event(LogEvent::TaskStateChanged(
-                next_id,
-                TaskState::Running,
-            ));
+            self.push_event(LogEvent::TaskStateChanged(next_id, TaskState::Running));
         } else {
-            // ReadyQueue が空なら、実行可能なタスクが無い
             logging::info(" no ready tasks; scheduler idle");
         }
     }
 
     //
     // ──────────────────────────────────────────────
-    // Running タスクの runtime を 1 tick 増やす
+    // Runtime 更新
     // ──────────────────────────────────────────────
     //
 
     fn update_runtime(&mut self) {
         let idx = self.current_task;
-        let tid = self.tasks[idx].id;
-
+        let id = self.tasks[idx].id;
         self.tasks[idx].runtime_ticks += 1;
-
         logging::info_u64(" runtime_ticks", self.tasks[idx].runtime_ticks);
-
-        self.push_event(LogEvent::RuntimeUpdated(
-            tid,
-            self.tasks[idx].runtime_ticks,
-        ));
+        self.push_event(LogEvent::RuntimeUpdated(id, self.tasks[idx].runtime_ticks));
     }
 
     //
     // ──────────────────────────────────────────────
-    // Running タスクの time_slice_used を 1 tick 増やし、
-    // quantum を超えたら QuantumExpired イベントを記録してスケジューリングする。
+    // Time slice 更新
     // ──────────────────────────────────────────────
     //
 
     fn update_time_slice_and_maybe_schedule(&mut self) {
         let idx = self.current_task;
-        let tid = self.tasks[idx].id;
-
+        let id = self.tasks[idx].id;
         self.tasks[idx].time_slice_used += 1;
-        let used = self.tasks[idx].time_slice_used;
+        logging::info_u64(" time_slice_used", self.tasks[idx].time_slice_used);
 
-        logging::info_u64(" time_slice_used", used);
-
-        if used >= self.quantum {
+        if self.tasks[idx].time_slice_used >= self.quantum {
             logging::info(" quantum expired; scheduling next task");
-            self.push_event(LogEvent::QuantumExpired(tid, used));
+            self.push_event(LogEvent::QuantumExpired(id, self.tasks[idx].time_slice_used));
             self.schedule_next_task();
         }
     }
 
     //
     // ──────────────────────────────────────────────
-    // 疑似的な Blocked 処理:
+    // 疑似 Blocked / Wake
     // ──────────────────────────────────────────────
     //
 
     fn maybe_block_current_task(&mut self) {
-        // デモ用ルール:
-        // - tick_count が 0 でなく、かつ 7 の倍数のとき
-        // - かつ 現在の task_id が 2 のとき
         if self.tick_count != 0
             && self.tick_count % 7 == 0
             && self.tasks[self.current_task].id.0 == 2
         {
             let idx = self.current_task;
-            let tid = self.tasks[idx].id;
+            let id = self.tasks[idx].id;
 
             logging::info(" blocking current task (fake I/O wait)");
             self.tasks[idx].state = TaskState::Blocked;
             self.tasks[idx].time_slice_used = 0;
 
-            self.push_event(LogEvent::TaskStateChanged(tid, TaskState::Blocked));
+            self.push_event(LogEvent::TaskStateChanged(id, TaskState::Blocked));
 
-            // WaitQueue に入れて、次のタスクへ切り替え
             self.enqueue_wait(idx);
             self.schedule_next_task();
         }
     }
 
-    //
-    // ──────────────────────────────────────────────
-    // 疑似的な Wake 処理:
-    // ──────────────────────────────────────────────
-    //
-
     fn maybe_wake_one_task(&mut self) {
         if let Some(idx) = self.dequeue_wait() {
-            let tid = self.tasks[idx].id;
-
+            let id = self.tasks[idx].id;
             logging::info(" waking 1 blocked task");
             self.tasks[idx].state = TaskState::Ready;
-
-            self.push_event(LogEvent::TaskStateChanged(tid, TaskState::Ready));
-
-            // ReadyQueue に戻しておく
+            self.push_event(LogEvent::TaskStateChanged(id, TaskState::Ready));
             self.enqueue_ready(idx);
         }
     }
 
     //
     // ──────────────────────────────────────────────
-    // MemAction を実際のページテーブル操作へ渡すラッパ。
-    // - self 内の phys_mem を arch::paging 側に渡す。
-    // - ここ自体は safe なままにしておき、unsafe は arch 側に閉じ込める。
+    // 実ページテーブル操作（Task0のみ）
     // ──────────────────────────────────────────────
     //
 
@@ -501,10 +463,8 @@ impl KernelState {
         }
 
         self.tick_count += 1;
-
         logging::info("KernelState::tick()");
         logging::info_u64(" tick_count", self.tick_count);
-
         self.push_event(LogEvent::TickStarted(self.tick_count));
 
         let running = self.tasks[self.current_task].id;
@@ -512,7 +472,6 @@ impl KernelState {
 
         let (next_activity, action) = next_activity_and_action(self.activity);
 
-        // 副作用：タイマ / フレーム割り当て / メモリ操作
         match action {
             KernelAction::None => {
                 logging::info(" action = None");
@@ -522,8 +481,6 @@ impl KernelState {
                 self.time_ticks += 1;
                 logging::info_u64(" time_ticks", self.time_ticks);
                 self.push_event(LogEvent::TimerUpdated(self.time_ticks));
-
-                // Timer 更新のタイミングで 1タスクだけ Wake してみる
                 self.maybe_wake_one_task();
             }
             KernelAction::AllocateFrame => {
@@ -532,7 +489,7 @@ impl KernelState {
                     logging::info(" allocated usable frame (tick)");
                     self.push_event(LogEvent::FrameAllocated);
                 } else {
-                    logging::error(" no more frames; halting later");
+                    logging::error(" no more usable frames; halting later");
                     self.should_halt = true;
                 }
             }
@@ -546,7 +503,6 @@ impl KernelState {
                 let task_idx = self.current_task;
                 let task_id = self.tasks[task_idx].id;
 
-                // ★ タスクごとのフラグに基づき Map / Unmap を切り替える
                 let mem_action = if !self.mem_demo_mapped[task_idx] {
                     logging::info(" mem_demo: issuing Map (for current task)");
                     MemAction::Map { page, frame, flags }
@@ -555,25 +511,15 @@ impl KernelState {
                     MemAction::Unmap { page }
                 };
 
-                // 対象のタスクのアドレススペースを取り出す
                 let aspace = &mut self.address_spaces[task_idx];
 
-                // まずは論理アドレス空間に適用して、不整合がないかチェック
                 match aspace.apply(mem_action) {
                     Ok(()) => {
                         logging::info(" address_space.apply: OK");
+                        // Map/Unmap 状態をトグル
+                        self.mem_demo_mapped[task_idx] = !self.mem_demo_mapped[task_idx];
 
-                        // 状態フラグを更新
-                        match mem_action {
-                            MemAction::Map { .. } => {
-                                self.mem_demo_mapped[task_idx] = true;
-                            }
-                            MemAction::Unmap { .. } => {
-                                self.mem_demo_mapped[task_idx] = false;
-                            }
-                        }
-
-                        // ★ 実ページテーブル操作は「Task0 だけ」で行う（今はカーネル共通アドレス空間のため）
+                        // ★ Task0 だけ実ページテーブル操作
                         if task_idx == 0 {
                             logging::info(" mem_demo: applying arch paging (task_idx = 0)");
                             self.apply_mem_action(mem_action);
@@ -581,7 +527,6 @@ impl KernelState {
                             logging::info(" mem_demo: skip arch paging (non-zero task, logical only)");
                         }
 
-                        // 抽象イベントとしては、全タスク分をちゃんと記録
                         self.push_event(LogEvent::MemActionApplied {
                             task: task_id,
                             action: mem_action,
@@ -600,16 +545,10 @@ impl KernelState {
             }
         }
 
-        // Running タスクの累積 runtime を更新
         self.update_runtime();
-
-        // 疑似的に「時々 Blocked にする」
         self.maybe_block_current_task();
-
-        // quantum 消費と、必要ならスケジューラ発動（優先度付き）
         self.update_time_slice_and_maybe_schedule();
 
-        // 次の KernelActivity へ
         self.activity = next_activity;
     }
 
@@ -619,33 +558,38 @@ impl KernelState {
 
     //
     // ──────────────────────────────────────────────
-    // 抽象イベントログ + 各タスクの AddressSpace の中身を VGA にダンプ
+    // dump_events — EventLog + AddressSpace dump
     // ──────────────────────────────────────────────
     //
 
     pub fn dump_events(&self) {
         logging::info("=== KernelState Event Log Dump ===");
-
         for i in 0..self.event_log_len {
             if let Some(ev) = self.event_log[i] {
                 log_event_to_vga(ev);
             }
         }
-
         logging::info("=== End of Event Log ===");
 
-        // ★ 各タスクの AddressSpace の中身もダンプする
         logging::info("=== AddressSpace Dump (per task) ===");
-        for task_idx in 0..self.num_tasks {
-            let task = self.tasks[task_idx];
+        for i in 0..self.num_tasks {
+            let task = self.tasks[i];
 
             logging::info(" Task AddressSpace:");
-            logging::info_u64("  task_index", task_idx as u64);
+            logging::info_u64("  task_index", i as u64);
             logging::info_u64("  task_id", task.id.0);
 
-            let aspace = &self.address_spaces[task_idx];
-            let count = aspace.mapping_count();
-            logging::info_u64("  mapping_count", count as u64);
+            match task.root_page_frame {
+                Some(root) => {
+                    logging::info_u64("  root_page_frame_index", root.number);
+                }
+                None => {
+                    logging::info("  root_page_frame_index = None");
+                }
+            }
+
+            let aspace = &self.address_spaces[i];
+            logging::info_u64("  mapping_count", aspace.mapping_count() as u64);
 
             aspace.for_each_mapping(|m| {
                 logging::info("  MAPPING:");
@@ -659,7 +603,9 @@ impl KernelState {
 }
 
 //
-// LogEvent → VGA 出力（副作用）
+// ──────────────────────────────────────────────
+// LogEvent → VGA 出力
+// ──────────────────────────────────────────────
 //
 
 fn log_event_to_vga(ev: LogEvent) {
@@ -734,7 +680,9 @@ fn log_event_to_vga(ev: LogEvent) {
 }
 
 //
-// 純粋な KernelActivity → (次状態, アクション)
+// ──────────────────────────────────────────────
+// KernelActivity → (次状態, アクション)
+// ──────────────────────────────────────────────
 //
 
 fn next_activity_and_action(current: KernelActivity) -> (KernelActivity, KernelAction) {
@@ -746,20 +694,20 @@ fn next_activity_and_action(current: KernelActivity) -> (KernelActivity, KernelA
         KernelActivity::AllocatingFrame =>
             (KernelActivity::MappingDemoPage, KernelAction::AllocateFrame),
         KernelActivity::MappingDemoPage =>
-        // デモ用に、毎サイクル 1 回だけ MemDemo を発行してみる。
             (KernelActivity::Idle, KernelAction::MemDemo),
     }
 }
 
 //
+// ──────────────────────────────────────────────
 // カーネル起動エントリ
+// ──────────────────────────────────────────────
 //
 
 pub fn start(boot_info: &'static BootInfo) {
     logging::info("kernel::start()");
 
     let mut kstate = KernelState::new(boot_info);
-
     kstate.bootstrap();
 
     let max_ticks = 40;
@@ -772,6 +720,5 @@ pub fn start(boot_info: &'static BootInfo) {
     }
 
     kstate.dump_events();
-
     arch::halt_loop();
 }
