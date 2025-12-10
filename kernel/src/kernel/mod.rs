@@ -75,8 +75,15 @@ pub enum LogEvent {
     RuntimeUpdated(TaskId, u64),
     QuantumExpired(TaskId, u64),
 
+    /// MemActionApplied:
+    /// - task:        この MemAction を起こしたタスクID
+    /// - address_space: 対象となる AddressSpaceId
+    /// - action:      Map(page, frame, flags) または Unmap(page)
+    /// - このイベントは「抽象メモリモデルに対する操作」を表し、
+    ///   実際のページテーブル更新は arch::paging 側で処理される。
     MemActionApplied {
         task: TaskId,
+        address_space: AddressSpaceId,
         action: MemAction,
     },
 }
@@ -449,9 +456,15 @@ impl KernelState {
         }
     }
 
-    //
-    // tick()
-    //
+    /// tick():
+    /// - 現在の KernelActivity に応じて、(次の KernelActivity, KernelAction) を決める
+    /// - Timer 更新 / Frame 割当 / MemDemo のいずれかを1ステップだけ行う
+    /// - 抽象的には、次のような状態遷移:
+    ///     Idle            -> UpdatingTimer
+    ///     UpdatingTimer   -> AllocatingFrame
+    ///     AllocatingFrame -> MappingDemoPage
+    ///     MappingDemoPage -> Idle
+    /// - すべての主要イベントは LogEvent に記録される。
     pub fn tick(&mut self) {
         if self.should_halt {
             return;
@@ -532,6 +545,7 @@ impl KernelState {
 
                         self.push_event(LogEvent::MemActionApplied {
                             task: task_id,
+                            address_space: task.address_space_id,
                             action: mem_action,
                         });
                     }
@@ -553,6 +567,9 @@ impl KernelState {
         self.update_time_slice_and_maybe_schedule();
 
         self.activity = next_activity;
+
+        // 簡易的な不変条件チェック（デバッグ用）
+        self.debug_check_invariants();
     }
 
     pub fn should_halt(&self) -> bool {
@@ -609,6 +626,28 @@ impl KernelState {
         }
 
         logging::info("=== End of AddressSpace Dump ===");
+    }
+
+    /// 簡易的な不変条件チェック。
+    /// - 各タスクの address_space_id が有効範囲内かどうか
+    /// - 将来 invariant を増やしたいときはここに追加していく
+    fn debug_check_invariants(&self) {
+        for (idx, task) in self.tasks.iter().enumerate().take(self.num_tasks) {
+            let as_id = task.address_space_id.0;
+            if as_id >= MAX_TASKS {
+                logging::error("INVARIANT VIOLATION: address_space_id out of range");
+                logging::error(" offending_task_index");
+                logging::info_u64(" offending_task_index", idx as u64);
+                logging::info_u64(" as_id", as_id as u64);
+            }
+
+            // AddressSpace が必ず存在するという前提をチェック
+            // （as_id < MAX_TASKS であることを想定）
+            // ここでは単に参照してみて、ログだけ出しておく。
+            if as_id < MAX_TASKS {
+                let _ = &self.address_spaces[as_id];
+            }
+        }
     }
 }
 
@@ -671,9 +710,10 @@ fn log_event_to_vga(ev: LogEvent) {
             logging::info_u64(" used_ticks", used);
         }
 
-        LogEvent::MemActionApplied { task, action } => {
+        LogEvent::MemActionApplied { task, address_space, action } => {
             logging::info("EVENT: MemActionApplied");
             logging::info_u64(" task", task.0);
+            logging::info_u64(" address_space_id", address_space.0 as u64);
 
             match action {
                 MemAction::Map { page, frame, flags } => {
