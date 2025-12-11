@@ -85,14 +85,32 @@ impl VirtPage {
     }
 }
 
+// --- Debug 実装（ログで見やすくするため） ---
+
+impl fmt::Debug for PhysAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // 物理アドレスを 0x... 形式で表示
+        write!(f, "PhysAddr({:#x})", self.0)
+    }
+}
+
+impl fmt::Debug for VirtAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // 仮想アドレスを 0x... 形式で表示
+        write!(f, "VirtAddr({:#x})", self.0)
+    }
+}
+
 impl fmt::Debug for PhysFrame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // フレーム先頭の物理アドレスを表示
         write!(f, "PhysFrame({:#x})", self.start_address().0)
     }
 }
 
 impl fmt::Debug for VirtPage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // ページ先頭の仮想アドレスを表示
         write!(f, "VirtPage({:#x})", self.start_address().0)
     }
 }

@@ -1,51 +1,84 @@
 // kernel/src/mem/address_space.rs
 //
 // 役割:
-// - 論理的なアドレス空間（どの仮想ページがどの物理フレームにマップされているか）を表す。
-// - フォーマル検証しやすいように、ページ単位のMappingを固定長配列で保持する。
-// - 「このアドレス空間に対して MemAction(Map/Unmap) を適用するとどうなるか」を純粋関数として表現する。
-// - root_page_frame は、このアドレス空間に対応する L4 ページテーブルの物理フレーム。
-//   （※ 現時点では Task0 のカーネル空間用だけが設定される）
+// - 論理アドレス空間（プロセスやカーネルのメモリ空間）を表現する。
+// - どの仮想ページがどの物理フレームにどの権限でマップされているかを保持する。
+// - kind で「カーネル用かユーザ用か」を明示し、将来の権限チェックのベースにする。
 
 use crate::mem::addr::{PhysFrame, VirtPage};
 use crate::mem::paging::{MemAction, PageFlags};
 
-/// 1つのアドレス空間の中で管理する最大マッピング数。
-const MAX_MAPPINGS: usize = 64;
+/// アドレス空間の種類（役割）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddressSpaceKind {
+    /// カーネル専用のアドレス空間（カーネルコードやカーネル用スタックなど）
+    Kernel,
+    /// ユーザプロセス用のアドレス空間
+    User,
+}
 
 /// 1つの仮想ページに対するマッピング情報。
 #[derive(Clone, Copy)]
 pub struct Mapping {
-    pub page: VirtPage,
+    pub page:  VirtPage,
     pub frame: PhysFrame,
     pub flags: PageFlags,
 }
 
-/// アドレス空間全体を表す構造。
-#[derive(Clone, Copy)]
+/// 管理可能なマッピング数上限（デモ用の固定長）。
+const MAX_MAPPINGS: usize = 64;
+
+/// 複数のタスクから共有されることもある論理アドレス空間。
 pub struct AddressSpace {
-    pub root_page_frame: Option<PhysFrame>,          // L4 page table の物理フレーム
-    mappings: [Option<Mapping>; MAX_MAPPINGS],       // 論理的なページマップ
+    /// このアドレス空間がカーネル用かユーザ用か。
+    pub kind: AddressSpaceKind,
+    /// このアドレス空間に対応する L4 PageTable の物理フレーム（将来 CR3 に使う）。
+    pub root_page_frame: Option<PhysFrame>,
+    /// 仮想ページ→物理フレームのマッピング情報。
+    mappings: [Option<Mapping>; MAX_MAPPINGS],
 }
 
 /// AddressSpace 更新時のエラー種別。
 #[derive(Clone, Copy, Debug)]
 pub enum AddressSpaceError {
+    /// すでに同じ page がマップされているのに、Map が来た。
     AlreadyMapped,
+    /// その page はマップされていないのに、Unmap が来た。
     NotMapped,
+    /// 登録できるスロットがもう残っていない。
     CapacityExceeded,
 }
 
 impl AddressSpace {
-    /// 空のアドレス空間を作成する。
-    pub fn new() -> Self {
+    /// カーネル用アドレス空間を新規に作成する。
+    pub fn new_kernel() -> Self {
         AddressSpace {
+            kind: AddressSpaceKind::Kernel,
             root_page_frame: None,
             mappings: [None; MAX_MAPPINGS],
         }
     }
 
-    /// このアドレス空間に MemAction を適用する（論理的な状態更新）。
+    /// ユーザ用アドレス空間を新規に作成する。
+    pub fn new_user() -> Self {
+        AddressSpace {
+            kind: AddressSpaceKind::User,
+            root_page_frame: None,
+            mappings: [None; MAX_MAPPINGS],
+        }
+    }
+
+    /// 汎用的に kind を指定して新規作成したい場合はこちら。
+    #[allow(dead_code)]
+    pub fn new_with_kind(kind: AddressSpaceKind) -> Self {
+        AddressSpace {
+            kind,
+            root_page_frame: None,
+            mappings: [None; MAX_MAPPINGS],
+        }
+    }
+
+    /// このアドレス空間に対して MemAction (Map/Unmap) を適用する。
     pub fn apply(&mut self, action: MemAction) -> Result<(), AddressSpaceError> {
         match action {
             MemAction::Map { page, frame, flags } => {
@@ -58,7 +91,7 @@ impl AddressSpace {
                     }
                 }
 
-                // 空きスロットに追加
+                // 空きスロットに登録
                 for entry in self.mappings.iter_mut() {
                     if entry.is_none() {
                         *entry = Some(Mapping { page, frame, flags });
@@ -69,6 +102,7 @@ impl AddressSpace {
                 Err(AddressSpaceError::CapacityExceeded)
             }
             MemAction::Unmap { page } => {
+                // 対応するマッピングを探して削除
                 for entry in self.mappings.iter_mut() {
                     if let Some(m) = entry {
                         if m.page == page {
@@ -82,12 +116,12 @@ impl AddressSpace {
         }
     }
 
-    /// 登録されているマッピング数（デバッグ / 可視化用）
+    /// 現在のマッピング数（デバッグ用）。
     pub fn mapping_count(&self) -> usize {
         self.mappings.iter().filter(|m| m.is_some()).count()
     }
 
-    /// すべてのマッピングに対してコールバックを呼び出す（デバッグ / 可視化用）。
+    /// 各マッピングに対してクロージャを適用する（ダンプ等に使用）。
     pub fn for_each_mapping<F>(&self, mut f: F)
     where
         F: FnMut(&Mapping),
