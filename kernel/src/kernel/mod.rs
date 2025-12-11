@@ -7,6 +7,23 @@
 // - Task0 のみ実ページテーブルへの反映（map_to/unmap）
 // - switch_address_space(root) で「アドレス空間切替」の抽象イベントを出す
 //
+// [設計上の不変条件（このモジュールにおける仕様）]
+//
+// 1. AddressSpaceId と kind の関係
+//    - AddressSpaceId(0) は常に Kernel アドレス空間（kind = Kernel）。
+//    - AddressSpaceId(1..=N-1) は User アドレス空間（kind = User）。
+//
+// 2. root_page_frame に関する仕様（プロトタイプ段階）
+//    - Kernel アドレス空間 (id=0) だけが root_page_frame = Some(…) を持つ。
+//    - User アドレス空間 (id>=1) は root_page_frame = None のまま（論理空間のみ）。
+//
+// 3. Task と AddressSpace の対応（現プロトタイプ仕様）
+//    - tasks[i].address_space_id == AddressSpaceId(i) が成り立つ。（i < num_tasks）
+//    - Task index 0（TaskId(1)）は Kernel アドレス空間 (AddressSpaceId(0)) に属する。
+//    - Task index 1 以降（TaskId(2..)) は User アドレス空間 (AddressSpaceId(1..)) に属する。
+//
+// これらは「設計上守りたいもの」を明文化したものであり、
+// debug_check_invariants() によってログ出力ベースで検証される。
 
 use bootloader::BootInfo;
 use crate::{arch, logging};
@@ -18,6 +35,18 @@ use x86_64::registers::control::Cr3;
 
 const MAX_TASKS: usize = 3;
 const EVENT_LOG_CAP: usize = 256;
+
+// プロトタイプ用の固定 ID（設計仕様をコードで表現するための定数）
+const KERNEL_ASID_INDEX: usize = 0;          // AddressSpaces[0] は Kernel
+const FIRST_USER_ASID_INDEX: usize = 1;      // AddressSpaces[1..] は User
+
+const TASK0_INDEX: usize = 0;
+const TASK1_INDEX: usize = 1;
+const TASK2_INDEX: usize = 2;
+
+const TASK0_ID: TaskId = TaskId(1);
+const TASK1_ID: TaskId = TaskId(2);
+const TASK2_ID: TaskId = TaskId(3);
 
 // デモ用: 0x0010_0000 (1MiB) → 仮想ページ index
 const DEMO_VIRT_PAGE_INDEX: u64 = 0x100;
@@ -172,28 +201,28 @@ impl KernelState {
         //
         let tasks = [
             Task {
-                id: TaskId(1),
+                id: TASK0_ID,
                 state: TaskState::Running,
                 runtime_ticks: 0,
                 time_slice_used: 0,
                 priority: 1,
-                address_space_id: AddressSpaceId(0),
+                address_space_id: AddressSpaceId(KERNEL_ASID_INDEX),
             },
             Task {
-                id: TaskId(2),
+                id: TASK1_ID,
                 state: TaskState::Ready,
                 runtime_ticks: 0,
                 time_slice_used: 0,
                 priority: 3,
-                address_space_id: AddressSpaceId(1),
+                address_space_id: AddressSpaceId(FIRST_USER_ASID_INDEX),
             },
             Task {
-                id: TaskId(3),
+                id: TASK2_ID,
                 state: TaskState::Ready,
                 runtime_ticks: 0,
                 time_slice_used: 0,
                 priority: 2,
-                address_space_id: AddressSpaceId(2),
+                address_space_id: AddressSpaceId(FIRST_USER_ASID_INDEX + 1),
             },
         ];
 
@@ -208,7 +237,7 @@ impl KernelState {
         ];
 
         // Task0 の AddressSpace(0) に root_page_frame を設定
-        address_spaces[0].root_page_frame = Some(root_frame_for_task0);
+        address_spaces[KERNEL_ASID_INDEX].root_page_frame = Some(root_frame_for_task0);
 
         KernelState {
             phys_mem,
@@ -250,16 +279,72 @@ impl KernelState {
     //
     // 簡易的な不変条件チェック（デバッグ用）
     //
+    //
+    // 簡易的な不変条件チェック（デバッグ用）
+    //
     fn debug_check_invariants(&self) {
+        // 1. Kernel アドレス空間 (AddressSpaceId(0)) に関する invariant
+        {
+            let kernel_as = &self.address_spaces[KERNEL_ASID_INDEX];
+
+            if kernel_as.kind != AddressSpaceKind::Kernel {
+                logging::error("INVARIANT VIOLATION: address_spaces[0] is not Kernel");
+            }
+
+            if kernel_as.root_page_frame.is_none() {
+                logging::error("INVARIANT VIOLATION: kernel address space has no root_page_frame");
+            }
+        }
+
+        // 2. User アドレス空間 (AddressSpaceId >= 1) に関する invariant（プロトタイプ仕様）
+        for as_idx in FIRST_USER_ASID_INDEX..self.num_tasks {
+            let aspace = &self.address_spaces[as_idx];
+
+            if aspace.kind != AddressSpaceKind::User {
+                logging::error("INVARIANT VIOLATION: user address space kind is not User");
+                logging::info_u64(" offending_as_idx", as_idx as u64);
+            }
+
+            // プロトタイプでは「User はまだ root_page_frame を持たない」という設計
+            if aspace.root_page_frame.is_some() {
+                logging::error("INVARIANT VIOLATION: user address space has root_page_frame (prototype spec expects None)");
+                logging::info_u64(" offending_as_idx", as_idx as u64);
+            }
+        }
+
+        // 3. Task と AddressSpaceId の対応に関する invariant
         for (idx, task) in self.tasks.iter().enumerate().take(self.num_tasks) {
             let as_id = task.address_space_id.0;
+
+            // (既存チェック) 範囲チェック
             if as_id >= MAX_TASKS {
                 logging::error("INVARIANT VIOLATION: address_space_id out of range");
                 logging::info_u64(" offending_task_index", idx as u64);
                 logging::info_u64(" as_id", as_id as u64);
-            } else {
-                // as_id が範囲内であることを確認するだけ
-                let _ = &self.address_spaces[as_id];
+                continue;
+            }
+
+            // (プロトタイプ仕様) tasks[idx].address_space_id == AddressSpaceId(idx)
+            if as_id != idx {
+                logging::error("INVARIANT VIOLATION: task.address_space_id != task index (prototype spec)");
+                logging::info_u64(" task_index", idx as u64);
+                logging::info_u64(" task_address_space_id", as_id as u64);
+            }
+
+            let aspace = &self.address_spaces[as_id];
+
+            // Task0 は Kernel アドレス空間を使うべき
+            if idx == TASK0_INDEX && aspace.kind != AddressSpaceKind::Kernel {
+                logging::error("INVARIANT VIOLATION: Task0 is not in Kernel address space");
+                logging::info_u64(" task_index", idx as u64);
+                logging::info_u64(" as_id", as_id as u64);
+            }
+
+            // Task1 以降は User アドレス空間を使うべき
+            if idx >= FIRST_USER_ASID_INDEX && aspace.kind != AddressSpaceKind::User {
+                logging::error("INVARIANT VIOLATION: user task is not in User address space");
+                logging::info_u64(" task_index", idx as u64);
+                logging::info_u64(" as_id", as_id as u64);
             }
         }
     }
