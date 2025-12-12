@@ -1,19 +1,51 @@
 # formal-os
 
-A pre-formal-verification microkernel written in Rust.  
+A **pre-formal-verification microkernel prototype** written in Rust.  
 Boots via `bootloader` v0.9 + `bootimage`, designed to run cleanly under QEMU x86_64.
 
 The project intentionally keeps the kernel small, layered, and analyzable.  
-The long-term goal is to evolve this into a formally verifiable operating system.
+The long-term goal is to evolve this into a **formally verifiable operating system**.
 
 ---
 
-## Current Features (as of 2025-02)
+## Current Features (as of 2025-12)
 
 ### Boot Infrastructure
 - Uses `bootloader` v0.9 and `bootimage` to construct a bootable image.
 - Runs on QEMU x86_64 in 64-bit long mode.
 - Provides a minimal VGA/serial logging backend.
+
+### Kernel Core (Formal-Friendly State Machine)
+- `next_activity_and_action()` is a **pure transition function** (no side effects).
+- `tick()` executes the derived side effects and records an abstract trace.
+- Invariant checks (`debug_check_invariants`) are used to detect design violations early.
+
+### Task Scheduling
+- Task states: `Ready`, `Running`, `Blocked`.
+- Priority-based selection with a quantum (time slice) per task.
+- Synthetic blocking/waking for demonstration.
+- Ready/Wait queues are implemented as **fixed-size arrays + length** (order intentionally abstracted).
+
+### Memory / Address Spaces
+#### Architecture-independent (spec layer)
+- `MemAction` represents abstract mapping operations:  
+  `Map { page, frame, flags }` / `Unmap { page }`
+- Each task has its own logical `AddressSpace` storing mappings (`VirtPage ↔ PhysFrame` + flags).
+- Safety checks prevent double-mapping, unmapping unmapped pages, and capacity overflow.
+- AddressSpace contents can be dumped at shutdown.
+
+#### Hardware-backed paging (x86_64)
+- Uses `OffsetPageTable` for real page table operations when enabled.
+- `Task0` (kernel AS) performs a real map/unmap demo and validates it with a memory read/write test.
+- **User AddressSpaces now have real PML4 roots**:
+  - Each user AS receives `root_page_frame = Some(...)`.
+  - User PML4 is initialized by copying the kernel PML4 **high-half (entries 256..512)** while keeping low-half empty.
+- Because the kernel is currently running in the low-half (no high-half kernel placement yet), **real CR3 switching is gated**:
+  - `configure_cr3_switch_safety(code_addr, stack_addr)` enables real CR3 writes only if both addresses are in `KERNEL_SPACE_START..`.
+  - When unsafe, switching remains logical/observational only.
+- To keep progress while CR3 switching is gated, the kernel can still:
+  - Apply mapping operations directly to **arbitrary PML4 roots** (without switching CR3).
+  - Verify results using a page-table translation check (`translate: OK / NONE`).
 
 ---
 
@@ -27,10 +59,11 @@ KernelState
  ├─ time_ticks              : simplified timer
  ├─ tasks[]                 : Task objects (TaskId / TaskState / priority)
  ├─ current_task            : index of running task
- ├─ ready_queue[]           : Ready tasks (ring buffer)
- ├─ wait_queue[]            : Blocked tasks (ring buffer)
- ├─ address_spaces[]        : logical AddressSpace per task
+ ├─ ready_queue[] + rq_len  : Ready tasks (order abstracted)
+ ├─ wait_queue[]  + wq_len  : Blocked tasks (order abstracted)
+ ├─ address_spaces[]        : AddressSpace per task (Kernel/User)
  ├─ mem_demo_mapped[]       : demo flag for each task's mapping state
+ ├─ mem_demo_frame[]        : per-task demo frame (allocated once, then reused)
  ├─ event_log[]             : abstract execution trace
 ```
 
@@ -45,35 +78,10 @@ The kernel core follows a strictly separated structure:
   Defines the next `KernelActivity` and required `KernelAction`.
 
 - `tick()`  
-  Executes all side effects derived from the above transition (timer update, frame allocation, memory actions, scheduling), and records abstract events.
+  Executes all side effects derived from the above transition (timer update, frame allocation, memory actions, scheduling),
+  and records abstract events.
 
-This separation mirrors techniques used in formally verified kernels such as seL4.
-
----
-
-## Task Scheduling
-
-- Task states: `Ready`, `Running`, `Blocked`.
-- Round-robin scheduling with per-task priorities.
-- Quantum accounting per task (time slice).
-- Periodic synthetic blocking/waking for demonstration.
-- ReadyQueue and WaitQueue implemented as fixed-size ring buffers.
-
----
-
-## Memory Model (Abstract AddressSpace)
-
-The kernel implements a clean, architecture-independent memory model:
-
-- `MemAction` represents abstract mapping operations:  
-  `Map { page, frame, flags }` / `Unmap { page }`
-- Each task has its own `AddressSpace`, storing logical mappings  
-  (`VirtPage ↔ PhysFrame` + flags).
-- Integrity checks prevent double-mapping or unmapping unmapped pages.
-- `MemActionApplied { task, action }` is recorded in the event log.
-- All AddressSpace contents can be dumped at shutdown.
-
-This model provides a verifiable “specification layer” decoupled from hardware page tables.
+This separation mirrors techniques used in kernels that emphasize formal reasoning.
 
 ---
 
@@ -90,7 +98,11 @@ All logical events generated during execution are recorded:
 - `ReadyDequeued(TaskId)`
 - `WaitQueued(TaskId)`
 - `WaitDequeued(TaskId)`
-- `MemActionApplied { task, action }`
+- `MemActionApplied { task, address_space, action }`
+
+Additionally, when applying mappings to a non-current root page table, the kernel can log:
+
+- page-table translation results (`translate: OK` / `translate: NONE`) for verification without switching CR3.
 
 The resulting trace can be inspected via:
 
@@ -144,14 +156,27 @@ scripts/run-qemu-debug.sh
 
 ---
 
-## Roadmap
+## Roadmap (Near-term)
 
-- Implement hardware-backed page table mapping (`OffsetPageTable`).
-- Provide real virtual memory per task (CR3 switching).
-- Introduce user-mode execution and system call interface.
-- Serialize event logs externally for formal analysis.
-- Develop formal specifications (TLA+ model of kernel transitions).
-- Expand AddressSpace into a full capability- or rights-based memory system.
+### 1) Make address-space differences clearer (still safe without CR3 switching)
+- Use distinct demo virtual pages per task (e.g. Task1 vs Task2).
+- Keep verifying via translation checks.
+
+### 2) High-half kernel placement (enables real CR3 switching safely)
+- Move kernel code/stack to the high-half layout defined in `mem/layout.rs`.
+- Enable real CR3 switching and validate per-task user mappings with real memory access.
+
+### 3) User-mode execution & syscalls
+- Transition to ring3 user tasks.
+- Provide a minimal syscall interface (yield, IPC primitives).
+
+### 4) IPC + capability-oriented access control
+- Introduce endpoints, blocking send/recv/reply.
+- Evolve AddressSpace operations into a rights/capability model.
+
+### 5) Formal specs
+- Write a TLA+ model of `KernelState` and `tick()` transitions.
+- Check invariants and key liveness properties.
 
 ---
 
