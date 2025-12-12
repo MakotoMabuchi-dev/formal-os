@@ -1,38 +1,19 @@
 // src/kernel/mod.rs
 //
-// formal-os: 優先度付きプリエンプティブ＋ReadyQueue＋Blocked状態付きミニカーネル
+// formal-os: 優先度付きプリエンプティブ＋ReadyQueue＋Blocked状態付きミニカーネル + IPC(Endpoint)
 //
-// - Task: TaskId + TaskState + AddressSpaceId
-// - AddressSpace: kind (Kernel/User) + root_page_frame + logical mappings
-// - Task0 のみ実ページテーブルへの反映（map_to/unmap）
-// - switch_address_space(root) で「アドレス空間切替」の抽象イベントを出す
+// 目的:
+// - タスク状態遷移（Ready/Running/Blocked）とキュー整合性を、ログと invariant で追える形にする。
+// - AddressSpace の分離（root(PML4) 違いで同一VAが別PAに解決される）を、translateログで示す。
+// - BlockedReason を導入し、将来の IPC（send/recv/reply）待ちを自然に表現できる拡張点を作る。
+// - 次の段階として、Endpoint を追加し、IPC の最小プロトタイプ（同期send/recv/reply）を動かす。
 //
-// [設計上の不変条件（このモジュールにおける仕様）]
-//
-// 1. AddressSpaceId と kind の関係
-//    - AddressSpaceId(0) は常に Kernel アドレス空間（kind = Kernel）。
-//    - AddressSpaceId(1..=N-1) は User アドレス空間（kind = User）。
-//
-// 2. root_page_frame に関する仕様（プロトタイプ段階）
-//    - Kernel アドレス空間 (id=0) は root_page_frame = Some(…) を持つ。
-//    - User アドレス空間 (id>=1) も root_page_frame = Some(…) を持つ。
-//      ただし User の PML4 は「Kernel の上位半分だけコピー」して安全に CR3 切替できるようにする。
-//      (low half は未マップのまま)
-//
-// 3. Task と AddressSpace の対応（現プロトタイプ仕様）
-//    - tasks[i].address_space_id == AddressSpaceId(i) が成り立つ。（i < num_tasks）
-//    - Task index 0（TaskId(1)）は Kernel アドレス空間 (AddressSpaceId(0)) に属する。
-//    - Task index 1 以降（TaskId(2..)) は User アドレス空間 (AddressSpaceId(1..)) に属する。
-//
-// 4. スケジューラ/キューの整合性（デバッグで検証する）
-//    - Running は常に current_task のみ
-//    - ReadyQueue には Ready のみ、WaitQueue には Blocked のみ
-//    - 各タスクは Ready/Wait に重複して入らない
-//
-// 5. 仮想アドレスレイアウト（論理マッピングの段階）
-//    - User アドレス空間は high-half(kernel 空間) を使わない
-//
-// これらは debug_check_invariants() によってログ出力ベースで検証される。
+// 設計方針:
+// - unsafe は arch 側に局所化し、kernel 側は状態遷移＋抽象イベント中心。
+// - WaitQueue は「Blocked 全体」を保持する。
+//   * Sleep の wake は “Sleep のみ” を対象にする（IPC の待ちをタイマで勝手に起こさない）。
+// - tick 中に schedule が走って current_task が変わるのは自然に起こりうるため、
+//   ran_idx と current_task のズレは許容し、ブロック判定は current_task に対してのみ行う。
 
 use bootloader::BootInfo;
 use crate::{arch, logging};
@@ -46,6 +27,8 @@ use x86_64::registers::control::Cr3;
 const MAX_TASKS: usize = 3;
 const EVENT_LOG_CAP: usize = 256;
 
+const MAX_ENDPOINTS: usize = 2;
+
 // プロトタイプ用の固定 ID（設計仕様をコードで表現するための定数）
 const KERNEL_ASID_INDEX: usize = 0;          // AddressSpaces[0] は Kernel
 const FIRST_USER_ASID_INDEX: usize = 1;      // AddressSpaces[1..] は User
@@ -58,19 +41,24 @@ const TASK0_ID: TaskId = TaskId(1);
 const TASK1_ID: TaskId = TaskId(2);
 const TASK2_ID: TaskId = TaskId(3);
 
-// デモ用: 0x0010_0000 (1MiB) → 仮想ページ index
-const DEMO_VIRT_PAGE_INDEX: u64 = 0x100;
+// デモ用：Task別の仮想ページ
+// - Task0: 0x0010_0000 (0x100)
+// - User タスクは「同一virt」を使う（分離の証拠を示す）
+const DEMO_VIRT_PAGE_INDEX_TASK0: u64 = 0x100; // 0x0010_0000
+const DEMO_VIRT_PAGE_INDEX_USER:  u64 = 0x110; // 0x0011_0000  ← Task1/Task2 共通
+
+const IPC_DEMO_EP0: EndpointId = EndpointId(0);
 
 //
 // ──────────────────────────────────────────────
-// TaskId / AddressSpaceId / TaskState / Task
+// TaskId / AddressSpaceId / TaskState / BlockedReason / Task
 // ──────────────────────────────────────────────
 //
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct TaskId(pub u64);
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct AddressSpaceId(pub usize);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -78,6 +66,26 @@ pub enum TaskState {
     Ready,
     Running,
     Blocked,
+}
+
+/// IPC 用エンドポイントID（最小デモは固定個数）
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct EndpointId(pub usize);
+
+/// Blocked 状態の理由（将来 IPC 待ちなどを追加するための拡張点）
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BlockedReason {
+    /// 現段階では「擬似 I/O wait」相当（将来は sleep に発展させる/タイムアウトを持たせる）
+    Sleep,
+
+    /// IPC: recv 待ち
+    IpcRecv { ep: EndpointId },
+
+    /// IPC: send 待ち（受信者不在）
+    IpcSend { ep: EndpointId },
+
+    /// IPC: reply 待ち（同期的 IPC を表現）
+    IpcReply { partner: TaskId, ep: EndpointId },
 }
 
 #[derive(Clone, Copy)]
@@ -90,6 +98,67 @@ pub struct Task {
 
     /// このタスクが属する論理アドレス空間のID。
     pub address_space_id: AddressSpaceId,
+
+    /// Blocked の理由（Blocked のときのみ Some、Blocked 以外では None）
+    pub blocked_reason: Option<BlockedReason>,
+
+    /// IPC デモ用：受信した値（本来は inbox などに積む）
+    pub last_msg: Option<u64>,
+
+    /// IPC デモ用：送信待ちで保持する payload
+    pub pending_send_msg: Option<u64>,
+}
+
+//
+// ──────────────────────────────────────────────
+// Endpoint（最小IPC）
+// ──────────────────────────────────────────────
+//
+
+#[derive(Clone, Copy)]
+pub struct Endpoint {
+    pub id: EndpointId,
+
+    /// recv で待っているタスク index（最大1）
+    pub recv_waiter: Option<usize>,
+
+    /// send 待ちタスク index のキュー（順序は抽象化してOK）
+    pub send_queue: [usize; MAX_TASKS],
+    pub sq_len: usize,
+
+    /// reply 待ちの送信者（最小デモ：1件）
+    pub reply_waiter: Option<usize>,
+}
+
+impl Endpoint {
+    pub const fn new(id: EndpointId) -> Self {
+        Endpoint {
+            id,
+            recv_waiter: None,
+            send_queue: [0; MAX_TASKS],
+            sq_len: 0,
+            reply_waiter: None,
+        }
+    }
+
+    fn enqueue_sender(&mut self, idx: usize) {
+        if self.sq_len >= MAX_TASKS {
+            return;
+        }
+        self.send_queue[self.sq_len] = idx;
+        self.sq_len += 1;
+    }
+
+    fn dequeue_sender(&mut self) -> Option<usize> {
+        if self.sq_len == 0 {
+            return None;
+        }
+        // swap-remove
+        let last = self.sq_len - 1;
+        let idx = self.send_queue[last];
+        self.sq_len -= 1;
+        Some(idx)
+    }
 }
 
 //
@@ -118,6 +187,15 @@ pub enum LogEvent {
         address_space: AddressSpaceId,
         action: MemAction,
     },
+
+    // ── IPC ───────────────────────
+    IpcRecvCalled { task: TaskId, ep: EndpointId },
+    IpcRecvBlocked { task: TaskId, ep: EndpointId },
+    IpcSendCalled { task: TaskId, ep: EndpointId, msg: u64 },
+    IpcSendBlocked { task: TaskId, ep: EndpointId },
+    IpcDelivered { from: TaskId, to: TaskId, ep: EndpointId, msg: u64 },
+    IpcReplyCalled { task: TaskId, ep: EndpointId, to: TaskId },
+    IpcReplyDelivered { from: TaskId, to: TaskId, ep: EndpointId },
 }
 
 //
@@ -132,6 +210,7 @@ pub enum KernelActivity {
     UpdatingTimer,
     AllocatingFrame,
     MappingDemoPage,
+    IpcDemo,
 }
 
 #[derive(Clone, Copy)]
@@ -140,6 +219,7 @@ enum KernelAction {
     UpdateTimer,
     AllocateFrame,
     MemDemo,
+    IpcDemo,
 }
 
 //
@@ -184,6 +264,14 @@ pub struct KernelState {
 
     // MemDemo: タスクごとにデモ用フレームを保持（初回Map時に割当）
     mem_demo_frame: [Option<PhysFrame>; MAX_TASKS],
+
+    // IPC
+    endpoints: [Endpoint; MAX_ENDPOINTS],
+
+    // IPC デモ進行
+    ipc_demo_recv_done: bool,
+    ipc_demo_send_done: bool,
+    ipc_demo_reply_done: bool,
 }
 
 impl KernelState {
@@ -214,6 +302,9 @@ impl KernelState {
                 time_slice_used: 0,
                 priority: 1,
                 address_space_id: AddressSpaceId(KERNEL_ASID_INDEX),
+                blocked_reason: None,
+                last_msg: None,
+                pending_send_msg: None,
             },
             Task {
                 id: TASK1_ID,
@@ -222,6 +313,9 @@ impl KernelState {
                 time_slice_used: 0,
                 priority: 3,
                 address_space_id: AddressSpaceId(FIRST_USER_ASID_INDEX),
+                blocked_reason: None,
+                last_msg: None,
+                pending_send_msg: None,
             },
             Task {
                 id: TASK2_ID,
@@ -230,6 +324,9 @@ impl KernelState {
                 time_slice_used: 0,
                 priority: 2,
                 address_space_id: AddressSpaceId(FIRST_USER_ASID_INDEX + 1),
+                blocked_reason: None,
+                last_msg: None,
+                pending_send_msg: None,
             },
         ];
 
@@ -294,6 +391,15 @@ impl KernelState {
             quantum: 5,
             mem_demo_mapped: [false; MAX_TASKS],
             mem_demo_frame: [None; MAX_TASKS],
+
+            endpoints: [
+                Endpoint::new(EndpointId(0)),
+                Endpoint::new(EndpointId(1)),
+            ],
+
+            ipc_demo_recv_done: false,
+            ipc_demo_send_done: false,
+            ipc_demo_reply_done: false,
         }
     }
 
@@ -371,8 +477,26 @@ impl KernelState {
         }
 
         // ─────────────────────────────
-        // 2. スケジューラ / キュー構造の invariant（完全版）
+        // 2. スケジューラ / キュー構造の invariant
         // ─────────────────────────────
+
+        // BlockedReason の整合
+        for (idx, t) in self.tasks.iter().enumerate().take(self.num_tasks) {
+            match t.state {
+                TaskState::Blocked => {
+                    if t.blocked_reason.is_none() {
+                        logging::error("INVARIANT VIOLATION: BLOCKED task has no blocked_reason");
+                        logging::info_u64(" task_index", idx as u64);
+                    }
+                }
+                _ => {
+                    if t.blocked_reason.is_some() {
+                        logging::error("INVARIANT VIOLATION: non-BLOCKED task has blocked_reason");
+                        logging::info_u64(" task_index", idx as u64);
+                    }
+                }
+            }
+        }
 
         // current_task は必ず Running
         if self.current_task >= self.num_tasks {
@@ -506,6 +630,84 @@ impl KernelState {
                 }
             });
         }
+
+        // ─────────────────────────────
+        // 4. IPC Endpoint invariant（最小）
+        // ─────────────────────────────
+        for e in self.endpoints.iter() {
+            // recv_waiter 整合
+            if let Some(idx) = e.recv_waiter {
+                if idx >= self.num_tasks {
+                    logging::error("INVARIANT VIOLATION: endpoint.recv_waiter out of range");
+                    logging::info_u64(" ep", e.id.0 as u64);
+                    logging::info_u64(" idx", idx as u64);
+                } else {
+                    let t = &self.tasks[idx];
+                    if t.state != TaskState::Blocked {
+                        logging::error("INVARIANT VIOLATION: recv_waiter is not BLOCKED");
+                        logging::info_u64(" ep", e.id.0 as u64);
+                        logging::info_u64(" idx", idx as u64);
+                    }
+                    match t.blocked_reason {
+                        Some(BlockedReason::IpcRecv { ep }) if ep == e.id => {}
+                        _ => {
+                            logging::error("INVARIANT VIOLATION: recv_waiter blocked_reason mismatch");
+                            logging::info_u64(" ep", e.id.0 as u64);
+                            logging::info_u64(" idx", idx as u64);
+                        }
+                    }
+                }
+            }
+
+            // send_queue 整合
+            for pos in 0..e.sq_len {
+                let idx = e.send_queue[pos];
+                if idx >= self.num_tasks {
+                    logging::error("INVARIANT VIOLATION: endpoint.send_queue idx out of range");
+                    logging::info_u64(" ep", e.id.0 as u64);
+                    logging::info_u64(" idx", idx as u64);
+                    continue;
+                }
+                let t = &self.tasks[idx];
+                if t.state != TaskState::Blocked {
+                    logging::error("INVARIANT VIOLATION: sender in send_queue is not BLOCKED");
+                    logging::info_u64(" ep", e.id.0 as u64);
+                    logging::info_u64(" idx", idx as u64);
+                }
+                match t.blocked_reason {
+                    Some(BlockedReason::IpcSend { ep }) if ep == e.id => {}
+                    _ => {
+                        logging::error("INVARIANT VIOLATION: sender blocked_reason mismatch");
+                        logging::info_u64(" ep", e.id.0 as u64);
+                        logging::info_u64(" idx", idx as u64);
+                    }
+                }
+            }
+
+            // reply_waiter 整合（最小デモ：1件だけ追う）
+            if let Some(idx) = e.reply_waiter {
+                if idx >= self.num_tasks {
+                    logging::error("INVARIANT VIOLATION: endpoint.reply_waiter out of range");
+                    logging::info_u64(" ep", e.id.0 as u64);
+                    logging::info_u64(" idx", idx as u64);
+                } else {
+                    let t = &self.tasks[idx];
+                    if t.state != TaskState::Blocked {
+                        logging::error("INVARIANT VIOLATION: reply_waiter is not BLOCKED");
+                        logging::info_u64(" ep", e.id.0 as u64);
+                        logging::info_u64(" idx", idx as u64);
+                    }
+                    match t.blocked_reason {
+                        Some(BlockedReason::IpcReply { ep, .. }) if ep == e.id => {}
+                        _ => {
+                            logging::error("INVARIANT VIOLATION: reply_waiter blocked_reason mismatch");
+                            logging::info_u64(" ep", e.id.0 as u64);
+                            logging::info_u64(" idx", idx as u64);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     //
@@ -544,6 +746,18 @@ impl KernelState {
     fn is_in_wait_queue(&self, idx: usize) -> bool {
         for pos in 0..self.wq_len {
             if self.wait_queue[pos] == idx {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn remove_from_wait_queue(&mut self, idx: usize) -> bool {
+        for pos in 0..self.wq_len {
+            if self.wait_queue[pos] == idx {
+                let last = self.wq_len - 1;
+                self.wait_queue[pos] = self.wait_queue[last];
+                self.wq_len -= 1;
                 return true;
             }
         }
@@ -617,6 +831,10 @@ impl KernelState {
         if self.tasks[idx].state != TaskState::Blocked {
             return;
         }
+        if self.tasks[idx].blocked_reason.is_none() {
+            // BlockedReason を必須にする
+            return;
+        }
 
         self.wait_queue[self.wq_len] = idx;
         self.wq_len += 1;
@@ -658,6 +876,7 @@ impl KernelState {
 
             self.tasks[next_idx].state = TaskState::Running;
             self.tasks[next_idx].time_slice_used = 0;
+            self.tasks[next_idx].blocked_reason = None;
             self.current_task = next_idx;
 
             logging::info(" switched to task");
@@ -703,10 +922,9 @@ impl KernelState {
             return false;
         }
 
+        // tick 中に schedule が走ると ran_idx と current_task はズレうる。
+        // ここは “current_task に対してのみ” 判定する。
         if ran_idx != self.current_task {
-            logging::error("INVARIANT VIOLATION: ran_idx != current_task at block check");
-            logging::info_u64(" ran_idx", ran_idx as u64);
-            logging::info_u64(" current_task", self.current_task as u64);
             return false;
         }
 
@@ -718,6 +936,7 @@ impl KernelState {
 
             logging::info(" blocking current task (fake I/O wait)");
             self.tasks[ran_idx].state = TaskState::Blocked;
+            self.tasks[ran_idx].blocked_reason = Some(BlockedReason::Sleep);
             self.tasks[ran_idx].time_slice_used = 0;
 
             self.push_event(LogEvent::TaskStateChanged(id, TaskState::Blocked));
@@ -757,22 +976,37 @@ impl KernelState {
     }
 
     //
-    // 疑似 Wake
+    // 疑似 Wake（Sleep だけ起こす）
+    // - IPC の Blocked をタイマで勝手に起こすと、Endpoint 側の待ち状態と矛盾する。
     //
-    fn maybe_wake_one_task(&mut self) {
-        if let Some(idx) = self.dequeue_wait() {
-            let id = self.tasks[idx].id;
+    fn maybe_wake_one_sleep_task(&mut self) {
+        for pos in 0..self.wq_len {
+            let idx = self.wait_queue[pos];
+            if idx >= self.num_tasks {
+                continue;
+            }
 
-            logging::info(" waking 1 blocked task");
-            self.tasks[idx].state = TaskState::Ready;
+            if self.tasks[idx].blocked_reason == Some(BlockedReason::Sleep) {
+                // swap-remove
+                let last = self.wq_len - 1;
+                self.wait_queue[pos] = self.wait_queue[last];
+                self.wq_len -= 1;
 
-            self.push_event(LogEvent::TaskStateChanged(id, TaskState::Ready));
-            self.enqueue_ready(idx);
+                let id = self.tasks[idx].id;
+
+                logging::info(" waking 1 blocked task (Sleep only)");
+                self.tasks[idx].state = TaskState::Ready;
+                self.tasks[idx].blocked_reason = None;
+
+                self.push_event(LogEvent::TaskStateChanged(id, TaskState::Ready));
+                self.enqueue_ready(idx);
+                return;
+            }
         }
     }
 
     //
-    // 実ページテーブル操作
+    // 実ページテーブル操作（現CR3向け）
     //
     fn apply_mem_action(&mut self, action: MemAction) {
         unsafe {
@@ -808,6 +1042,260 @@ impl KernelState {
     }
 
     //
+    // タスクごとのデモ用 VirtPage を返す
+    // - Kernel(Task0): 0x0010_0000
+    // - User(Task1/Task2): 同じ 0x0011_0000 を使う（分離の証拠）
+    //
+    fn demo_page_for_task(&self, task_idx: usize) -> VirtPage {
+        let idx = match task_idx {
+            TASK0_INDEX => DEMO_VIRT_PAGE_INDEX_TASK0,
+            TASK1_INDEX => DEMO_VIRT_PAGE_INDEX_USER,
+            TASK2_INDEX => DEMO_VIRT_PAGE_INDEX_USER,
+            _ => DEMO_VIRT_PAGE_INDEX_TASK0,
+        };
+        VirtPage::from_index(idx)
+    }
+
+    //
+    // ──────────────────────────────────────────────
+    // IPC helpers（最小プロトタイプ）
+    // ──────────────────────────────────────────────
+    //
+
+    fn block_current_and_schedule(&mut self, reason: BlockedReason) {
+        let idx = self.current_task;
+        let id = self.tasks[idx].id;
+
+        self.tasks[idx].state = TaskState::Blocked;
+        self.tasks[idx].blocked_reason = Some(reason);
+        self.tasks[idx].time_slice_used = 0;
+
+        self.push_event(LogEvent::TaskStateChanged(id, TaskState::Blocked));
+
+        self.enqueue_wait(idx);
+        self.schedule_next_task();
+    }
+
+    fn wake_task_to_ready(&mut self, idx: usize) {
+        if idx >= self.num_tasks {
+            return;
+        }
+
+        // wait_queue から除去（入っているはず）
+        let _ = self.remove_from_wait_queue(idx);
+
+        let id = self.tasks[idx].id;
+
+        self.tasks[idx].state = TaskState::Ready;
+        self.tasks[idx].blocked_reason = None;
+
+        self.push_event(LogEvent::TaskStateChanged(id, TaskState::Ready));
+        self.enqueue_ready(idx);
+    }
+
+    /// IPC: recv（受信者が ep で待つ。送信者が居れば即 deliver）
+    fn ipc_recv(&mut self, ep: EndpointId) {
+        if ep.0 >= MAX_ENDPOINTS {
+            return;
+        }
+
+        let recv_idx = self.current_task;
+        let recv_id = self.tasks[recv_idx].id;
+
+        self.push_event(LogEvent::IpcRecvCalled { task: recv_id, ep });
+
+        // sender が居れば 1件取り出す（Endpoint の借用を短くする）
+        let send_idx_opt = {
+            let e = &mut self.endpoints[ep.0];
+            e.dequeue_sender()
+        };
+
+        if let Some(send_idx) = send_idx_opt {
+            let send_id = self.tasks[send_idx].id;
+            let msg = self.tasks[send_idx].pending_send_msg.take().unwrap_or(0);
+
+            // sender は reply 待ちで Block
+            self.tasks[send_idx].state = TaskState::Blocked;
+            self.tasks[send_idx].blocked_reason = Some(BlockedReason::IpcReply {
+                partner: recv_id,
+                ep,
+            });
+            self.tasks[send_idx].time_slice_used = 0;
+            self.enqueue_wait(send_idx);
+
+            // Endpoint に reply_waiter をセット
+            {
+                let e = &mut self.endpoints[ep.0];
+                e.reply_waiter = Some(send_idx);
+            }
+
+            // receiver に値を渡す
+            self.tasks[recv_idx].last_msg = Some(msg);
+
+            self.push_event(LogEvent::IpcDelivered {
+                from: send_id,
+                to: recv_id,
+                ep,
+                msg,
+            });
+            return;
+        }
+
+        // sender がいない → recv_waiter をセットして block
+        let already_waiting = {
+            let e = &mut self.endpoints[ep.0];
+            e.recv_waiter.is_some()
+        };
+
+        if !already_waiting {
+            let e = &mut self.endpoints[ep.0];
+            e.recv_waiter = Some(recv_idx);
+        }
+
+        self.push_event(LogEvent::IpcRecvBlocked { task: recv_id, ep });
+        self.block_current_and_schedule(BlockedReason::IpcRecv { ep });
+    }
+
+    /// IPC: send（受信者が待っていれば即 deliver、いなければ send_queue に入って Block）
+    fn ipc_send(&mut self, ep: EndpointId, msg: u64) {
+        if ep.0 >= MAX_ENDPOINTS {
+            return;
+        }
+
+        let send_idx = self.current_task;
+        let send_id = self.tasks[send_idx].id;
+
+        self.push_event(LogEvent::IpcSendCalled { task: send_id, ep, msg });
+
+        // recv_waiter を取り出す（Endpoint の借用を短くする）
+        let recv_idx_opt = {
+            let e = &mut self.endpoints[ep.0];
+            e.recv_waiter.take()
+        };
+
+        if let Some(recv_idx) = recv_idx_opt {
+            let recv_id = self.tasks[recv_idx].id;
+
+            // receiver を起こす（WaitQueue から除去して Ready に）
+            self.wake_task_to_ready(recv_idx);
+
+            // 値を渡す
+            self.tasks[recv_idx].last_msg = Some(msg);
+
+            // Endpoint に reply_waiter をセット
+            {
+                let e = &mut self.endpoints[ep.0];
+                e.reply_waiter = Some(send_idx);
+            }
+
+            self.push_event(LogEvent::IpcDelivered {
+                from: send_id,
+                to: recv_id,
+                ep,
+                msg,
+            });
+
+            // sender は reply待ちで Block
+            self.block_current_and_schedule(BlockedReason::IpcReply {
+                partner: recv_id,
+                ep,
+            });
+            return;
+        }
+
+        // receiver がいない → sender を send_queue に積んで Block
+        self.tasks[send_idx].pending_send_msg = Some(msg);
+
+        {
+            let e = &mut self.endpoints[ep.0];
+            e.enqueue_sender(send_idx);
+        }
+
+        self.push_event(LogEvent::IpcSendBlocked { task: send_id, ep });
+        self.block_current_and_schedule(BlockedReason::IpcSend { ep });
+    }
+
+    /// IPC: reply（最小デモ：ep の reply_waiter を 1件だけ起こす）
+    fn ipc_reply(&mut self, ep: EndpointId) {
+        if ep.0 >= MAX_ENDPOINTS {
+            return;
+        }
+
+        let recv_idx = self.current_task;
+        let recv_id = self.tasks[recv_idx].id;
+
+        let send_idx_opt = {
+            let e = &mut self.endpoints[ep.0];
+            e.reply_waiter.take()
+        };
+
+        let send_idx = match send_idx_opt {
+            Some(i) => i,
+            None => return,
+        };
+
+        let send_id = self.tasks[send_idx].id;
+
+        self.push_event(LogEvent::IpcReplyCalled {
+            task: recv_id,
+            ep,
+            to: send_id,
+        });
+
+        self.wake_task_to_ready(send_idx);
+
+        self.push_event(LogEvent::IpcReplyDelivered {
+            from: recv_id,
+            to: send_id,
+            ep,
+        });
+    }
+
+    //
+    // IPC デモ：最小のシナリオを回す
+    //
+    // - Receiver: Task3（TaskId=3）
+    // - Sender  : Task2（TaskId=2）
+    //
+    fn ipc_demo(&mut self) {
+        let idx = self.current_task;
+        let tid = self.tasks[idx].id;
+
+        // 1) Receiver が recv（初回はブロックする想定）
+        if !self.ipc_demo_recv_done && tid == TASK2_ID {
+            self.ipc_recv(IPC_DEMO_EP0);
+            self.ipc_demo_recv_done = true;
+            return;
+        }
+
+        // 2) Sender が send（recv_waiter が居れば deliver して reply待ちでブロック）
+        if self.ipc_demo_recv_done && !self.ipc_demo_send_done && tid == TASK1_ID {
+            self.ipc_send(IPC_DEMO_EP0, 0x1234_5678_9ABC_DEF0u64);
+            self.ipc_demo_send_done = true;
+            return;
+        }
+
+        // 3) Receiver が reply（受信済みなら reply）
+        if self.ipc_demo_send_done && !self.ipc_demo_reply_done && tid == TASK2_ID {
+            if self.tasks[idx].last_msg.is_some() {
+                self.ipc_reply(IPC_DEMO_EP0);
+                self.ipc_demo_reply_done = true;
+            }
+            return;
+        }
+
+        // 4) 一周したらリセット（次の周回へ）
+        if self.ipc_demo_recv_done && self.ipc_demo_send_done && self.ipc_demo_reply_done {
+            self.ipc_demo_recv_done = false;
+            self.ipc_demo_send_done = false;
+            self.ipc_demo_reply_done = false;
+
+            // 周回の前に inbox を消す（見やすさ）
+            self.tasks[TASK2_INDEX].last_msg = None;
+        }
+    }
+
+    //
     // tick()
     //
     pub fn tick(&mut self) {
@@ -825,7 +1313,7 @@ impl KernelState {
         let running = self.tasks[self.current_task].id;
         logging::info_u64(" running_task", running.0);
 
-        // この tick で「実行した」タスク index を固定
+        // この tick 冒頭で「実行していた」タスク index
         let ran_idx = self.current_task;
 
         let (next_activity, action) = next_activity_and_action(self.activity);
@@ -840,7 +1328,8 @@ impl KernelState {
                 logging::info_u64(" time_ticks", self.time_ticks);
                 self.push_event(LogEvent::TimerUpdated(self.time_ticks));
 
-                self.maybe_wake_one_task();
+                // Sleep だけ起こす（IPC をタイマで起こさない）
+                self.maybe_wake_one_sleep_task();
             }
             KernelAction::AllocateFrame => {
                 logging::info(" action = AllocateFrame");
@@ -855,11 +1344,12 @@ impl KernelState {
             KernelAction::MemDemo => {
                 logging::info(" action = MemDemo");
 
-                let page = VirtPage::from_index(DEMO_VIRT_PAGE_INDEX);
-
                 let task_idx = self.current_task;
                 let task = self.tasks[task_idx];
                 let task_id = task.id;
+
+                // ★ User 同一VAテスト：Task1/Task2 は同じ virt ページを使う
+                let page = self.demo_page_for_task(task_idx);
 
                 // Task0 は kernel 相当、Task1/2 は user 相当としてフラグを変える
                 let flags = if task_idx == TASK0_INDEX {
@@ -897,21 +1387,10 @@ impl KernelState {
 
                         self.mem_demo_mapped[task_idx] = !self.mem_demo_mapped[task_idx];
 
-                        // ─────────────────────────────────────────────
-                        // ここが今回のステップの主役
-                        //
-                        // - Task0: 現CR3（今動いているページテーブル）に apply する
-                        // - Task1/2: その AddressSpace の root(PML4) に直接 apply する（CR3は切替えない）
-                        //   → その root で translate して「反映されたか」を検証ログに出す
-                        // ─────────────────────────────────────────────
                         if task_idx == TASK0_INDEX {
                             logging::info(" mem_demo: applying arch paging (Task0 / current CR3)");
                             self.apply_mem_action(mem_action);
-
-                            // translate 検証（現CR3相当）をしたい場合は paging.rs 側で追加可能だが、
-                            // ここでは従来どおり mem_test が走るので省略
                         } else {
-                            // User AS は root_page_frame が Some のはず（invariant）
                             let root = match aspace.root_page_frame {
                                 Some(r) => r,
                                 None => {
@@ -949,11 +1428,22 @@ impl KernelState {
                     }
                 }
             }
+            KernelAction::IpcDemo => {
+                logging::info(" action = IpcDemo");
+                self.ipc_demo();
+            }
         }
 
+        // tick途中で schedule が走ることがあるため、ran_idx の runtime を積む（デモ用途）
         self.update_runtime_for(ran_idx);
 
-        let blocked = self.maybe_block_task(ran_idx);
+        // ブロック判定は current_task に対してのみ（ran_idx が変わっていたらスキップ）
+        let blocked = if ran_idx == self.current_task {
+            self.maybe_block_task(ran_idx)
+        } else {
+            false
+        };
+
         if !blocked {
             self.update_time_slice_for_and_maybe_schedule(ran_idx);
         } else {
@@ -963,7 +1453,6 @@ impl KernelState {
         self.activity = next_activity;
 
         self.debug_check_invariants();
-
     }
 
     pub fn should_halt(&self) -> bool {
@@ -1017,6 +1506,11 @@ impl KernelState {
                 logging::info_u64("    phys_frame_index", m.frame.number);
                 logging::info_u64("    flags_bits", m.flags.bits());
             });
+
+            if let Some(m) = task.last_msg {
+                logging::info("  IPC:");
+                logging::info_u64("    last_msg", m);
+            }
         }
 
         logging::info("=== End of AddressSpace Dump ===");
@@ -1097,6 +1591,48 @@ fn log_event_to_vga(ev: LogEvent) {
                 }
             }
         }
+
+        // ── IPC ───────────────────────
+        LogEvent::IpcRecvCalled { task, ep } => {
+            logging::info("EVENT: IpcRecvCalled");
+            logging::info_u64(" task", task.0);
+            logging::info_u64(" ep", ep.0 as u64);
+        }
+        LogEvent::IpcRecvBlocked { task, ep } => {
+            logging::info("EVENT: IpcRecvBlocked");
+            logging::info_u64(" task", task.0);
+            logging::info_u64(" ep", ep.0 as u64);
+        }
+        LogEvent::IpcSendCalled { task, ep, msg } => {
+            logging::info("EVENT: IpcSendCalled");
+            logging::info_u64(" task", task.0);
+            logging::info_u64(" ep", ep.0 as u64);
+            logging::info_u64(" msg", msg);
+        }
+        LogEvent::IpcSendBlocked { task, ep } => {
+            logging::info("EVENT: IpcSendBlocked");
+            logging::info_u64(" task", task.0);
+            logging::info_u64(" ep", ep.0 as u64);
+        }
+        LogEvent::IpcDelivered { from, to, ep, msg } => {
+            logging::info("EVENT: IpcDelivered");
+            logging::info_u64(" from", from.0);
+            logging::info_u64(" to", to.0);
+            logging::info_u64(" ep", ep.0 as u64);
+            logging::info_u64(" msg", msg);
+        }
+        LogEvent::IpcReplyCalled { task, ep, to } => {
+            logging::info("EVENT: IpcReplyCalled");
+            logging::info_u64(" task", task.0);
+            logging::info_u64(" ep", ep.0 as u64);
+            logging::info_u64(" to", to.0);
+        }
+        LogEvent::IpcReplyDelivered { from, to, ep } => {
+            logging::info("EVENT: IpcReplyDelivered");
+            logging::info_u64(" from", from.0);
+            logging::info_u64(" to", to.0);
+            logging::info_u64(" ep", ep.0 as u64);
+        }
     }
 }
 
@@ -1107,12 +1643,10 @@ fn log_event_to_vga(ev: LogEvent) {
 fn next_activity_and_action(current: KernelActivity) -> (KernelActivity, KernelAction) {
     match current {
         KernelActivity::Idle => (KernelActivity::UpdatingTimer, KernelAction::None),
-
         KernelActivity::UpdatingTimer => (KernelActivity::AllocatingFrame, KernelAction::UpdateTimer),
-
         KernelActivity::AllocatingFrame => (KernelActivity::MappingDemoPage, KernelAction::AllocateFrame),
-
-        KernelActivity::MappingDemoPage => (KernelActivity::Idle, KernelAction::MemDemo),
+        KernelActivity::MappingDemoPage => (KernelActivity::IpcDemo, KernelAction::MemDemo),
+        KernelActivity::IpcDemo => (KernelActivity::Idle, KernelAction::IpcDemo),
     }
 }
 
@@ -1133,7 +1667,7 @@ pub fn start(boot_info: &'static BootInfo) {
 
     kstate.bootstrap();
 
-    let max_ticks = 40;
+    let max_ticks = 60;
     for _ in 0..max_ticks {
         if kstate.should_halt() {
             logging::info("KernelState requested halt; stop ticking");
