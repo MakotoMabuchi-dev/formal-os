@@ -14,8 +14,10 @@
 //    - AddressSpaceId(1..=N-1) は User アドレス空間（kind = User）。
 //
 // 2. root_page_frame に関する仕様（プロトタイプ段階）
-//    - Kernel アドレス空間 (id=0) だけが root_page_frame = Some(…) を持つ。
-//    - User アドレス空間 (id>=1) は root_page_frame = None のまま（論理空間のみ）。
+//    - Kernel アドレス空間 (id=0) は root_page_frame = Some(…) を持つ。
+//    - User アドレス空間 (id>=1) も root_page_frame = Some(…) を持つ。
+//      ただし User の PML4 は「Kernel の上位半分だけコピー」して安全に CR3 切替できるようにする。
+//      (low half は未マップのまま)
 //
 // 3. Task と AddressSpace の対応（現プロトタイプ仕様）
 //    - tasks[i].address_space_id == AddressSpaceId(i) が成り立つ。（i < num_tasks）
@@ -189,7 +191,7 @@ impl KernelState {
     // new()
     //
     pub fn new(boot_info: &'static BootInfo) -> Self {
-        let phys_mem = PhysicalMemoryManager::new(boot_info);
+        let mut phys_mem = PhysicalMemoryManager::new(boot_info);
 
         //
         // Task0 用 root_page_frame を CR3 から取得
@@ -243,6 +245,26 @@ impl KernelState {
 
         // Task0 の AddressSpace(0) に root_page_frame を設定
         address_spaces[KERNEL_ASID_INDEX].root_page_frame = Some(root_frame_for_task0);
+
+        // User AddressSpace 用の root_page_frame を割り当て、Kernel の上位半分をコピーして初期化する
+        for as_idx in FIRST_USER_ASID_INDEX..MAX_TASKS {
+            let raw = match phys_mem.allocate_frame() {
+                Some(f) => f,
+                None => {
+                    logging::error("no more frames for user pml4");
+                    continue;
+                }
+            };
+
+            let phys_u64 = raw.start_address().as_u64();
+            let frame_index = phys_u64 / PAGE_SIZE;
+            let user_root = PhysFrame::from_index(frame_index);
+
+            address_spaces[as_idx].root_page_frame = Some(user_root);
+
+            // User PML4 を “Kernel 上位半分コピー” で初期化（CR3切替で落ちないように）
+            arch::paging::init_user_pml4_from_current(user_root);
+        }
 
         // Ready: task1, task2 を初期投入
         let ready_queue = [TASK1_INDEX, TASK2_INDEX, 0];
@@ -310,8 +332,9 @@ impl KernelState {
                 logging::info_u64(" offending_as_idx", as_idx as u64);
             }
 
-            if aspace.root_page_frame.is_some() {
-                logging::error("INVARIANT VIOLATION: user address space has root_page_frame (prototype spec expects None)");
+            // この段階では User も root_page_frame を持つ（CR3切替の準備）
+            if aspace.root_page_frame.is_none() {
+                logging::error("INVARIANT VIOLATION: user address space has no root_page_frame");
                 logging::info_u64(" offending_as_idx", as_idx as u64);
             }
         }
@@ -351,7 +374,7 @@ impl KernelState {
         // 2. スケジューラ / キュー構造の invariant（完全版）
         // ─────────────────────────────
 
-        // 2-1. current_task は必ず Running
+        // current_task は必ず Running
         if self.current_task >= self.num_tasks {
             logging::error("INVARIANT VIOLATION: current_task index out of range");
         } else if self.tasks[self.current_task].state != TaskState::Running {
@@ -359,7 +382,7 @@ impl KernelState {
             logging::info_u64(" current_task_index", self.current_task as u64);
         }
 
-        // 2-2. Running は current_task だけ
+        // Running は current_task のみ
         for (idx, t) in self.tasks.iter().enumerate().take(self.num_tasks) {
             if idx == self.current_task {
                 continue;
@@ -370,11 +393,9 @@ impl KernelState {
             }
         }
 
-        // 2-3. ready_queue / wait_queue の内容を集計（重複チェック込み）
         let mut in_ready = [false; MAX_TASKS];
         let mut in_wait = [false; MAX_TASKS];
 
-        // ReadyQueue: 0..rq_len
         for pos in 0..self.rq_len {
             let idx = self.ready_queue[pos];
 
@@ -397,7 +418,6 @@ impl KernelState {
             }
         }
 
-        // WaitQueue: 0..wq_len
         for pos in 0..self.wq_len {
             let idx = self.wait_queue[pos];
 
@@ -420,7 +440,6 @@ impl KernelState {
             }
         }
 
-        // 2-4. Ready と Blocked が両方に入っていない
         for idx in 0..self.num_tasks {
             if in_ready[idx] && in_wait[idx] {
                 logging::error("INVARIANT VIOLATION: task is in both ready_queue and wait_queue");
@@ -428,7 +447,6 @@ impl KernelState {
             }
         }
 
-        // 2-5. state と所属の逆方向チェック
         for idx in 0..self.num_tasks {
             match self.tasks[idx].state {
                 TaskState::Running => {
@@ -645,7 +663,6 @@ impl KernelState {
             logging::info(" switched to task");
             logging::info_u64(" task_id", next_id.0);
 
-            // AddressSpace の root_page_frame を参照して switch に渡す
             let root = self.address_spaces[as_idx].root_page_frame;
             arch::paging::switch_address_space(root);
 
@@ -839,11 +856,17 @@ impl KernelState {
                 logging::info(" action = MemDemo");
 
                 let page = VirtPage::from_index(DEMO_VIRT_PAGE_INDEX);
-                let flags = PageFlags::PRESENT | PageFlags::WRITABLE;
 
                 let task_idx = self.current_task;
                 let task = self.tasks[task_idx];
                 let task_id = task.id;
+
+                // Task0 は kernel 相当、Task1/2 は user 相当としてフラグを変える
+                let flags = if task_idx == TASK0_INDEX {
+                    PageFlags::PRESENT | PageFlags::WRITABLE
+                } else {
+                    PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER
+                };
 
                 let mem_action = if !self.mem_demo_mapped[task_idx] {
                     logging::info(" mem_demo: issuing Map (for current task)");
@@ -874,11 +897,39 @@ impl KernelState {
 
                         self.mem_demo_mapped[task_idx] = !self.mem_demo_mapped[task_idx];
 
-                        if task_idx == 0 {
-                            logging::info(" mem_demo: applying arch paging (Task0)");
+                        // ─────────────────────────────────────────────
+                        // ここが今回のステップの主役
+                        //
+                        // - Task0: 現CR3（今動いているページテーブル）に apply する
+                        // - Task1/2: その AddressSpace の root(PML4) に直接 apply する（CR3は切替えない）
+                        //   → その root で translate して「反映されたか」を検証ログに出す
+                        // ─────────────────────────────────────────────
+                        if task_idx == TASK0_INDEX {
+                            logging::info(" mem_demo: applying arch paging (Task0 / current CR3)");
                             self.apply_mem_action(mem_action);
+
+                            // translate 検証（現CR3相当）をしたい場合は paging.rs 側で追加可能だが、
+                            // ここでは従来どおり mem_test が走るので省略
                         } else {
-                            logging::info(" mem_demo: skip arch paging (logical only)");
+                            // User AS は root_page_frame が Some のはず（invariant）
+                            let root = match aspace.root_page_frame {
+                                Some(r) => r,
+                                None => {
+                                    logging::error(" mem_demo: user root_page_frame is None (unexpected)");
+                                    self.activity = next_activity;
+                                    self.debug_check_invariants();
+                                    return;
+                                }
+                            };
+
+                            logging::info(" mem_demo: applying arch paging (User root / no CR3 switch)");
+                            unsafe {
+                                arch::paging::apply_mem_action_in_root(mem_action, root, &mut self.phys_mem);
+                            }
+
+                            // その root で virt がどう解決されるかをログで検証
+                            let virt_addr_u64 = page.start_address().0;
+                            arch::paging::debug_translate_in_root(root, virt_addr_u64);
                         }
 
                         self.push_event(LogEvent::MemActionApplied {
@@ -912,6 +963,7 @@ impl KernelState {
         self.activity = next_activity;
 
         self.debug_check_invariants();
+
     }
 
     pub fn should_halt(&self) -> bool {
@@ -1070,6 +1122,12 @@ fn next_activity_and_action(current: KernelActivity) -> (KernelActivity, KernelA
 
 pub fn start(boot_info: &'static BootInfo) {
     logging::info("kernel::start()");
+
+    // CR3 real switch を有効化してよいか（カーネルが high-half にいるか）を判定
+    let code_addr = start as usize as u64;
+    let stack_probe: u64 = 0;
+    let stack_addr = &stack_probe as *const u64 as u64;
+    arch::paging::configure_cr3_switch_safety(code_addr, stack_addr);
 
     let mut kstate = KernelState::new(boot_info);
 
