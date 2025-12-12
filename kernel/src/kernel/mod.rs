@@ -22,8 +22,15 @@
 //    - Task index 0（TaskId(1)）は Kernel アドレス空間 (AddressSpaceId(0)) に属する。
 //    - Task index 1 以降（TaskId(2..)) は User アドレス空間 (AddressSpaceId(1..)) に属する。
 //
-// これらは「設計上守りたいもの」を明文化したものであり、
-// debug_check_invariants() によってログ出力ベースで検証される。
+// 4. スケジューラ/キューの整合性（デバッグで検証する）
+//    - Running は常に current_task のみ
+//    - ReadyQueue には Ready のみ、WaitQueue には Blocked のみ
+//    - 各タスクは Ready/Wait に重複して入らない
+//
+// 5. 仮想アドレスレイアウト（論理マッピングの段階）
+//    - User アドレス空間は high-half(kernel 空間) を使わない
+//
+// これらは debug_check_invariants() によってログ出力ベースで検証される。
 
 use bootloader::BootInfo;
 use crate::{arch, logging};
@@ -31,6 +38,7 @@ use crate::mm::PhysicalMemoryManager;
 use crate::mem::addr::{PhysFrame, VirtPage, PAGE_SIZE};
 use crate::mem::paging::{MemAction, PageFlags};
 use crate::mem::address_space::{AddressSpace, AddressSpaceError, AddressSpaceKind};
+use crate::mem::layout::KERNEL_SPACE_START;
 use x86_64::registers::control::Cr3;
 
 const MAX_TASKS: usize = 3;
@@ -50,8 +58,6 @@ const TASK2_ID: TaskId = TaskId(3);
 
 // デモ用: 0x0010_0000 (1MiB) → 仮想ページ index
 const DEMO_VIRT_PAGE_INDEX: u64 = 0x100;
-// デモ用: 0x0020_0000 (2MiB) → 物理フレーム index
-const DEMO_PHYS_FRAME_INDEX: u64 = 0x200;
 
 //
 // ──────────────────────────────────────────────
@@ -156,16 +162,12 @@ pub struct KernelState {
     num_tasks: usize,
     current_task: usize,
 
-    // ReadyQueue（タスク index のリングバッファ）
+    // ReadyQueue（タスク index の配列 + len）
     ready_queue: [usize; MAX_TASKS],
-    rq_head: usize,
-    rq_tail: usize,
     rq_len: usize,
 
-    // WaitQueue（Blocked タスク index のリングバッファ）
+    // WaitQueue（Blocked タスク index の配列 + len）
     wait_queue: [usize; MAX_TASKS],
-    wq_head: usize,
-    wq_tail: usize,
     wq_len: usize,
 
     // 抽象イベントログ
@@ -177,6 +179,9 @@ pub struct KernelState {
 
     // MemDemo (Map/Unmap 切替)
     mem_demo_mapped: [bool; MAX_TASKS],
+
+    // MemDemo: タスクごとにデモ用フレームを保持（初回Map時に割当）
+    mem_demo_frame: [Option<PhysFrame>; MAX_TASKS],
 }
 
 impl KernelState {
@@ -239,6 +244,10 @@ impl KernelState {
         // Task0 の AddressSpace(0) に root_page_frame を設定
         address_spaces[KERNEL_ASID_INDEX].root_page_frame = Some(root_frame_for_task0);
 
+        // Ready: task1, task2 を初期投入
+        let ready_queue = [TASK1_INDEX, TASK2_INDEX, 0];
+        let rq_len = 2;
+
         KernelState {
             phys_mem,
             tick_count: 0,
@@ -249,16 +258,12 @@ impl KernelState {
             address_spaces,
             tasks,
             num_tasks: MAX_TASKS,
-            current_task: 0,
+            current_task: TASK0_INDEX,
 
-            ready_queue: [1, 2, 0],
-            rq_head: 0,
-            rq_tail: 2,
-            rq_len: 2,
+            ready_queue,
+            rq_len,
 
             wait_queue: [0; MAX_TASKS],
-            wq_head: 0,
-            wq_tail: 0,
             wq_len: 0,
 
             event_log: [None; EVENT_LOG_CAP],
@@ -266,6 +271,7 @@ impl KernelState {
 
             quantum: 5,
             mem_demo_mapped: [false; MAX_TASKS],
+            mem_demo_frame: [None; MAX_TASKS],
         }
     }
 
@@ -279,11 +285,11 @@ impl KernelState {
     //
     // 簡易的な不変条件チェック（デバッグ用）
     //
-    //
-    // 簡易的な不変条件チェック（デバッグ用）
-    //
     fn debug_check_invariants(&self) {
-        // 1. Kernel アドレス空間 (AddressSpaceId(0)) に関する invariant
+        // ─────────────────────────────
+        // 1. AddressSpace 周りの invariant
+        // ─────────────────────────────
+
         {
             let kernel_as = &self.address_spaces[KERNEL_ASID_INDEX];
 
@@ -296,7 +302,6 @@ impl KernelState {
             }
         }
 
-        // 2. User アドレス空間 (AddressSpaceId >= 1) に関する invariant（プロトタイプ仕様）
         for as_idx in FIRST_USER_ASID_INDEX..self.num_tasks {
             let aspace = &self.address_spaces[as_idx];
 
@@ -305,18 +310,15 @@ impl KernelState {
                 logging::info_u64(" offending_as_idx", as_idx as u64);
             }
 
-            // プロトタイプでは「User はまだ root_page_frame を持たない」という設計
             if aspace.root_page_frame.is_some() {
                 logging::error("INVARIANT VIOLATION: user address space has root_page_frame (prototype spec expects None)");
                 logging::info_u64(" offending_as_idx", as_idx as u64);
             }
         }
 
-        // 3. Task と AddressSpaceId の対応に関する invariant
         for (idx, task) in self.tasks.iter().enumerate().take(self.num_tasks) {
             let as_id = task.address_space_id.0;
 
-            // (既存チェック) 範囲チェック
             if as_id >= MAX_TASKS {
                 logging::error("INVARIANT VIOLATION: address_space_id out of range");
                 logging::info_u64(" offending_task_index", idx as u64);
@@ -324,7 +326,6 @@ impl KernelState {
                 continue;
             }
 
-            // (プロトタイプ仕様) tasks[idx].address_space_id == AddressSpaceId(idx)
             if as_id != idx {
                 logging::error("INVARIANT VIOLATION: task.address_space_id != task index (prototype spec)");
                 logging::info_u64(" task_index", idx as u64);
@@ -333,19 +334,159 @@ impl KernelState {
 
             let aspace = &self.address_spaces[as_id];
 
-            // Task0 は Kernel アドレス空間を使うべき
             if idx == TASK0_INDEX && aspace.kind != AddressSpaceKind::Kernel {
                 logging::error("INVARIANT VIOLATION: Task0 is not in Kernel address space");
                 logging::info_u64(" task_index", idx as u64);
                 logging::info_u64(" as_id", as_id as u64);
             }
 
-            // Task1 以降は User アドレス空間を使うべき
             if idx >= FIRST_USER_ASID_INDEX && aspace.kind != AddressSpaceKind::User {
                 logging::error("INVARIANT VIOLATION: user task is not in User address space");
                 logging::info_u64(" task_index", idx as u64);
                 logging::info_u64(" as_id", as_id as u64);
             }
+        }
+
+        // ─────────────────────────────
+        // 2. スケジューラ / キュー構造の invariant（完全版）
+        // ─────────────────────────────
+
+        // 2-1. current_task は必ず Running
+        if self.current_task >= self.num_tasks {
+            logging::error("INVARIANT VIOLATION: current_task index out of range");
+        } else if self.tasks[self.current_task].state != TaskState::Running {
+            logging::error("INVARIANT VIOLATION: current_task is not RUNNING");
+            logging::info_u64(" current_task_index", self.current_task as u64);
+        }
+
+        // 2-2. Running は current_task だけ
+        for (idx, t) in self.tasks.iter().enumerate().take(self.num_tasks) {
+            if idx == self.current_task {
+                continue;
+            }
+            if t.state == TaskState::Running {
+                logging::error("INVARIANT VIOLATION: multiple RUNNING tasks");
+                logging::info_u64(" extra_running_task_index", idx as u64);
+            }
+        }
+
+        // 2-3. ready_queue / wait_queue の内容を集計（重複チェック込み）
+        let mut in_ready = [false; MAX_TASKS];
+        let mut in_wait = [false; MAX_TASKS];
+
+        // ReadyQueue: 0..rq_len
+        for pos in 0..self.rq_len {
+            let idx = self.ready_queue[pos];
+
+            if idx >= self.num_tasks {
+                logging::error("INVARIANT VIOLATION: ready_queue contains invalid task index");
+                logging::info_u64(" queue_pos", pos as u64);
+                logging::info_u64(" task_index", idx as u64);
+                continue;
+            }
+
+            if in_ready[idx] {
+                logging::error("INVARIANT VIOLATION: task appears multiple times in ready_queue");
+                logging::info_u64(" task_index", idx as u64);
+            }
+            in_ready[idx] = true;
+
+            if self.tasks[idx].state != TaskState::Ready {
+                logging::error("INVARIANT VIOLATION: task in ready_queue is not READY");
+                logging::info_u64(" task_index", idx as u64);
+            }
+        }
+
+        // WaitQueue: 0..wq_len
+        for pos in 0..self.wq_len {
+            let idx = self.wait_queue[pos];
+
+            if idx >= self.num_tasks {
+                logging::error("INVARIANT VIOLATION: wait_queue contains invalid task index");
+                logging::info_u64(" queue_pos", pos as u64);
+                logging::info_u64(" task_index", idx as u64);
+                continue;
+            }
+
+            if in_wait[idx] {
+                logging::error("INVARIANT VIOLATION: task appears multiple times in wait_queue");
+                logging::info_u64(" task_index", idx as u64);
+            }
+            in_wait[idx] = true;
+
+            if self.tasks[idx].state != TaskState::Blocked {
+                logging::error("INVARIANT VIOLATION: task in wait_queue is not BLOCKED");
+                logging::info_u64(" task_index", idx as u64);
+            }
+        }
+
+        // 2-4. Ready と Blocked が両方に入っていない
+        for idx in 0..self.num_tasks {
+            if in_ready[idx] && in_wait[idx] {
+                logging::error("INVARIANT VIOLATION: task is in both ready_queue and wait_queue");
+                logging::info_u64(" task_index", idx as u64);
+            }
+        }
+
+        // 2-5. state と所属の逆方向チェック
+        for idx in 0..self.num_tasks {
+            match self.tasks[idx].state {
+                TaskState::Running => {
+                    if idx != self.current_task {
+                        logging::error("INVARIANT VIOLATION: non-current task is RUNNING");
+                        logging::info_u64(" task_index", idx as u64);
+                    }
+                    if in_ready[idx] || in_wait[idx] {
+                        logging::error("INVARIANT VIOLATION: RUNNING task appears in ready/wait queue");
+                        logging::info_u64(" task_index", idx as u64);
+                    }
+                }
+                TaskState::Ready => {
+                    if !in_ready[idx] {
+                        logging::error("INVARIANT VIOLATION: READY task not in ready_queue");
+                        logging::info_u64(" task_index", idx as u64);
+                    }
+                    if in_wait[idx] {
+                        logging::error("INVARIANT VIOLATION: READY task in wait_queue");
+                        logging::info_u64(" task_index", idx as u64);
+                    }
+                }
+                TaskState::Blocked => {
+                    if !in_wait[idx] {
+                        logging::error("INVARIANT VIOLATION: BLOCKED task not in wait_queue");
+                        logging::info_u64(" task_index", idx as u64);
+                    }
+                    if in_ready[idx] {
+                        logging::error("INVARIANT VIOLATION: BLOCKED task in ready_queue");
+                        logging::info_u64(" task_index", idx as u64);
+                    }
+                    if idx == self.current_task {
+                        logging::error("INVARIANT VIOLATION: current_task is BLOCKED");
+                        logging::info_u64(" task_index", idx as u64);
+                    }
+                }
+            }
+        }
+
+        // ─────────────────────────────
+        // 3. 仮想アドレスレイアウト invariant（論理マッピング）
+        //    - User は high-half を使わない
+        // ─────────────────────────────
+        for as_idx in FIRST_USER_ASID_INDEX..self.num_tasks {
+            let aspace = &self.address_spaces[as_idx];
+            if aspace.kind != AddressSpaceKind::User {
+                continue;
+            }
+
+            aspace.for_each_mapping(|m| {
+                let virt_addr = m.page.number * PAGE_SIZE;
+                if virt_addr >= KERNEL_SPACE_START {
+                    logging::error("INVARIANT VIOLATION: user mapping in kernel-space range");
+                    logging::info_u64(" as_idx", as_idx as u64);
+                    logging::info_u64(" virt_page_index", m.page.number);
+                    logging::info_u64(" virt_addr", virt_addr);
+                }
+            });
         }
     }
 
@@ -371,14 +512,44 @@ impl KernelState {
     }
 
     //
+    // ReadyQueue / WaitQueue: 存在チェック（二重 enqueue 防止）
+    //
+    fn is_in_ready_queue(&self, idx: usize) -> bool {
+        for pos in 0..self.rq_len {
+            if self.ready_queue[pos] == idx {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn is_in_wait_queue(&self, idx: usize) -> bool {
+        for pos in 0..self.wq_len {
+            if self.wait_queue[pos] == idx {
+                return true;
+            }
+        }
+        false
+    }
+
+    //
     // ReadyQueue
     //
     fn enqueue_ready(&mut self, idx: usize) {
         if self.rq_len >= MAX_TASKS {
             return;
         }
-        self.ready_queue[self.rq_tail] = idx;
-        self.rq_tail = (self.rq_tail + 1) % MAX_TASKS;
+        if idx >= self.num_tasks {
+            return;
+        }
+        if self.is_in_ready_queue(idx) {
+            return;
+        }
+        if self.tasks[idx].state != TaskState::Ready {
+            return;
+        }
+
+        self.ready_queue[self.rq_len] = idx;
         self.rq_len += 1;
 
         self.push_event(LogEvent::ReadyQueued(self.tasks[idx].id));
@@ -389,12 +560,11 @@ impl KernelState {
             return None;
         }
 
-        let mut best_pos = self.rq_head;
-        let mut best_idx = self.ready_queue[self.rq_head];
+        let mut best_pos = 0usize;
+        let mut best_idx = self.ready_queue[0];
         let mut best_prio = self.tasks[best_idx].priority;
 
-        for offset in 1..self.rq_len {
-            let pos = (self.rq_head + offset) % MAX_TASKS;
+        for pos in 1..self.rq_len {
             let idx = self.ready_queue[pos];
             let prio = self.tasks[idx].priority;
             if prio > best_prio {
@@ -404,11 +574,9 @@ impl KernelState {
             }
         }
 
-        // 取り出し
-        let last_pos = (self.rq_head + self.rq_len - 1) % MAX_TASKS;
+        // swap-remove
+        let last_pos = self.rq_len - 1;
         self.ready_queue[best_pos] = self.ready_queue[last_pos];
-
-        self.rq_tail = last_pos;
         self.rq_len -= 1;
 
         self.push_event(LogEvent::ReadyDequeued(self.tasks[best_idx].id));
@@ -422,8 +590,17 @@ impl KernelState {
         if self.wq_len >= MAX_TASKS {
             return;
         }
-        self.wait_queue[self.wq_tail] = idx;
-        self.wq_tail = (self.wq_tail + 1) % MAX_TASKS;
+        if idx >= self.num_tasks {
+            return;
+        }
+        if self.is_in_wait_queue(idx) {
+            return;
+        }
+        if self.tasks[idx].state != TaskState::Blocked {
+            return;
+        }
+
+        self.wait_queue[self.wq_len] = idx;
         self.wq_len += 1;
 
         self.push_event(LogEvent::WaitQueued(self.tasks[idx].id));
@@ -433,8 +610,10 @@ impl KernelState {
         if self.wq_len == 0 {
             return None;
         }
-        let idx = self.wait_queue[self.wq_head];
-        self.wq_head = (self.wq_head + 1) % MAX_TASKS;
+
+        // 順序は抽象化されているので、ここも swap-remove で OK
+        let last_pos = self.wq_len - 1;
+        let idx = self.wait_queue[last_pos];
         self.wq_len -= 1;
 
         self.push_event(LogEvent::WaitDequeued(self.tasks[idx].id));
@@ -478,57 +657,85 @@ impl KernelState {
     }
 
     //
-    // runtime 更新
+    // runtime 更新（この tick で実行したタスク ran_idx にだけ適用）
     //
-    fn update_runtime(&mut self) {
-        let idx = self.current_task;
-        let id = self.tasks[idx].id;
+    fn update_runtime_for(&mut self, ran_idx: usize) {
+        if ran_idx >= self.num_tasks {
+            logging::error("update_runtime_for: ran_idx out of range");
+            return;
+        }
 
-        self.tasks[idx].runtime_ticks += 1;
-        logging::info_u64(" runtime_ticks", self.tasks[idx].runtime_ticks);
+        let id = self.tasks[ran_idx].id;
+
+        self.tasks[ran_idx].runtime_ticks += 1;
+        logging::info_u64(" runtime_ticks", self.tasks[ran_idx].runtime_ticks);
 
         self.push_event(LogEvent::RuntimeUpdated(
             id,
-            self.tasks[idx].runtime_ticks,
+            self.tasks[ran_idx].runtime_ticks,
         ));
     }
 
     //
-    // time slice 更新
+    // 疑似 Blocked（この tick で実行したタスク ran_idx に対して判定）
+    // 戻り値: この tick で block が発生したら true（この場合 time_slice 更新はスキップ推奨）
     //
-    fn update_time_slice_and_maybe_schedule(&mut self) {
-        let idx = self.current_task;
-        let id = self.tasks[idx].id;
-
-        self.tasks[idx].time_slice_used += 1;
-        logging::info_u64(" time_slice_used", self.tasks[idx].time_slice_used);
-
-        if self.tasks[idx].time_slice_used >= self.quantum {
-            logging::info(" quantum expired; scheduling next task");
-            self.push_event(LogEvent::QuantumExpired(id, self.tasks[idx].time_slice_used));
-            self.schedule_next_task();
+    fn maybe_block_task(&mut self, ran_idx: usize) -> bool {
+        if ran_idx >= self.num_tasks {
+            logging::error("maybe_block_task: ran_idx out of range");
+            return false;
         }
-    }
 
-    //
-    // 疑似 Blocked
-    //
-    fn maybe_block_current_task(&mut self) {
+        if ran_idx != self.current_task {
+            logging::error("INVARIANT VIOLATION: ran_idx != current_task at block check");
+            logging::info_u64(" ran_idx", ran_idx as u64);
+            logging::info_u64(" current_task", self.current_task as u64);
+            return false;
+        }
+
         if self.tick_count != 0
             && self.tick_count % 7 == 0
-            && self.tasks[self.current_task].id.0 == 2
+            && self.tasks[ran_idx].id.0 == 2
         {
-            let idx = self.current_task;
-            let id = self.tasks[idx].id;
+            let id = self.tasks[ran_idx].id;
 
             logging::info(" blocking current task (fake I/O wait)");
-            self.tasks[idx].state = TaskState::Blocked;
-            self.tasks[idx].time_slice_used = 0;
+            self.tasks[ran_idx].state = TaskState::Blocked;
+            self.tasks[ran_idx].time_slice_used = 0;
 
             self.push_event(LogEvent::TaskStateChanged(id, TaskState::Blocked));
 
-            self.enqueue_wait(idx);
+            self.enqueue_wait(ran_idx);
             self.schedule_next_task();
+            return true;
+        }
+
+        false
+    }
+
+    //
+    // time slice 更新（この tick で実行したタスク ran_idx にだけ適用）
+    //
+    fn update_time_slice_for_and_maybe_schedule(&mut self, ran_idx: usize) {
+        if ran_idx >= self.num_tasks {
+            logging::error("update_time_slice_for_and_maybe_schedule: ran_idx out of range");
+            return;
+        }
+
+        let id = self.tasks[ran_idx].id;
+
+        self.tasks[ran_idx].time_slice_used += 1;
+        logging::info_u64(" time_slice_used", self.tasks[ran_idx].time_slice_used);
+
+        if self.tasks[ran_idx].time_slice_used >= self.quantum {
+            logging::info(" quantum expired; scheduling next task");
+            self.push_event(LogEvent::QuantumExpired(id, self.tasks[ran_idx].time_slice_used));
+
+            if ran_idx == self.current_task {
+                self.schedule_next_task();
+            } else {
+                logging::info(" quantum expired but task already switched in this tick; skip schedule");
+            }
         }
     }
 
@@ -557,6 +764,33 @@ impl KernelState {
     }
 
     //
+    // MemDemo: Map に必要なフレームを「初回だけ」割り当てる
+    //
+    fn get_or_alloc_demo_frame(&mut self, task_idx: usize) -> Option<PhysFrame> {
+        if task_idx >= self.num_tasks {
+            return None;
+        }
+
+        if let Some(f) = self.mem_demo_frame[task_idx] {
+            return Some(f);
+        }
+
+        match self.phys_mem.allocate_frame() {
+            Some(raw_frame) => {
+                let phys_u64 = raw_frame.start_address().as_u64();
+                let frame_index = phys_u64 / PAGE_SIZE;
+
+                let f = PhysFrame::from_index(frame_index);
+
+                self.push_event(LogEvent::FrameAllocated);
+                self.mem_demo_frame[task_idx] = Some(f);
+                Some(f)
+            }
+            None => None,
+        }
+    }
+
+    //
     // tick()
     //
     pub fn tick(&mut self) {
@@ -573,6 +807,9 @@ impl KernelState {
 
         let running = self.tasks[self.current_task].id;
         logging::info_u64(" running_task", running.0);
+
+        // この tick で「実行した」タスク index を固定
+        let ran_idx = self.current_task;
 
         let (next_activity, action) = next_activity_and_action(self.activity);
 
@@ -602,7 +839,6 @@ impl KernelState {
                 logging::info(" action = MemDemo");
 
                 let page = VirtPage::from_index(DEMO_VIRT_PAGE_INDEX);
-                let frame = PhysFrame::from_index(DEMO_PHYS_FRAME_INDEX);
                 let flags = PageFlags::PRESENT | PageFlags::WRITABLE;
 
                 let task_idx = self.current_task;
@@ -611,6 +847,18 @@ impl KernelState {
 
                 let mem_action = if !self.mem_demo_mapped[task_idx] {
                     logging::info(" mem_demo: issuing Map (for current task)");
+
+                    let frame = match self.get_or_alloc_demo_frame(task_idx) {
+                        Some(f) => f,
+                        None => {
+                            logging::error(" mem_demo: no more usable frames");
+                            self.should_halt = true;
+                            self.activity = next_activity;
+                            self.debug_check_invariants();
+                            return;
+                        }
+                    };
+
                     MemAction::Map { page, frame, flags }
                 } else {
                     logging::info(" mem_demo: issuing Unmap (for current task)");
@@ -652,13 +900,17 @@ impl KernelState {
             }
         }
 
-        self.update_runtime();
-        self.maybe_block_current_task();
-        self.update_time_slice_and_maybe_schedule();
+        self.update_runtime_for(ran_idx);
+
+        let blocked = self.maybe_block_task(ran_idx);
+        if !blocked {
+            self.update_time_slice_for_and_maybe_schedule(ran_idx);
+        } else {
+            logging::info(" skip time_slice update due to block in this tick");
+        }
 
         self.activity = next_activity;
 
-        // 簡易 invariant チェック
         self.debug_check_invariants();
     }
 
@@ -680,9 +932,6 @@ impl KernelState {
 
         logging::info("=== End of Event Log ===");
 
-        //
-        // AddressSpace Dump (per task)
-        //
         logging::info("=== AddressSpace Dump (per task) ===");
 
         for i in 0..self.num_tasks {
@@ -695,22 +944,18 @@ impl KernelState {
             let as_idx = task.address_space_id.0;
             let aspace = &self.address_spaces[as_idx];
 
-            // kind を表示
             match aspace.kind {
                 AddressSpaceKind::Kernel => logging::info("  kind = Kernel"),
-                AddressSpaceKind::User   => logging::info("  kind = User"),
+                AddressSpaceKind::User => logging::info("  kind = User"),
             }
 
-            // root_page_frame_index
             match aspace.root_page_frame {
                 Some(root) => logging::info_u64("  root_page_frame_index", root.number),
-                None       => logging::info("  root_page_frame_index = None"),
+                None => logging::info("  root_page_frame_index = None"),
             }
 
-            // AddressSpaceId 自体
             logging::info_u64("  address_space_id", as_idx as u64);
 
-            // マッピング
             let count = aspace.mapping_count();
             logging::info_u64("  mapping_count", count as u64);
 
@@ -807,21 +1052,15 @@ fn log_event_to_vga(ev: LogEvent) {
 // KernelActivity → (次状態, アクション)
 // ─────────────────────────────────────────────
 
-fn next_activity_and_action(current: KernelActivity)
-                            -> (KernelActivity, KernelAction)
-{
+fn next_activity_and_action(current: KernelActivity) -> (KernelActivity, KernelAction) {
     match current {
-        KernelActivity::Idle =>
-            (KernelActivity::UpdatingTimer, KernelAction::None),
+        KernelActivity::Idle => (KernelActivity::UpdatingTimer, KernelAction::None),
 
-        KernelActivity::UpdatingTimer =>
-            (KernelActivity::AllocatingFrame, KernelAction::UpdateTimer),
+        KernelActivity::UpdatingTimer => (KernelActivity::AllocatingFrame, KernelAction::UpdateTimer),
 
-        KernelActivity::AllocatingFrame =>
-            (KernelActivity::MappingDemoPage, KernelAction::AllocateFrame),
+        KernelActivity::AllocatingFrame => (KernelActivity::MappingDemoPage, KernelAction::AllocateFrame),
 
-        KernelActivity::MappingDemoPage =>
-            (KernelActivity::Idle, KernelAction::MemDemo),
+        KernelActivity::MappingDemoPage => (KernelActivity::Idle, KernelAction::MemDemo),
     }
 }
 
