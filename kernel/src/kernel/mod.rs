@@ -1,4 +1,4 @@
-// src/kernel/mod.rs
+// kernel/src/kernel/mod.rs
 //
 // formal-os: 優先度付きプリエンプティブ＋ReadyQueue＋Blocked状態付きミニカーネル + IPC(Endpoint)
 //
@@ -13,8 +13,9 @@
 // - unsafe は arch 側に局所化し、kernel 側は状態遷移＋抽象イベント中心。
 // - WaitQueue は「Blocked 全体」を保持する。
 //   * Sleep の wake は “Sleep のみ” を対象にする（IPC の待ちをタイマで勝手に起こさない）。
-// - tick 中に schedule が走って current_task が変わるのは自然に起こりうるため、
-//   ran_idx と current_task のズレは許容し、ブロック判定は current_task に対してのみ行う。
+// - tick 中に schedule が走って current_task が変わるのは自然に起こりうる。
+//   * ただし time_slice 更新は「その tick の最後まで同じ task が RUNNING の場合のみ」行う。
+//     （IPC などで tick 中にブロック/切替が起きた場合、time_slice を誤って加算しない）
 //
 // [IPC 仕様（このモジュールにおける約束事）]
 // - Endpoint.recv_waiter = Some(tidx) のとき:
@@ -144,8 +145,29 @@ impl Endpoint {
         }
     }
 
+    fn send_queue_contains(&self, idx: usize) -> bool {
+        for pos in 0..self.sq_len {
+            if self.send_queue[pos] == idx {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn reply_queue_contains(&self, idx: usize) -> bool {
+        for pos in 0..self.rq_len {
+            if self.reply_queue[pos] == idx {
+                return true;
+            }
+        }
+        false
+    }
+
     fn enqueue_sender(&mut self, idx: usize) {
         if self.sq_len >= MAX_TASKS {
+            return;
+        }
+        if self.send_queue_contains(idx) {
             return;
         }
         self.send_queue[self.sq_len] = idx;
@@ -167,17 +189,21 @@ impl Endpoint {
         if self.rq_len >= MAX_TASKS {
             return;
         }
+        if self.reply_queue_contains(idx) {
+            return;
+        }
         self.reply_queue[self.rq_len] = idx;
         self.rq_len += 1;
     }
 
-    fn dequeue_reply_waiter(&mut self) -> Option<usize> {
-        if self.rq_len == 0 {
+    fn remove_reply_waiter_at(&mut self, pos: usize) -> Option<usize> {
+        if pos >= self.rq_len {
             return None;
         }
         // swap-remove（順序は抽象化）
         let last = self.rq_len - 1;
-        let idx = self.reply_queue[last];
+        let idx = self.reply_queue[pos];
+        self.reply_queue[pos] = self.reply_queue[last];
         self.rq_len -= 1;
         Some(idx)
     }
@@ -579,11 +605,16 @@ impl KernelState {
     }
 
     fn remove_from_wait_queue(&mut self, idx: usize) -> bool {
+        if idx >= self.num_tasks {
+            return false;
+        }
         for pos in 0..self.wq_len {
             if self.wait_queue[pos] == idx {
                 let last = self.wq_len - 1;
                 self.wait_queue[pos] = self.wait_queue[last];
                 self.wq_len -= 1;
+
+                self.push_event(LogEvent::WaitDequeued(self.tasks[idx].id));
                 return true;
             }
         }
@@ -660,19 +691,6 @@ impl KernelState {
         self.push_event(LogEvent::WaitQueued(self.tasks[idx].id));
     }
 
-    fn dequeue_wait(&mut self) -> Option<usize> {
-        if self.wq_len == 0 {
-            return None;
-        }
-
-        let last_pos = self.wq_len - 1;
-        let idx = self.wait_queue[last_pos];
-        self.wq_len -= 1;
-
-        self.push_event(LogEvent::WaitDequeued(self.tasks[idx].id));
-        Some(idx)
-    }
-
     //
     // Scheduler
     //
@@ -724,6 +742,46 @@ impl KernelState {
     }
 
     //
+    // block current
+    //
+    fn block_current(&mut self, reason: BlockedReason) {
+        let idx = self.current_task;
+        let id = self.tasks[idx].id;
+
+        self.tasks[idx].state = TaskState::Blocked;
+        self.tasks[idx].blocked_reason = Some(reason);
+        self.tasks[idx].time_slice_used = 0;
+
+        self.push_event(LogEvent::TaskStateChanged(id, TaskState::Blocked));
+        self.enqueue_wait(idx);
+    }
+
+    fn block_current_and_schedule(&mut self, reason: BlockedReason) {
+        self.block_current(reason);
+        self.schedule_next_task();
+    }
+
+    fn wake_task_to_ready(&mut self, idx: usize) {
+        if idx >= self.num_tasks {
+            return;
+        }
+        if self.tasks[idx].state != TaskState::Blocked {
+            logging::error("wake_task_to_ready: target is not BLOCKED");
+            return;
+        }
+
+        let _ = self.remove_from_wait_queue(idx);
+        let id = self.tasks[idx].id;
+
+        self.tasks[idx].state = TaskState::Ready;
+        self.tasks[idx].blocked_reason = None;
+        self.tasks[idx].time_slice_used = 0;
+
+        self.push_event(LogEvent::TaskStateChanged(id, TaskState::Ready));
+        self.enqueue_ready(idx);
+    }
+
+    //
     // fake block (Sleep)
     //
     fn maybe_block_task(&mut self, ran_idx: usize) -> bool {
@@ -731,8 +789,6 @@ impl KernelState {
             logging::error("maybe_block_task: ran_idx out of range");
             return false;
         }
-
-        // tick中に schedule が走ると ran_idx と current_task はズレうるので current_task のみ判定
         if ran_idx != self.current_task {
             return false;
         }
@@ -741,14 +797,8 @@ impl KernelState {
             && self.tick_count % 7 == 0
             && self.tasks[ran_idx].id.0 == 2
         {
-            let id = self.tasks[ran_idx].id;
             logging::info(" blocking current task (fake I/O wait)");
-            self.tasks[ran_idx].state = TaskState::Blocked;
-            self.tasks[ran_idx].blocked_reason = Some(BlockedReason::Sleep);
-            self.tasks[ran_idx].time_slice_used = 0;
-            self.push_event(LogEvent::TaskStateChanged(id, TaskState::Blocked));
-            self.enqueue_wait(ran_idx);
-            self.schedule_next_task();
+            self.block_current_and_schedule(BlockedReason::Sleep);
             return true;
         }
 
@@ -763,6 +813,14 @@ impl KernelState {
             logging::error("update_time_slice_for_and_maybe_schedule: ran_idx out of range");
             return;
         }
+        if ran_idx != self.current_task {
+            logging::info(" time_slice update skipped (task switched in this tick)");
+            return;
+        }
+        if self.tasks[ran_idx].state != TaskState::Running {
+            logging::info(" time_slice update skipped (task not RUNNING)");
+            return;
+        }
 
         let id = self.tasks[ran_idx].id;
         self.tasks[ran_idx].time_slice_used += 1;
@@ -771,12 +829,7 @@ impl KernelState {
         if self.tasks[ran_idx].time_slice_used >= self.quantum {
             logging::info(" quantum expired; scheduling next task");
             self.push_event(LogEvent::QuantumExpired(id, self.tasks[ran_idx].time_slice_used));
-
-            if ran_idx == self.current_task {
-                self.schedule_next_task();
-            } else {
-                logging::info(" quantum expired but task already switched in this tick; skip schedule");
-            }
+            self.schedule_next_task();
         }
     }
 
@@ -789,20 +842,9 @@ impl KernelState {
             if idx >= self.num_tasks {
                 continue;
             }
-
             if self.tasks[idx].blocked_reason == Some(BlockedReason::Sleep) {
-                let last = self.wq_len - 1;
-                self.wait_queue[pos] = self.wait_queue[last];
-                self.wq_len -= 1;
-
-                let id = self.tasks[idx].id;
-
                 logging::info(" waking 1 blocked task (Sleep only)");
-                self.tasks[idx].state = TaskState::Ready;
-                self.tasks[idx].blocked_reason = None;
-
-                self.push_event(LogEvent::TaskStateChanged(id, TaskState::Ready));
-                self.enqueue_ready(idx);
+                self.wake_task_to_ready(idx);
                 return;
             }
         }
@@ -917,6 +959,9 @@ impl KernelState {
             Err(AddressSpaceError::AlreadyMapped) => logging::info(" address_space.apply: AlreadyMapped"),
             Err(AddressSpaceError::NotMapped) => logging::info(" address_space.apply: NotMapped"),
             Err(AddressSpaceError::CapacityExceeded) => logging::info(" address_space.apply: CapacityExceeded"),
+            Err(AddressSpaceError::UserMappingInKernelSpace) => logging::error(" address_space.apply: UserMappingInKernelSpace"),
+            Err(AddressSpaceError::UserMappingMissingUserFlag) => logging::error(" address_space.apply: UserMappingMissingUserFlag"),
+            Err(AddressSpaceError::KernelMappingHasUserFlag) => logging::error(" address_space.apply: KernelMappingHasUserFlag"),
         }
     }
 
@@ -926,32 +971,29 @@ impl KernelState {
     // ──────────────────────────────────────────────
     //
 
-    fn block_current_and_schedule(&mut self, reason: BlockedReason) {
-        let idx = self.current_task;
-        let id = self.tasks[idx].id;
-
-        self.tasks[idx].state = TaskState::Blocked;
-        self.tasks[idx].blocked_reason = Some(reason);
-        self.tasks[idx].time_slice_used = 0;
-
-        self.push_event(LogEvent::TaskStateChanged(id, TaskState::Blocked));
-        self.enqueue_wait(idx);
-        self.schedule_next_task();
-    }
-
-    fn wake_task_to_ready(&mut self, idx: usize) {
-        if idx >= self.num_tasks {
-            return;
+    fn take_reply_waiter_for_partner(&mut self, ep: EndpointId, partner: TaskId) -> Option<usize> {
+        if ep.0 >= MAX_ENDPOINTS {
+            return None;
         }
 
-        let _ = self.remove_from_wait_queue(idx);
-        let id = self.tasks[idx].id;
+        let e = &mut self.endpoints[ep.0];
 
-        self.tasks[idx].state = TaskState::Ready;
-        self.tasks[idx].blocked_reason = None;
+        // 後ろから探す（順序は抽象化、swap-remove を維持）
+        for pos in (0..e.rq_len).rev() {
+            let idx = e.reply_queue[pos];
+            if idx >= self.num_tasks {
+                continue;
+            }
 
-        self.push_event(LogEvent::TaskStateChanged(id, TaskState::Ready));
-        self.enqueue_ready(idx);
+            match self.tasks[idx].blocked_reason {
+                Some(BlockedReason::IpcReply { partner: p, ep: pep }) if p == partner && pep == ep => {
+                    return e.remove_reply_waiter_at(pos);
+                }
+                _ => {}
+            }
+        }
+
+        None
     }
 
     fn ipc_recv(&mut self, ep: EndpointId) {
@@ -971,9 +1013,16 @@ impl KernelState {
 
         if let Some(send_idx) = send_idx_opt {
             let send_id = self.tasks[send_idx].id;
-            let msg = self.tasks[send_idx].pending_send_msg.take().unwrap_or(0);
 
-            // sender は reply待ちで Block + reply_queue に積む
+            let msg = match self.tasks[send_idx].pending_send_msg.take() {
+                Some(m) => m,
+                None => {
+                    logging::error("ipc_recv: sender had no pending_send_msg");
+                    0
+                }
+            };
+
+            // sender は reply待ち（Blocked のまま reason を差し替え）
             self.tasks[send_idx].state = TaskState::Blocked;
             self.tasks[send_idx].blocked_reason = Some(BlockedReason::IpcReply {
                 partner: recv_id,
@@ -989,7 +1038,6 @@ impl KernelState {
 
             self.tasks[recv_idx].last_msg = Some(msg);
 
-            // demo(A): 受信回数を数える（Task3 + ep0 の deliver）
             if ep == IPC_DEMO_EP0 && recv_idx == TASK2_INDEX && self.ipc_a_msgs_delivered < 2 {
                 self.ipc_a_msgs_delivered += 1;
             }
@@ -1004,18 +1052,18 @@ impl KernelState {
         }
 
         // sender がいない → recv_waiter に登録して Block
-        let already_waiting = {
-            let e = &mut self.endpoints[ep.0];
-            e.recv_waiter.is_some()
-        };
-
-        if !already_waiting {
-            let e = &mut self.endpoints[ep.0];
-            e.recv_waiter = Some(recv_idx);
+        if self.endpoints[ep.0].recv_waiter.is_some() {
+            // このプロトタイプでは recv_waiter は単一前提。
+            // 2人目を Block すると回収不能になり得るので「拒否」する。
+            logging::error("ipc_recv: recv_waiter already exists; recv rejected (prototype)");
+            return;
         }
 
+        self.block_current(BlockedReason::IpcRecv { ep });
+        self.endpoints[ep.0].recv_waiter = Some(recv_idx);
+
         self.push_event(LogEvent::IpcRecvBlocked { task: recv_id, ep });
-        self.block_current_and_schedule(BlockedReason::IpcRecv { ep });
+        self.schedule_next_task();
     }
 
     fn ipc_send(&mut self, ep: EndpointId, msg: u64) {
@@ -1040,12 +1088,21 @@ impl KernelState {
             self.wake_task_to_ready(recv_idx);
             self.tasks[recv_idx].last_msg = Some(msg);
 
+            // sender を reply待ちで Block → reply_queue へ
+            self.block_current(BlockedReason::IpcReply {
+                partner: recv_id,
+                ep,
+            });
+
             {
                 let e = &mut self.endpoints[ep.0];
                 e.enqueue_reply_waiter(send_idx);
             }
 
-            // sender を reply待ちで Block（この時点で reply_queue にも入っている）
+            if ep == IPC_DEMO_EP0 && recv_idx == TASK2_INDEX && self.ipc_a_msgs_delivered < 2 {
+                self.ipc_a_msgs_delivered += 1;
+            }
+
             self.push_event(LogEvent::IpcDelivered {
                 from: send_id,
                 to: recv_id,
@@ -1053,27 +1110,21 @@ impl KernelState {
                 msg,
             });
 
-            // demo(A): 受信回数を数える（Task3 + ep0 の deliver）
-            if ep == IPC_DEMO_EP0 && recv_idx == TASK2_INDEX && self.ipc_a_msgs_delivered < 2 {
-                self.ipc_a_msgs_delivered += 1;
-            }
-
-            self.block_current_and_schedule(BlockedReason::IpcReply {
-                partner: recv_id,
-                ep,
-            });
+            self.schedule_next_task();
             return;
         }
 
         // receiver がいない → sender を send_queue に積んで Block
         self.tasks[send_idx].pending_send_msg = Some(msg);
+
+        self.block_current(BlockedReason::IpcSend { ep });
         {
             let e = &mut self.endpoints[ep.0];
             e.enqueue_sender(send_idx);
         }
 
         self.push_event(LogEvent::IpcSendBlocked { task: send_id, ep });
-        self.block_current_and_schedule(BlockedReason::IpcSend { ep });
+        self.schedule_next_task();
     }
 
     fn ipc_reply(&mut self, ep: EndpointId) {
@@ -1084,12 +1135,7 @@ impl KernelState {
         let recv_idx = self.current_task;
         let recv_id = self.tasks[recv_idx].id;
 
-        let send_idx_opt = {
-            let e = &mut self.endpoints[ep.0];
-            e.dequeue_reply_waiter()
-        };
-
-        let send_idx = match send_idx_opt {
+        let send_idx = match self.take_reply_waiter_for_partner(ep, recv_id) {
             Some(i) => i,
             None => return,
         };
@@ -1120,26 +1166,22 @@ impl KernelState {
     // IPC demo(A): 2 send → reply_queue=2 → 2 reply
     // ──────────────────────────────────────────────
     //
-    // 役割:
-    // - Receiver: Task3 (TASK2_INDEX)
-    // - Sender A: Task2 (TASK1_INDEX)
-    // - Sender B: Task1 (TASK0_INDEX)
-    //
-    // シーケンス（意図）:
-    // 1) Task3 が recv(1回目) で Block
-    // 2) Task2 が send して deliver → Task2 が reply_queue に入る（Task3 Ready）
-    // 3) Task3 が recv(2回目) で Block
-    // 4) Task1 が send して deliver → Task1 が reply_queue に入る（reply_queue_len=2）
-    // 5) Task3 が reply を2回行い、reply_queue_len=2→1→0 になる
-    //
     fn ipc_demo(&mut self) {
         let ep = IPC_DEMO_EP0;
 
-        // 見える化: IpcDemo を実行するたび、ep0 の reply_queue_len を表示
+        // 見える化: IpcDemo を実行するたび、ep0 の状態を表示
         {
             let e = &self.endpoints[ep.0];
             logging::info("ipc_demo: ep0 state");
-            logging::info_u64(" recv_waiter", if e.recv_waiter.is_some() { 1 } else { 0 });
+            logging::info_u64(" recv_waiter_is_some", if e.recv_waiter.is_some() { 1 } else { 0 });
+
+            if let Some(w) = e.recv_waiter {
+                logging::info_u64(" recv_waiter_task_index", w as u64);
+                if w < self.num_tasks {
+                    logging::info_u64(" recv_waiter_task_id", self.tasks[w].id.0);
+                }
+            }
+
             logging::info_u64(" send_queue_len", e.sq_len as u64);
             logging::info_u64(" reply_queue_len", e.rq_len as u64);
             logging::info_u64(" msgs_delivered", self.ipc_a_msgs_delivered as u64);
@@ -1150,13 +1192,11 @@ impl KernelState {
 
         // Receiver (Task3)
         if cur == TASK2_INDEX {
-            // 受信が2回済んでいなければ recv を優先（2回目の recv を張る）
             if self.ipc_a_msgs_delivered < 2 {
                 self.ipc_recv(ep);
                 return;
             }
 
-            // 受信が2回済みなら reply を2回
             if self.ipc_a_replies_sent < 2 {
                 self.ipc_reply(ep);
                 return;
@@ -1254,18 +1294,24 @@ impl KernelState {
             }
         }
 
+        // ran_idx の runtime は「この tick の開始時点で走っていたタスク」に加算
         self.update_runtime_for(ran_idx);
 
-        let blocked = if ran_idx == self.current_task {
+        // Sleep block は current_task のみ判定
+        let still_running = ran_idx == self.current_task && self.tasks[ran_idx].state == TaskState::Running;
+
+        let blocked_by_sleep = if still_running {
             self.maybe_block_task(ran_idx)
         } else {
             false
         };
 
-        if !blocked {
+        if still_running && !blocked_by_sleep {
             self.update_time_slice_for_and_maybe_schedule(ran_idx);
-        } else {
+        } else if blocked_by_sleep {
             logging::info(" skip time_slice update due to block in this tick");
+        } else {
+            logging::info(" skip time_slice update due to task switch in this tick");
         }
 
         self.activity = next_activity;

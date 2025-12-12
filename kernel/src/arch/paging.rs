@@ -13,6 +13,10 @@
 // - CR3 を切り替えなくても、任意の root PML4 を直接操作/検査する API を提供。
 //   (low-half にカーネルがいる現状でも安全に “User AS のページテーブル” を更新できる)
 //
+// 重要な注意:
+// - apply_mem_action_in_root() は「現CR3ではない root」を編集する。
+//   この場合、MapperFlush::flush()（invlpg）は“現CR3のTLB”を触るだけで意味が薄い。
+//   よって root!=current のとき flush は呼ばず「deferred」として扱う。
 
 use bootloader::BootInfo;
 use bootloader::bootinfo::MemoryRegionType;
@@ -36,7 +40,7 @@ use x86_64::{
         PageTableFlags,
         Size4KiB,
         OffsetPageTable,
-        Translate, // ★ 追加: translate_addr を使うため
+        Translate,
     },
     structures::paging::mapper::{MapToError, UnmapError},
 };
@@ -64,7 +68,6 @@ unsafe fn phys_u64_to_virt_ptr(phys: u64) -> *mut u8 {
 pub fn init(boot_info: &'static BootInfo) {
     logging::info("arch::paging::init: start");
 
-    // あなたの環境では physical_memory_offset は u64
     PHYSICAL_MEMORY_OFFSET.store(boot_info.physical_memory_offset, Ordering::Relaxed);
 
     let mem_map = &boot_info.memory_map;
@@ -225,8 +228,12 @@ unsafe fn apply_mem_action_with_mapper(
 
                 match mapper.map_to(x86_page, x86_frame, x86_flags, &mut frame_alloc) {
                     Ok(flush) => {
-                        flush.flush();
-                        logging::info(" map_to: OK (flush done)");
+                        if root.is_none() {
+                            flush.flush();
+                            logging::info(" map_to: OK (flush done)");
+                        } else {
+                            logging::info(" map_to: OK (flush deferred; root!=current)");
+                        }
 
                         // root=None（現CR3）だけ mem_test を行う
                         if root.is_none() {
@@ -274,16 +281,18 @@ unsafe fn apply_mem_action_with_mapper(
 
                 match mapper.unmap(x86_page) {
                     Ok((_frame, flush)) => {
-                        flush.flush();
-                        logging::info(" unmap: OK (flush done)");
+                        if root.is_none() {
+                            flush.flush();
+                            logging::info(" unmap: OK (flush done)");
+                        } else {
+                            logging::info(" unmap: OK (flush deferred; root!=current)");
+                        }
                     }
                     Err(err) => {
                         logging::error(" unmap: ERROR");
                         log_unmap_error(err);
                     }
                 }
-
-                let _ = phys_mem;
             } else {
                 logging::info(" REAL PAGING: disabled (ENABLE_REAL_PAGING = false)");
             }
