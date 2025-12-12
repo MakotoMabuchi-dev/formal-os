@@ -4,8 +4,13 @@
 // - 論理アドレス空間（プロセスやカーネルのメモリ空間）を表現する。
 // - どの仮想ページがどの物理フレームにどの権限でマップされているかを保持する。
 // - kind で「カーネル用かユーザ用か」を明示し、将来の権限チェックのベースにする。
+//
+// 方針:
+// - ここは “論理モデル” なので実ページテーブル操作は行わない。
+// - ただしプロトタイプ段階でも危険な誤用（User が kernel-space を map 等）は早めに弾く。
 
-use crate::mem::addr::{PhysFrame, VirtPage};
+use crate::mem::addr::{PhysFrame, VirtPage, PAGE_SIZE};
+use crate::mem::layout::KERNEL_SPACE_START;
 use crate::mem::paging::{MemAction, PageFlags};
 
 /// アドレス空間の種類（役割）。
@@ -47,6 +52,13 @@ pub enum AddressSpaceError {
     NotMapped,
     /// 登録できるスロットがもう残っていない。
     CapacityExceeded,
+
+    /// User AS が kernel-space に map しようとした。
+    UserMappingInKernelSpace,
+    /// User AS の map なのに USER フラグが無い。
+    UserMappingMissingUserFlag,
+    /// Kernel AS の map なのに USER フラグが付いている。
+    KernelMappingHasUserFlag,
 }
 
 impl AddressSpace {
@@ -78,10 +90,34 @@ impl AddressSpace {
         }
     }
 
+    fn validate_map(&self, page: VirtPage, flags: PageFlags) -> Result<(), AddressSpaceError> {
+        let virt_addr = page.number * PAGE_SIZE;
+
+        match self.kind {
+            AddressSpaceKind::User => {
+                if virt_addr >= KERNEL_SPACE_START {
+                    return Err(AddressSpaceError::UserMappingInKernelSpace);
+                }
+                if !flags.contains(PageFlags::USER) {
+                    return Err(AddressSpaceError::UserMappingMissingUserFlag);
+                }
+            }
+            AddressSpaceKind::Kernel => {
+                if flags.contains(PageFlags::USER) {
+                    return Err(AddressSpaceError::KernelMappingHasUserFlag);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// このアドレス空間に対して MemAction (Map/Unmap) を適用する。
     pub fn apply(&mut self, action: MemAction) -> Result<(), AddressSpaceError> {
         match action {
             MemAction::Map { page, frame, flags } => {
+                self.validate_map(page, flags)?;
+
                 // すでに同じ page が存在していないかチェック
                 for entry in self.mappings.iter() {
                     if let Some(m) = entry {
