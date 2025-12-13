@@ -1,39 +1,24 @@
 // kernel/src/kernel/pagetable_init.rs
 //
 // 役割:
-// - 新しい L4 ページテーブルを 1フレーム分確保し、ゼロクリアして返す。
-// - 返り値は「自前の」PhysFrame（mem::addr::PhysFrame）。
-// - まだこの L4 を CR3 に設定したりはしない（Task1/2 の root_page_frame として持っておくだけ）。
+// - タスク用の新しい root(PML4) を 1フレーム分確保して返す。
+// - 物理フレームの中身（PageTable の初期化）は arch::paging に寄せる。
 //
+// やること:
+// - PhysicalMemoryManager から 4KiB フレームを 1 枚確保
+// - 自前 PhysFrame に変換して返す
+//
+// やらないこと:
+// - ここでフレームをゼロクリアする（unsafe を増やさない）
+//   ※ init_user_pml4_from_current() が 512 エントリを上書きするのでゼロクリアは必須ではない
+// - CR3 の切替（スケジューラの責務）
 
 use crate::mm::PhysicalMemoryManager;
 use crate::mem::addr::{PhysFrame, PAGE_SIZE};
-use x86_64::structures::paging::{PageTable, PhysFrame as X86PhysFrame, Size4KiB};
-use core::ptr::write_bytes;
 
-/// 新しい L4 ページテーブル用のフレームを 1枚確保し、
-/// そのフレームをゼロクリアして、自前の PhysFrame 型で返す。
-///
-/// - 物理メモリは identity map (phys == virt) 前提で、
-///   物理アドレスをそのまま kernel の仮想アドレスとして扱っている。
-pub fn allocate_new_l4_table(
-    phys_mem: &mut PhysicalMemoryManager,
-) -> Option<PhysFrame> {
-    // PhysicalMemoryManager から x86_64 の PhysFrame<Size4KiB> を 1枚もらう
-    let x86_frame: X86PhysFrame<Size4KiB> = phys_mem.allocate_frame()?;
-
-    // 物理アドレス
-    let phys_addr_u64 = x86_frame.start_address().as_u64();
-
-    // identity map 前提なので、そのまま仮想アドレスとして PageTable ポインタに変換
-    let ptr = phys_addr_u64 as *mut PageTable;
-
-    unsafe {
-        // L4 ページテーブル全体をゼロクリア
-        write_bytes(ptr, 0, 1);
-    }
-
-    // 自前の PhysFrame 型に変換（frame index = phys_addr / PAGE_SIZE）
-    let index = phys_addr_u64 / PAGE_SIZE;
+pub fn allocate_new_l4_table(phys_mem: &mut PhysicalMemoryManager) -> Option<PhysFrame> {
+    let raw = phys_mem.allocate_frame()?;
+    let phys_u64 = raw.start_address().as_u64();
+    let index = phys_u64 / PAGE_SIZE;
     Some(PhysFrame::from_index(index))
 }

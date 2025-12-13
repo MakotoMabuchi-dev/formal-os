@@ -1,11 +1,8 @@
-// src/mem/mod.rs
+// kernel/src/mem/mod.rs
 //
 // 役割:
 // - メモリ関連のサブモジュールをまとめる中継点。
-// - addr.rs / paging.rs などを公開する。
-// やること:
-// - pub mod addr;
-// - pub mod paging;
+// - addr.rs / paging.rs / address_space.rs / layout.rs を公開する。
 
 pub mod addr;
 pub mod paging;

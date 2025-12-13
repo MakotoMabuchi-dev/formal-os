@@ -5,6 +5,10 @@
 //   「Usable」な物理フレームを順番に返すだけの最小アロケータ。
 // - unsafe は BootInfo を受け取ってフレーム列挙器に変換する箇所に局所化する。
 // - フォーマル検証の対象になりやすいよう、状態は構造体 + カウンタに閉じ込める。
+//
+// 追加の設計意図（性能）:
+// - allocate_frame() を O(1) で動かす（毎回 nth で先頭から走査しない）
+// - 低スペック環境でも “フレーム確保回数が増えるほど遅くなる” 事態を避ける
 
 use bootloader::BootInfo;
 use bootloader::bootinfo::{MemoryMap, MemoryRegionType};
@@ -45,11 +49,23 @@ impl PhysicalMemoryManager {
 
 /// BootInfo の MemoryMap から usable なフレームを順番に返すアロケータ。
 ///
-/// - 状態: `memory_map`（不変入力）と `next`（何番目まで使ったか）
+/// - 状態: memory_map（不変入力）と「今どのUsable領域のどこまで配ったか」
 /// - これはほぼ純粋ロジックなので、フォーマル検証の対象にしやすい。
+///
+/// 重要: O(n^2) になりがちな nth(skip) を避けるため、
+/// 「次に返す物理アドレス」を保持して前進する。
 struct BootInfoFrameAllocator {
     memory_map: &'static MemoryMap,
-    next: usize,
+
+    // 次に見る memory_map のインデックス
+    region_index: usize,
+
+    // 現在の Usable region の [cur_addr, cur_end) を保持
+    cur_addr: u64,
+    cur_end: u64,
+
+    // 有効な region を指しているか
+    has_region: bool,
 }
 
 impl BootInfoFrameAllocator {
@@ -60,40 +76,72 @@ impl BootInfoFrameAllocator {
     /// - memory_map 上で `Usable` とマークされているフレームが、他で
     ///   すでに利用中でないこと（本アロケータ以外から触らないこと）。
     pub unsafe fn new(memory_map: &'static MemoryMap) -> Self {
-        BootInfoFrameAllocator {
+        let mut me = BootInfoFrameAllocator {
             memory_map,
-            next: 0,
-        }
+            region_index: 0,
+            cur_addr: 0,
+            cur_end: 0,
+            has_region: false,
+        };
+
+        // 最初の usable region をセット
+        me.advance_to_next_usable_region();
+        me
     }
 
-    /// memory_map 内の "Usable" な領域から、4KiB ごとの物理フレームを列挙する。
-    fn usable_frames(&self) -> impl Iterator<Item = PhysFrame> {
-        // 1. usable な領域だけを残す
-        let regions = self.memory_map.iter();
-        let usable_regions = regions
-            .filter(|r| r.region_type == MemoryRegionType::Usable);
+    /// 4KiB アライン（切り上げ）
+    #[inline]
+    fn align_up_4k(x: u64) -> u64 {
+        const MASK: u64 = 4096 - 1;
+        (x + MASK) & !MASK
+    }
 
-        // 2. 各領域を [start_addr, end_addr) のアドレス範囲に変換
-        let addr_ranges = usable_regions
-            .map(|r| r.range.start_addr()..r.range.end_addr());
+    /// 次の usable region を探して、(cur_addr, cur_end) を更新する。
+    fn advance_to_next_usable_region(&mut self) {
+        self.has_region = false;
 
-        // 3. 4KiB ごとのフレーム先頭アドレスに分解
-        let frame_addresses = addr_ranges.flat_map(|r| r.step_by(4096));
+        while self.region_index < self.memory_map.len() {
+            let region = &self.memory_map[self.region_index];
+            self.region_index += 1;
 
-        // 4. 物理アドレス → PhysFrame 型に変換
-        frame_addresses.map(|addr| {
-            PhysFrame::containing_address(PhysAddr::new(addr))
-        })
+            if region.region_type != MemoryRegionType::Usable {
+                continue;
+            }
+
+            let start = region.range.start_addr();
+            let end = region.range.end_addr();
+
+            // start を 4KiB に切り上げ、end は [start, end) のまま扱う
+            let cur = Self::align_up_4k(start);
+
+            if cur >= end {
+                continue;
+            }
+
+            self.cur_addr = cur;
+            self.cur_end = end;
+            self.has_region = true;
+            return;
+        }
     }
 
     /// 次の usable フレームを 1 つ返す。
     ///
-    /// - self.next の値だけ usable_frames() をスキップし、そのフレームを返す。
-    /// - 返したら self.next を 1 増やすことで、同じフレームを二度返さない。
+    /// - 1回の呼び出しで O(1) を狙う（region を跨ぐときだけスキャンが走る）
     fn allocate_frame(&mut self) -> Option<PhysFrame> {
-        let mut frames = self.usable_frames();
-        let frame = frames.nth(self.next)?;
-        self.next += 1;
-        Some(frame)
+        loop {
+            if !self.has_region {
+                return None;
+            }
+
+            if self.cur_addr + 4096 <= self.cur_end {
+                let addr = self.cur_addr;
+                self.cur_addr += 4096;
+                return Some(PhysFrame::containing_address(PhysAddr::new(addr)));
+            }
+
+            // region の終端に達したので、次の usable region を探す
+            self.advance_to_next_usable_region();
+        }
     }
 }

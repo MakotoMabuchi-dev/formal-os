@@ -10,10 +10,14 @@ volatile = "0.2.6"
 x86_64 = "0.15"
 bitflags = { version = "2", default-features = false }
 
-# プロファイル設定はワークスペース側に移すのが正道だが、
-# ひとまず残していても動作には影響しない
-[profile.dev]
-panic = "abort"
+[features]
+# デフォルトは「evil を一切入れない」＝通常動作
+default = []
 
-[profile.release]
-panic = "abort"
+# --- 正規 feature（今後この3つだけ使う） ---
+evil_double_map = []
+evil_unmap_not_mapped = []
+evil_ipc = []
+
+# --- 互換 alias（古い呼び名が残ってても壊さない） ---
+evil_mem_double_map = ["evil_double_map"]

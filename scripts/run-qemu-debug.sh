@@ -8,10 +8,21 @@ TARGET_JSON="x86_64-formal-os-local.json"
 TARGET_DIR="target/x86_64-formal-os-local/debug"
 BOOTIMAGE="${TARGET_DIR}/bootimage-kernel.bin"
 
-echo "[*] building kernel bootimage (target = ${TARGET_JSON})..."
-cargo bootimage -p kernel --target "${TARGET_JSON}"
+# 例:
+#   FEATURES="evil_ipc" ./scripts/run-qemu-debug.sh
+#   FEATURES="evil_double_map evil_ipc" ./scripts/run-qemu-debug.sh
+FEATURES="${FEATURES:-}"
 
-if [ ! -f "${BOOTIMAGE}" ]; then
+echo "[*] building kernel bootimage (target = ${TARGET_JSON})..."
+
+if [[ -n "${FEATURES}" ]]; then
+    echo "[*] features: ${FEATURES}"
+    cargo bootimage -p kernel --target "${TARGET_JSON}" --features "${FEATURES}"
+else
+    cargo bootimage -p kernel --target "${TARGET_JSON}"
+fi
+
+if [[ ! -f "${BOOTIMAGE}" ]]; then
     echo "[-] bootimage not found: ${BOOTIMAGE}"
     exit 1
 fi
@@ -29,4 +40,5 @@ echo "[*] logging output to ${LOG_FILE}"
 qemu-system-x86_64 \
   -drive format=raw,file="${BOOTIMAGE}" \
   -m 512M \
-  -serial stdio | tee "${LOG_FILE}"
+  -serial stdio \
+  | tee "${LOG_FILE}"
