@@ -1,16 +1,14 @@
 // kernel/src/kernel/user_program.rs
 //
 // user program（デモ）
-// - Running task が自分の意思で syscall を発行する。
-// - 後でユーザ空間ができたら置き換える想定。
+// - Running task が syscall を発行する。
+// - evil_ipc では「不正ep」を混ぜ、カーネルが安全に拒否/無視できることを観測する。
 
 use super::{
-    KernelState, Syscall,
-    IPC_DEMO_EP0, TASK0_INDEX, TASK1_INDEX, TASK2_INDEX, TaskState,
+    EndpointId, KernelState, Syscall, TaskState, IPC_DEMO_EP0, TASK0_INDEX, TASK1_INDEX, TASK2_INDEX,
 };
 
 impl KernelState {
-    /// Running task が 1 tick に 1 回だけ syscall を発行する（デモ）
     pub(super) fn user_step_issue_syscall(&mut self, task_idx: usize) {
         if task_idx >= self.num_tasks {
             return;
@@ -22,9 +20,19 @@ impl KernelState {
             return;
         }
 
+        // evil_ipc: たまに“不正ep”を投げる（カーネルが安全に拒否/無視できることを確認する）
+        #[cfg(feature = "evil_ipc")]
+        {
+            if task_idx == TASK0_INDEX && (self.tick_count % 13 == 0) {
+                self.tasks[task_idx].pending_syscall =
+                    Some(Syscall::IpcReply { ep: EndpointId(999) });
+                crate::logging::info("evil_ipc: issued IpcReply to invalid ep (expect safe reject)");
+                return;
+            }
+        }
+
         let ep = IPC_DEMO_EP0;
 
-        // Receiver (Task3)
         if task_idx == TASK2_INDEX {
             if self.demo_msgs_delivered < 2 {
                 self.tasks[task_idx].pending_syscall = Some(Syscall::IpcRecv { ep });
@@ -35,7 +43,6 @@ impl KernelState {
                 return;
             }
 
-            // 周回終了 → 状態リセット
             self.demo_msgs_delivered = 0;
             self.demo_replies_sent = 0;
             self.demo_sent_by_task2 = false;
@@ -46,7 +53,6 @@ impl KernelState {
             return;
         }
 
-        // Sender A (Task2)
         if task_idx == TASK1_INDEX {
             if !self.demo_sent_by_task2 {
                 let e = &self.endpoints[ep.0];
@@ -62,7 +68,6 @@ impl KernelState {
             return;
         }
 
-        // Sender B (Task1)
         if task_idx == TASK0_INDEX {
             if !self.demo_sent_by_task1 {
                 let e = &self.endpoints[ep.0];

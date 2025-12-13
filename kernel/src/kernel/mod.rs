@@ -329,10 +329,6 @@ impl KernelState {
         }
     }
 
-    // （以下、ファイルはあなたの現行のまま。省略せず全文を残すため、
-    //  ここから下は “変更なし” の現在版をそのまま貼っています）
-    // ---- ここから下は変更なし ----
-
     fn debug_check_invariants(&self) {
         {
             let kernel_as = &self.address_spaces[KERNEL_ASID_INDEX];
@@ -735,8 +731,15 @@ impl KernelState {
             return;
         }
 
+        #[cfg(feature = "evil_unmap_not_mapped")]
+        {
+            self.do_mem_demo_evil_unmap_not_mapped();
+            return;
+        }
+
         self.do_mem_demo_normal();
     }
+
 
     fn do_mem_demo_normal(&mut self) {
         let task_idx = self.current_task;
@@ -772,21 +775,28 @@ impl KernelState {
         let as_idx = task.address_space_id.0;
         let aspace = &mut self.address_spaces[as_idx];
 
-        // 1) 論理側（失敗は fail-stop）
-        if let Err(e) = aspace.apply(mem_action) {
-            logging::error("address_space.apply: FAILED (inconsistent state)");
-            match e {
-                AddressSpaceError::AlreadyMapped => logging::info("reason = AlreadyMapped"),
-                AddressSpaceError::NotMapped => logging::info("reason = NotMapped"),
-                AddressSpaceError::CapacityExceeded => logging::info("reason = CapacityExceeded"),
+        // まず論理側（失敗は fail-stop）
+        match aspace.apply(mem_action) {
+            Ok(()) => {
+                logging::info("address_space.apply: OK");
             }
-            panic!("address_space.apply failed; abort to keep state consistent");
+            Err(e) => {
+                logging::error("address_space.apply: ERROR");
+                match e {
+                    AddressSpaceError::AlreadyMapped => logging::info("reason = AlreadyMapped"),
+                    AddressSpaceError::NotMapped => logging::info("reason = NotMapped"),
+                    AddressSpaceError::CapacityExceeded => logging::info("reason = CapacityExceeded"),
+                }
+                panic!("address_space.apply failed; abort (fail-stop)");
+            }
         }
 
-        // 2) 実機側（失敗は fail-stop）
-        let arch_result = if task_idx == TASK0_INDEX {
+        // 次に arch 側（unsafe は arch に閉じ込める）
+        if task_idx == TASK0_INDEX {
             logging::info("mem_demo: applying arch paging (Task0 / current CR3)");
-            unsafe { arch::paging::apply_mem_action(mem_action, &mut self.phys_mem) }
+            unsafe {
+                arch::paging::apply_mem_action(mem_action, &mut self.phys_mem);
+            }
         } else {
             let root = match aspace.root_page_frame {
                 Some(r) => r,
@@ -797,23 +807,16 @@ impl KernelState {
             };
 
             logging::info("mem_demo: applying arch paging (User root / no CR3 switch)");
-            unsafe { arch::paging::apply_mem_action_in_root(mem_action, root, &mut self.phys_mem) }
-        };
+            unsafe {
+                arch::paging::apply_mem_action_in_root(mem_action, root, &mut self.phys_mem);
+            }
 
-        if arch_result.is_err() {
-            logging::error("mem_demo: arch paging apply FAILED; abort (fail-stop)");
-            panic!("arch paging apply failed; abort to keep state consistent");
-        }
-
-        // 3) 成功後にのみ状態を進める
-        self.mem_demo_mapped[task_idx] = !self.mem_demo_mapped[task_idx];
-
-        // user の場合は translate を追加で観測
-        if task_idx != TASK0_INDEX {
-            let root = aspace.root_page_frame.expect("root_page_frame must exist");
             let virt_addr_u64 = arch::paging::USER_SPACE_BASE + page.start_address().0;
             arch::paging::debug_translate_in_root(root, virt_addr_u64);
         }
+
+        // 成功扱いになった後でのみ状態を進める
+        self.mem_demo_mapped[task_idx] = !self.mem_demo_mapped[task_idx];
 
         self.push_event(LogEvent::MemActionApplied {
             task: task_id,
@@ -836,25 +839,22 @@ impl KernelState {
         };
 
         // Unmap を封じて、毎回 Map を出す（2回目で AlreadyMapped を引く）
-        let mem_action = {
-            logging::info("mem_demo: issuing Map (evil double-map test)");
+        logging::info("mem_demo: issuing Map (evil double-map test)");
 
-            let frame = match self.get_or_alloc_demo_frame(task_idx) {
-                Some(f) => f,
-                None => {
-                    logging::error("mem_demo: no more usable frames");
-                    self.should_halt = true;
-                    return;
-                }
-            };
-
-            MemAction::Map { page, frame, flags }
+        let frame = match self.get_or_alloc_demo_frame(task_idx) {
+            Some(f) => f,
+            None => {
+                logging::error("mem_demo: no more usable frames");
+                self.should_halt = true;
+                return;
+            }
         };
+
+        let mem_action = MemAction::Map { page, frame, flags };
 
         let as_idx = task.address_space_id.0;
         let aspace = &mut self.address_spaces[as_idx];
 
-        // ここで2回目は AlreadyMapped になり、panic で止まるのが正しい
         match aspace.apply(mem_action) {
             Ok(()) => {
                 logging::info("address_space.apply: OK");
@@ -870,19 +870,55 @@ impl KernelState {
             }
         }
 
-        // ※ここまで来るのは 1回目だけ。2回目は上で panic するはず。
+        // 1回目だけここまで来る（2回目は上で panic する）
         if task_idx == TASK0_INDEX {
             logging::info("mem_demo: applying arch paging (Task0 / current CR3)");
-            let r = unsafe { arch::paging::apply_mem_action(mem_action, &mut self.phys_mem) };
-            if r.is_err() {
-                panic!("arch paging apply failed in evil test");
+            unsafe {
+                arch::paging::apply_mem_action(mem_action, &mut self.phys_mem);
             }
         } else {
             let root = aspace.root_page_frame.expect("user root_page_frame must exist");
             logging::info("mem_demo: applying arch paging (User root / no CR3 switch)");
-            let r = unsafe { arch::paging::apply_mem_action_in_root(mem_action, root, &mut self.phys_mem) };
-            if r.is_err() {
-                panic!("arch paging apply failed in evil test");
+            unsafe {
+                arch::paging::apply_mem_action_in_root(mem_action, root, &mut self.phys_mem);
+            }
+        }
+
+        let _ = task;
+    }
+
+    #[cfg(feature = "evil_unmap_not_mapped")]
+    fn do_mem_demo_evil_unmap_not_mapped(&mut self) {
+        let task_idx = self.current_task;
+        let task = self.tasks[task_idx];
+        let task_id = task.id;
+
+        let page = self.demo_page_for_task(task_idx);
+        let as_idx = task.address_space_id.0;
+        let aspace = &mut self.address_spaces[as_idx];
+
+        logging::info("mem_demo: issuing Unmap (evil unmap-not-mapped test)");
+
+        let mem_action = MemAction::Unmap { page };
+
+        // 1) 論理層で必ず NotMapped になるはず
+        match aspace.apply(mem_action) {
+            Ok(()) => {
+                logging::error("UNEXPECTED: Unmap succeeded on non-mapped page");
+                panic!("evil_unmap_not_mapped violated invariant");
+            }
+            Err(AddressSpaceError::NotMapped) => {
+                logging::info("address_space.apply: NotMapped (expected)");
+                panic!("evil_unmap_not_mapped: correct fail-stop");
+            }
+            Err(e) => {
+                logging::error("address_space.apply: unexpected error");
+                match e {
+                    AddressSpaceError::AlreadyMapped => logging::info("reason = AlreadyMapped"),
+                    AddressSpaceError::CapacityExceeded => logging::info("reason = CapacityExceeded"),
+                    _ => {}
+                }
+                panic!("evil_unmap_not_mapped: unexpected error");
             }
         }
     }

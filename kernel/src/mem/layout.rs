@@ -1,5 +1,6 @@
 // kernel/src/mem/layout.rs
-//
+#![allow(dead_code)]
+
 // formal-os: x86_64 仮想アドレスレイアウト（仕様レベル）
 //
 // 目的:
