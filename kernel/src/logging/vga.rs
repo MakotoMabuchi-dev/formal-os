@@ -1,3 +1,13 @@
+// src/logging/vga.rs
+//
+// VGA テキストモード(0xb8000)への最小限出力。
+// - init(): Writer を初期化
+// - write_line(): 文字列＋改行
+//
+// 目的:
+// - まずは「画面に出る」ことを最優先にした簡易実装。
+// - 高級なフォーマットや色付けは後回し。
+
 use core::fmt::{self, Write};
 use spin::Mutex;
 use volatile::Volatile;
@@ -92,7 +102,6 @@ pub fn init() {
 }
 
 pub fn write_line(s: &str) {
-    use core::fmt::Write as _;
     if let Some(ref mut w) = *WRITER.lock() {
         let _ = w.write_str(s);
         let _ = w.write_str("\n");

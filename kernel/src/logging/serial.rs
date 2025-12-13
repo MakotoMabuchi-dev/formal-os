@@ -8,8 +8,8 @@
 // QEMU 起動時に `-serial stdio` を指定しておくと、
 // この出力がホスト側の標準出力（→ tee でログファイル）に流れる。
 
-use x86_64::instructions::port::Port;
 use core::fmt;
+use x86_64::instructions::port::Port;
 
 static mut SERIAL_INITIALIZED: bool = false;
 
@@ -32,7 +32,7 @@ pub fn init() {
 
         // DLAB 有効化
         port_line_ctrl.write(0x80);
-        // ボーレート 115200 の分周値（ 115200 / 115200 = 1 → LSB=1, MSB=0 ）
+        // ボーレート 115200 の分周値（115200 / 115200 = 1 → LSB=1, MSB=0）
         port_div_low.write(0x01);
         port_div_high.write(0x00);
 
@@ -72,7 +72,7 @@ pub fn write_line(s: &str) {
     write_str("\r\n");
 }
 
-// fmt::Write を実装しておくと、将来 format! 系にも使える
+/// fmt::Write を実装しておくと、将来 format! 系にも使える
 pub struct SerialWriter;
 
 impl fmt::Write for SerialWriter {
