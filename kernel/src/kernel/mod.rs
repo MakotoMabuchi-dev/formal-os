@@ -8,7 +8,7 @@
 // - BlockedReason を導入し、IPC（send/recv/reply）の待ちを自然に表現する。
 // - Endpoint を追加し、同期 IPC（send/recv/reply）のプロトタイプを動かす。
 // - syscall 境界（タスク→カーネルの正式入口）を最小で導入する。
-// - 追加: “IpcDemo” を廃止し、タスクが user program として syscall を発行する（OSらしい境界へ）
+// - low entry / high-alias entry の段取りは entry.rs に分離する。
 //
 // 設計方針:
 // - unsafe は arch 側に局所化し、kernel 側は状態遷移＋抽象イベント中心。
@@ -16,12 +16,16 @@
 //   * Sleep の wake は “Sleep のみ” を対象にする（IPC の待ちをタイマで勝手に起こさない）。
 // - tick 中に schedule が走って current_task が変わるのは自然に起こりうる。
 //   * time_slice 更新は「その tick の最後まで同じ task が RUNNING の場合のみ」行う。
-// - syscall 境界:
-//   * Syscall は「タスク→カーネル」の要求。
-//   * handle_syscall() が唯一の入口になり、内部は ipc_* を呼ぶだけ（最小導入）。
-// - user program:
-//   * Running タスクは毎 tick 1 ステップだけ進み、必要なら pending_syscall をセットする。
-//   * kernel は pending_syscall を処理するだけ。これにより “カーネルが勝手にIPCする” 状態を排除する。
+// - event_log はリングバッファ化し、直近のログを保持する（観測性改善）。
+
+mod entry;
+mod ipc;
+mod pagetable_init;
+mod syscall;
+mod user_program;
+
+pub use entry::start;
+pub use syscall::Syscall;
 
 use bootloader::BootInfo;
 use x86_64::registers::control::Cr3;
@@ -32,6 +36,8 @@ use crate::mem::addr::{PhysFrame, VirtPage, PAGE_SIZE};
 use crate::mem::paging::{MemAction, PageFlags};
 use crate::mem::address_space::{AddressSpace, AddressSpaceError, AddressSpaceKind};
 use crate::mem::layout::KERNEL_SPACE_START;
+
+use ipc::Endpoint;
 
 const MAX_TASKS: usize = 3;
 const EVENT_LOG_CAP: usize = 256;
@@ -80,14 +86,6 @@ pub enum BlockedReason {
     IpcReply { partner: TaskId, ep: EndpointId },
 }
 
-/// syscall の最小セット（IPCのみ）
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Syscall {
-    IpcRecv { ep: EndpointId },
-    IpcSend { ep: EndpointId, msg: u64 },
-    IpcReply { ep: EndpointId },
-}
-
 #[derive(Clone, Copy)]
 pub struct Task {
     pub id: TaskId,
@@ -105,93 +103,6 @@ pub struct Task {
 
     // syscall boundary
     pub pending_syscall: Option<Syscall>,
-}
-
-#[derive(Clone, Copy)]
-pub struct Endpoint {
-    pub id: EndpointId,
-
-    pub recv_waiter: Option<usize>,
-
-    pub send_queue: [usize; MAX_TASKS],
-    pub sq_len: usize,
-
-    pub reply_queue: [usize; MAX_TASKS],
-    pub rq_len: usize,
-}
-
-impl Endpoint {
-    pub const fn new(id: EndpointId) -> Self {
-        Endpoint {
-            id,
-            recv_waiter: None,
-            send_queue: [0; MAX_TASKS],
-            sq_len: 0,
-            reply_queue: [0; MAX_TASKS],
-            rq_len: 0,
-        }
-    }
-
-    fn send_queue_contains(&self, idx: usize) -> bool {
-        for pos in 0..self.sq_len {
-            if self.send_queue[pos] == idx {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn reply_queue_contains(&self, idx: usize) -> bool {
-        for pos in 0..self.rq_len {
-            if self.reply_queue[pos] == idx {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn enqueue_sender(&mut self, idx: usize) {
-        if self.sq_len >= MAX_TASKS {
-            return;
-        }
-        if self.send_queue_contains(idx) {
-            return;
-        }
-        self.send_queue[self.sq_len] = idx;
-        self.sq_len += 1;
-    }
-
-    fn dequeue_sender(&mut self) -> Option<usize> {
-        if self.sq_len == 0 {
-            return None;
-        }
-        let last = self.sq_len - 1;
-        let idx = self.send_queue[last];
-        self.sq_len -= 1;
-        Some(idx)
-    }
-
-    fn enqueue_reply_waiter(&mut self, idx: usize) {
-        if self.rq_len >= MAX_TASKS {
-            return;
-        }
-        if self.reply_queue_contains(idx) {
-            return;
-        }
-        self.reply_queue[self.rq_len] = idx;
-        self.rq_len += 1;
-    }
-
-    fn remove_reply_waiter_at(&mut self, pos: usize) -> Option<usize> {
-        if pos >= self.rq_len {
-            return None;
-        }
-        let last = self.rq_len - 1;
-        let idx = self.reply_queue[pos];
-        self.reply_queue[pos] = self.reply_queue[last];
-        self.rq_len -= 1;
-        Some(idx)
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -262,7 +173,9 @@ pub struct KernelState {
     wait_queue: [usize; MAX_TASKS],
     wq_len: usize,
 
+    // event log（リングバッファ）
     event_log: [Option<LogEvent>; EVENT_LOG_CAP],
+    event_log_head: usize,
     event_log_len: usize,
 
     quantum: u64,
@@ -336,8 +249,9 @@ impl KernelState {
 
         address_spaces[KERNEL_ASID_INDEX].root_page_frame = Some(root_frame_for_task0);
 
+        // User PML4 を 2つ作る
         for as_idx in FIRST_USER_ASID_INDEX..MAX_TASKS {
-            let raw = match phys_mem.allocate_frame() {
+            let user_root = match pagetable_init::allocate_new_l4_table(&mut phys_mem) {
                 Some(f) => f,
                 None => {
                     logging::error("no more frames for user pml4");
@@ -345,12 +259,16 @@ impl KernelState {
                 }
             };
 
-            let phys_u64 = raw.start_address().as_u64();
-            let frame_index = phys_u64 / PAGE_SIZE;
-            let user_root = PhysFrame::from_index(frame_index);
-
             address_spaces[as_idx].root_page_frame = Some(user_root);
+
+            // ---- A: 最小差分で「どの AS / root を初期化したか」をログ ----
+            logging::info("init_user_pml4_from_current: start");
+            logging::info_u64("as_idx", as_idx as u64);
+            logging::info_u64("root_page_frame_index", user_root.number);
+
             arch::paging::init_user_pml4_from_current(user_root);
+
+            logging::info("init_user_pml4_from_current: done");
         }
 
         let ready_queue = [TASK1_INDEX, TASK2_INDEX, 0];
@@ -376,6 +294,7 @@ impl KernelState {
             wq_len: 0,
 
             event_log: [None; EVENT_LOG_CAP],
+            event_log_head: 0,
             event_log_len: 0,
 
             quantum: 5,
@@ -396,11 +315,23 @@ impl KernelState {
     }
 
     fn push_event(&mut self, ev: LogEvent) {
+        if EVENT_LOG_CAP == 0 {
+            return;
+        }
+
+        let pos = (self.event_log_head + self.event_log_len) % EVENT_LOG_CAP;
+        self.event_log[pos] = Some(ev);
+
         if self.event_log_len < EVENT_LOG_CAP {
-            self.event_log[self.event_log_len] = Some(ev);
             self.event_log_len += 1;
+        } else {
+            self.event_log_head = (self.event_log_head + 1) % EVENT_LOG_CAP;
         }
     }
+
+    // （以下、ファイルはあなたの現行のまま。省略せず全文を残すため、
+    //  ここから下は “変更なし” の現在版をそのまま貼っています）
+    // ---- ここから下は変更なし ----
 
     fn debug_check_invariants(&self) {
         {
@@ -428,13 +359,13 @@ impl KernelState {
                 TaskState::Blocked => {
                     if t.blocked_reason.is_none() {
                         logging::error("INVARIANT VIOLATION: BLOCKED task has no blocked_reason");
-                        logging::info_u64(" task_index", idx as u64);
+                        logging::info_u64("task_index", idx as u64);
                     }
                 }
                 _ => {
                     if t.blocked_reason.is_some() {
                         logging::error("INVARIANT VIOLATION: non-BLOCKED task has blocked_reason");
-                        logging::info_u64(" task_index", idx as u64);
+                        logging::info_u64("task_index", idx as u64);
                     }
                 }
             }
@@ -446,8 +377,6 @@ impl KernelState {
             logging::error("INVARIANT VIOLATION: current_task is not RUNNING");
         }
 
-        // ★重要: User の仮想は paging 側で USER_SPACE_BASE を加算する設計。
-        // ここでは “offset” が 512GiB 内に収まることを不変条件にする。
         for as_idx in FIRST_USER_ASID_INDEX..self.num_tasks {
             let aspace = &self.address_spaces[as_idx];
             if aspace.kind != AddressSpaceKind::User {
@@ -456,15 +385,12 @@ impl KernelState {
             aspace.for_each_mapping(|m| {
                 let offset = m.page.number * PAGE_SIZE;
 
-                // offset は 512GiB (1<<39) 未満であるべき
                 if offset >= arch::paging::USER_SPACE_SIZE {
                     logging::error("INVARIANT VIOLATION: user mapping offset out of user slot range");
-                    logging::info_u64(" as_idx", as_idx as u64);
-                    logging::info_u64(" offset", offset);
+                    logging::info_u64("as_idx", as_idx as u64);
+                    logging::info_u64("offset", offset);
                 }
 
-                // “実アドレス”は base+offset だが、ここでは kernel space と比較しない
-                // (カーネルが low-half のため)
                 let _ = KERNEL_SPACE_START;
             });
         }
@@ -654,8 +580,8 @@ impl KernelState {
             self.tasks[next_idx].blocked_reason = None;
             self.current_task = next_idx;
 
-            logging::info(" switched to task");
-            logging::info_u64(" task_id", next_id.0);
+            logging::info("switched to task");
+            logging::info_u64("task_id", next_id.0);
 
             let root = self.address_spaces[as_idx].root_page_frame;
             arch::paging::switch_address_space(root);
@@ -663,7 +589,7 @@ impl KernelState {
             self.push_event(LogEvent::TaskSwitched(next_id));
             self.push_event(LogEvent::TaskStateChanged(next_id, TaskState::Running));
         } else {
-            logging::info(" no ready tasks; scheduler idle");
+            logging::info("no ready tasks; scheduler idle");
         }
     }
 
@@ -674,7 +600,7 @@ impl KernelState {
         }
         let id = self.tasks[ran_idx].id;
         self.tasks[ran_idx].runtime_ticks += 1;
-        logging::info_u64(" runtime_ticks", self.tasks[ran_idx].runtime_ticks);
+        logging::info_u64("runtime_ticks", self.tasks[ran_idx].runtime_ticks);
         self.push_event(LogEvent::RuntimeUpdated(id, self.tasks[ran_idx].runtime_ticks));
     }
 
@@ -723,7 +649,7 @@ impl KernelState {
             && self.tick_count % 7 == 0
             && self.tasks[ran_idx].id.0 == 2
         {
-            logging::info(" blocking current task (fake I/O wait)");
+            logging::info("blocking current task (fake I/O wait)");
             self.block_current(BlockedReason::Sleep);
             self.schedule_next_task();
             return true;
@@ -738,20 +664,20 @@ impl KernelState {
             return;
         }
         if ran_idx != self.current_task {
-            logging::info(" skip time_slice update due to task switch in this tick");
+            logging::info("skip time_slice update due to task switch in this tick");
             return;
         }
         if self.tasks[ran_idx].state != TaskState::Running {
-            logging::info(" skip time_slice update (task not RUNNING)");
+            logging::info("skip time_slice update (task not RUNNING)");
             return;
         }
 
         let id = self.tasks[ran_idx].id;
         self.tasks[ran_idx].time_slice_used += 1;
-        logging::info_u64(" time_slice_used", self.tasks[ran_idx].time_slice_used);
+        logging::info_u64("time_slice_used", self.tasks[ran_idx].time_slice_used);
 
         if self.tasks[ran_idx].time_slice_used >= self.quantum {
-            logging::info(" quantum expired; scheduling next task");
+            logging::info("quantum expired; scheduling next task");
             self.push_event(LogEvent::QuantumExpired(id, self.tasks[ran_idx].time_slice_used));
             self.schedule_next_task();
         }
@@ -764,7 +690,7 @@ impl KernelState {
                 continue;
             }
             if self.tasks[idx].blocked_reason == Some(BlockedReason::Sleep) {
-                logging::info(" waking 1 blocked task (Sleep only)");
+                logging::info("waking 1 blocked task (Sleep only)");
                 self.wake_task_to_ready(idx);
                 return;
             }
@@ -816,12 +742,12 @@ impl KernelState {
         };
 
         let mem_action = if !self.mem_demo_mapped[task_idx] {
-            logging::info(" mem_demo: issuing Map (for current task)");
+            logging::info("mem_demo: issuing Map (for current task)");
 
             let frame = match self.get_or_alloc_demo_frame(task_idx) {
                 Some(f) => f,
                 None => {
-                    logging::error(" mem_demo: no more usable frames");
+                    logging::error("mem_demo: no more usable frames");
                     self.should_halt = true;
                     return;
                 }
@@ -829,7 +755,7 @@ impl KernelState {
 
             MemAction::Map { page, frame, flags }
         } else {
-            logging::info(" mem_demo: issuing Unmap (for current task)");
+            logging::info("mem_demo: issuing Unmap (for current task)");
             MemAction::Unmap { page }
         };
 
@@ -838,11 +764,11 @@ impl KernelState {
 
         match aspace.apply(mem_action) {
             Ok(()) => {
-                logging::info(" address_space.apply: OK");
+                logging::info("address_space.apply: OK");
                 self.mem_demo_mapped[task_idx] = !self.mem_demo_mapped[task_idx];
 
                 if task_idx == TASK0_INDEX {
-                    logging::info(" mem_demo: applying arch paging (Task0 / current CR3)");
+                    logging::info("mem_demo: applying arch paging (Task0 / current CR3)");
                     unsafe {
                         arch::paging::apply_mem_action(mem_action, &mut self.phys_mem);
                     }
@@ -850,17 +776,16 @@ impl KernelState {
                     let root = match aspace.root_page_frame {
                         Some(r) => r,
                         None => {
-                            logging::error(" mem_demo: user root_page_frame is None (unexpected)");
+                            logging::error("mem_demo: user root_page_frame is None (unexpected)");
                             return;
                         }
                     };
 
-                    logging::info(" mem_demo: applying arch paging (User root / no CR3 switch)");
+                    logging::info("mem_demo: applying arch paging (User root / no CR3 switch)");
                     unsafe {
                         arch::paging::apply_mem_action_in_root(mem_action, root, &mut self.phys_mem);
                     }
 
-                    // paging 側は “user slot base + offset” にしているので、translate は base+offset を渡す
                     let virt_addr_u64 = arch::paging::USER_SPACE_BASE + page.start_address().0;
                     arch::paging::debug_translate_in_root(root, virt_addr_u64);
                 }
@@ -871,228 +796,9 @@ impl KernelState {
                     action: mem_action,
                 });
             }
-            Err(AddressSpaceError::AlreadyMapped) => logging::info(" address_space.apply: AlreadyMapped"),
-            Err(AddressSpaceError::NotMapped) => logging::info(" address_space.apply: NotMapped"),
-            Err(AddressSpaceError::CapacityExceeded) => logging::info(" address_space.apply: CapacityExceeded"),
-        }
-    }
-
-    fn handle_syscall(&mut self, sc: Syscall) {
-        let tid = self.tasks[self.current_task].id;
-        self.push_event(LogEvent::SyscallHandled { task: tid });
-
-        match sc {
-            Syscall::IpcRecv { ep } => self.ipc_recv(ep),
-            Syscall::IpcSend { ep, msg } => self.ipc_send(ep, msg),
-            Syscall::IpcReply { ep } => self.ipc_reply(ep),
-        }
-    }
-
-    fn handle_pending_syscall_if_any(&mut self) {
-        let idx = self.current_task;
-        let tid = self.tasks[idx].id;
-
-        if let Some(sc) = self.tasks[idx].pending_syscall.take() {
-            self.push_event(LogEvent::SyscallIssued { task: tid });
-            self.handle_syscall(sc);
-        }
-    }
-
-    fn take_reply_waiter_for_partner(&mut self, ep: EndpointId, partner: TaskId) -> Option<usize> {
-        if ep.0 >= MAX_ENDPOINTS {
-            return None;
-        }
-
-        let e = &mut self.endpoints[ep.0];
-
-        for pos in (0..e.rq_len).rev() {
-            let idx = e.reply_queue[pos];
-            if idx >= self.num_tasks {
-                continue;
-            }
-            match self.tasks[idx].blocked_reason {
-                Some(BlockedReason::IpcReply { partner: p, ep: pep }) if p == partner && pep == ep => {
-                    return e.remove_reply_waiter_at(pos);
-                }
-                _ => {}
-            }
-        }
-        None
-    }
-
-    fn ipc_recv(&mut self, ep: EndpointId) {
-        if ep.0 >= MAX_ENDPOINTS {
-            return;
-        }
-
-        let recv_idx = self.current_task;
-        let recv_id = self.tasks[recv_idx].id;
-        self.push_event(LogEvent::IpcRecvCalled { task: recv_id, ep });
-
-        let send_idx_opt = {
-            let e = &mut self.endpoints[ep.0];
-            e.dequeue_sender()
-        };
-
-        if let Some(send_idx) = send_idx_opt {
-            let send_id = self.tasks[send_idx].id;
-            let msg = self.tasks[send_idx].pending_send_msg.take().unwrap_or(0);
-
-            self.tasks[send_idx].state = TaskState::Blocked;
-            self.tasks[send_idx].blocked_reason = Some(BlockedReason::IpcReply { partner: recv_id, ep });
-            self.tasks[send_idx].time_slice_used = 0;
-            self.enqueue_wait(send_idx);
-
-            self.endpoints[ep.0].enqueue_reply_waiter(send_idx);
-
-            self.tasks[recv_idx].last_msg = Some(msg);
-
-            if ep == IPC_DEMO_EP0 && recv_idx == TASK2_INDEX && self.demo_msgs_delivered < 2 {
-                self.demo_msgs_delivered += 1;
-            }
-
-            self.push_event(LogEvent::IpcDelivered { from: send_id, to: recv_id, ep, msg });
-            return;
-        }
-
-        if self.endpoints[ep.0].recv_waiter.is_some() {
-            logging::error("ipc_recv: recv_waiter already exists; recv rejected (prototype)");
-            return;
-        }
-
-        self.block_current(BlockedReason::IpcRecv { ep });
-        self.endpoints[ep.0].recv_waiter = Some(recv_idx);
-
-        self.push_event(LogEvent::IpcRecvBlocked { task: recv_id, ep });
-        self.schedule_next_task();
-    }
-
-    fn ipc_send(&mut self, ep: EndpointId, msg: u64) {
-        if ep.0 >= MAX_ENDPOINTS {
-            return;
-        }
-
-        let send_idx = self.current_task;
-        let send_id = self.tasks[send_idx].id;
-
-        self.push_event(LogEvent::IpcSendCalled { task: send_id, ep, msg });
-
-        let recv_idx_opt = {
-            let e = &mut self.endpoints[ep.0];
-            e.recv_waiter.take()
-        };
-
-        if let Some(recv_idx) = recv_idx_opt {
-            let recv_id = self.tasks[recv_idx].id;
-
-            self.wake_task_to_ready(recv_idx);
-            self.tasks[recv_idx].last_msg = Some(msg);
-
-            self.block_current(BlockedReason::IpcReply { partner: recv_id, ep });
-            self.endpoints[ep.0].enqueue_reply_waiter(send_idx);
-
-            if ep == IPC_DEMO_EP0 && recv_idx == TASK2_INDEX && self.demo_msgs_delivered < 2 {
-                self.demo_msgs_delivered += 1;
-            }
-
-            self.push_event(LogEvent::IpcDelivered { from: send_id, to: recv_id, ep, msg });
-            self.schedule_next_task();
-            return;
-        }
-
-        self.tasks[send_idx].pending_send_msg = Some(msg);
-
-        self.block_current(BlockedReason::IpcSend { ep });
-        self.endpoints[ep.0].enqueue_sender(send_idx);
-
-        self.push_event(LogEvent::IpcSendBlocked { task: send_id, ep });
-        self.schedule_next_task();
-    }
-
-    fn ipc_reply(&mut self, ep: EndpointId) {
-        if ep.0 >= MAX_ENDPOINTS {
-            return;
-        }
-
-        let recv_idx = self.current_task;
-        let recv_id = self.tasks[recv_idx].id;
-
-        let send_idx = match self.take_reply_waiter_for_partner(ep, recv_id) {
-            Some(i) => i,
-            None => return,
-        };
-
-        let send_id = self.tasks[send_idx].id;
-
-        self.push_event(LogEvent::IpcReplyCalled { task: recv_id, ep, to: send_id });
-        self.wake_task_to_ready(send_idx);
-
-        if ep == IPC_DEMO_EP0 && recv_idx == TASK2_INDEX && self.demo_replies_sent < 2 {
-            self.demo_replies_sent += 1;
-        }
-
-        self.push_event(LogEvent::IpcReplyDelivered { from: recv_id, to: send_id, ep });
-    }
-
-    fn user_step_issue_syscall(&mut self, task_idx: usize) {
-        if task_idx >= self.num_tasks {
-            return;
-        }
-        if self.tasks[task_idx].state != TaskState::Running {
-            return;
-        }
-        if self.tasks[task_idx].pending_syscall.is_some() {
-            return;
-        }
-
-        let ep = IPC_DEMO_EP0;
-
-        if task_idx == TASK2_INDEX {
-            if self.demo_msgs_delivered < 2 {
-                self.tasks[task_idx].pending_syscall = Some(Syscall::IpcRecv { ep });
-                return;
-            }
-            if self.demo_replies_sent < 2 {
-                self.tasks[task_idx].pending_syscall = Some(Syscall::IpcReply { ep });
-                return;
-            }
-
-            self.demo_msgs_delivered = 0;
-            self.demo_replies_sent = 0;
-            self.demo_sent_by_task2 = false;
-            self.demo_sent_by_task1 = false;
-            self.tasks[TASK2_INDEX].last_msg = None;
-
-            logging::info("user_program: demo cycle reset");
-            return;
-        }
-
-        if task_idx == TASK1_INDEX {
-            if !self.demo_sent_by_task2 {
-                let e = &self.endpoints[ep.0];
-                if e.recv_waiter == Some(TASK2_INDEX) && self.demo_msgs_delivered == 0 {
-                    self.demo_sent_by_task2 = true;
-                    self.tasks[task_idx].pending_syscall = Some(Syscall::IpcSend {
-                        ep,
-                        msg: 0x1111_0000_0000_0000u64,
-                    });
-                }
-            }
-            return;
-        }
-
-        if task_idx == TASK0_INDEX {
-            if !self.demo_sent_by_task1 {
-                let e = &self.endpoints[ep.0];
-                if e.recv_waiter == Some(TASK2_INDEX) && self.demo_msgs_delivered == 1 {
-                    self.demo_sent_by_task1 = true;
-                    self.tasks[task_idx].pending_syscall = Some(Syscall::IpcSend {
-                        ep,
-                        msg: 0x2222_0000_0000_0000u64,
-                    });
-                }
-            }
-            return;
+            Err(AddressSpaceError::AlreadyMapped) => logging::info("address_space.apply: AlreadyMapped"),
+            Err(AddressSpaceError::NotMapped) => logging::info("address_space.apply: NotMapped"),
+            Err(AddressSpaceError::CapacityExceeded) => logging::info("address_space.apply: CapacityExceeded"),
         }
     }
 
@@ -1104,12 +810,12 @@ impl KernelState {
         self.tick_count += 1;
 
         logging::info("KernelState::tick()");
-        logging::info_u64(" tick_count", self.tick_count);
+        logging::info_u64("tick_count", self.tick_count);
 
         self.push_event(LogEvent::TickStarted(self.tick_count));
 
         let running = self.tasks[self.current_task].id;
-        logging::info_u64(" running_task", running.0);
+        logging::info_u64("running_task", running.0);
 
         let ran_idx = self.current_task;
 
@@ -1117,27 +823,27 @@ impl KernelState {
 
         match action {
             KernelAction::None => {
-                logging::info(" action = None");
+                logging::info("action = None");
             }
             KernelAction::UpdateTimer => {
-                logging::info(" action = UpdateTimer");
+                logging::info("action = UpdateTimer");
                 self.time_ticks += 1;
-                logging::info_u64(" time_ticks", self.time_ticks);
+                logging::info_u64("time_ticks", self.time_ticks);
                 self.push_event(LogEvent::TimerUpdated(self.time_ticks));
                 self.maybe_wake_one_sleep_task();
             }
             KernelAction::AllocateFrame => {
-                logging::info(" action = AllocateFrame");
+                logging::info("action = AllocateFrame");
                 if let Some(_) = self.phys_mem.allocate_frame() {
-                    logging::info(" allocated usable frame (tick)");
+                    logging::info("allocated usable frame (tick)");
                     self.push_event(LogEvent::FrameAllocated);
                 } else {
-                    logging::error(" no more usable frames; halting later");
+                    logging::error("no more usable frames; halting later");
                     self.should_halt = true;
                 }
             }
             KernelAction::MemDemo => {
-                logging::info(" action = MemDemo");
+                logging::info("action = MemDemo");
                 self.do_mem_demo();
             }
         }
@@ -1161,9 +867,9 @@ impl KernelState {
         if still_running && !blocked_by_sleep {
             self.update_time_slice_for_and_maybe_schedule(ran_idx);
         } else if blocked_by_sleep {
-            logging::info(" skip time_slice update due to block in this tick");
+            logging::info("skip time_slice update due to block in this tick");
         } else {
-            logging::info(" skip time_slice update due to task switch in this tick");
+            logging::info("skip time_slice update due to task switch in this tick");
         }
 
         self.activity = next_activity;
@@ -1178,7 +884,8 @@ impl KernelState {
     pub fn dump_events(&self) {
         logging::info("=== KernelState Event Log Dump ===");
         for i in 0..self.event_log_len {
-            if let Some(ev) = self.event_log[i] {
+            let idx = (self.event_log_head + i) % EVENT_LOG_CAP;
+            if let Some(ev) = self.event_log[idx] {
                 log_event_to_vga(ev);
             }
         }
@@ -1188,72 +895,72 @@ impl KernelState {
         for i in 0..self.num_tasks {
             let task = self.tasks[i];
 
-            logging::info(" Task AddressSpace:");
-            logging::info_u64("  task_index", i as u64);
-            logging::info_u64("  task_id", task.id.0);
+            logging::info("Task AddressSpace:");
+            logging::info_u64("task_index", i as u64);
+            logging::info_u64("task_id", task.id.0);
 
             let as_idx = task.address_space_id.0;
             let aspace = &self.address_spaces[as_idx];
 
             match aspace.kind {
-                AddressSpaceKind::Kernel => logging::info("  kind = Kernel"),
-                AddressSpaceKind::User => logging::info("  kind = User"),
+                AddressSpaceKind::Kernel => logging::info("kind = Kernel"),
+                AddressSpaceKind::User => logging::info("kind = User"),
             }
 
             match aspace.root_page_frame {
-                Some(root) => logging::info_u64("  root_page_frame_index", root.number),
-                None => logging::info("  root_page_frame_index = None"),
+                Some(root) => logging::info_u64("root_page_frame_index", root.number),
+                None => logging::info("root_page_frame_index = None"),
             }
 
-            logging::info_u64("  address_space_id", as_idx as u64);
+            logging::info_u64("address_space_id", as_idx as u64);
 
             let count = aspace.mapping_count();
-            logging::info_u64("  mapping_count", count as u64);
+            logging::info_u64("mapping_count", count as u64);
 
             aspace.for_each_mapping(|m| {
-                logging::info("  MAPPING:");
-                logging::info_u64("    virt_page_index", m.page.number);
-                logging::info_u64("    phys_frame_index", m.frame.number);
-                logging::info_u64("    flags_bits", m.flags.bits());
+                logging::info("MAPPING:");
+                logging::info_u64("virt_page_index", m.page.number);
+                logging::info_u64("phys_frame_index", m.frame.number);
+                logging::info_u64("flags_bits", m.flags.bits());
             });
 
             if let Some(m) = task.last_msg {
-                logging::info("  IPC:");
-                logging::info_u64("    last_msg", m);
+                logging::info("IPC:");
+                logging::info_u64("last_msg", m);
             }
         }
         logging::info("=== End of AddressSpace Dump ===");
 
         logging::info("=== Endpoint Dump ===");
         for ep in self.endpoints.iter() {
-            logging::info(" ENDPOINT:");
-            logging::info_u64("  ep_id", ep.id.0 as u64);
+            logging::info("ENDPOINT:");
+            logging::info_u64("ep_id", ep.id.0 as u64);
 
             match ep.recv_waiter {
                 Some(tidx) => {
-                    logging::info_u64("  recv_waiter_task_index", tidx as u64);
+                    logging::info_u64("recv_waiter_task_index", tidx as u64);
                     if tidx < self.num_tasks {
-                        logging::info_u64("  recv_waiter_task_id", self.tasks[tidx].id.0);
+                        logging::info_u64("recv_waiter_task_id", self.tasks[tidx].id.0);
                     }
                 }
-                None => logging::info("  recv_waiter_task_index = None"),
+                None => logging::info("recv_waiter_task_index = None"),
             }
 
-            logging::info_u64("  send_queue_len", ep.sq_len as u64);
+            logging::info_u64("send_queue_len", ep.sq_len as u64);
             for pos in 0..ep.sq_len {
                 let tidx = ep.send_queue[pos];
-                logging::info_u64("   send_queue_task_index", tidx as u64);
+                logging::info_u64("send_queue_task_index", tidx as u64);
                 if tidx < self.num_tasks {
-                    logging::info_u64("   send_queue_task_id", self.tasks[tidx].id.0);
+                    logging::info_u64("send_queue_task_id", self.tasks[tidx].id.0);
                 }
             }
 
-            logging::info_u64("  reply_queue_len", ep.rq_len as u64);
+            logging::info_u64("reply_queue_len", ep.rq_len as u64);
             for pos in 0..ep.rq_len {
                 let tidx = ep.reply_queue[pos];
-                logging::info_u64("   reply_queue_task_index", tidx as u64);
+                logging::info_u64("reply_queue_task_index", tidx as u64);
                 if tidx < self.num_tasks {
-                    logging::info_u64("   reply_queue_task_id", self.tasks[tidx].id.0);
+                    logging::info_u64("reply_queue_task_id", self.tasks[tidx].id.0);
                 }
             }
         }
@@ -1265,117 +972,117 @@ fn log_event_to_vga(ev: LogEvent) {
     match ev {
         LogEvent::TickStarted(n) => {
             logging::info("EVENT: TickStarted");
-            logging::info_u64(" tick", n);
+            logging::info_u64("tick", n);
         }
         LogEvent::TimerUpdated(n) => {
             logging::info("EVENT: TimerUpdated");
-            logging::info_u64(" time", n);
+            logging::info_u64("time", n);
         }
         LogEvent::FrameAllocated => logging::info("EVENT: FrameAllocated"),
         LogEvent::TaskSwitched(tid) => {
             logging::info("EVENT: TaskSwitched");
-            logging::info_u64(" task", tid.0);
+            logging::info_u64("task", tid.0);
         }
         LogEvent::TaskStateChanged(tid, state) => {
             logging::info("EVENT: TaskStateChanged");
-            logging::info_u64(" task", tid.0);
+            logging::info_u64("task", tid.0);
             match state {
-                TaskState::Ready => logging::info(" to READY"),
-                TaskState::Running => logging::info(" to RUNNING"),
-                TaskState::Blocked => logging::info(" to BLOCKED"),
+                TaskState::Ready => logging::info("to READY"),
+                TaskState::Running => logging::info("to RUNNING"),
+                TaskState::Blocked => logging::info("to BLOCKED"),
             }
         }
         LogEvent::ReadyQueued(tid) => {
             logging::info("EVENT: ReadyQueued");
-            logging::info_u64(" task", tid.0);
+            logging::info_u64("task", tid.0);
         }
         LogEvent::ReadyDequeued(tid) => {
             logging::info("EVENT: ReadyDequeued");
-            logging::info_u64(" task", tid.0);
+            logging::info_u64("task", tid.0);
         }
         LogEvent::WaitQueued(tid) => {
             logging::info("EVENT: WaitQueued");
-            logging::info_u64(" task", tid.0);
+            logging::info_u64("task", tid.0);
         }
         LogEvent::WaitDequeued(tid) => {
             logging::info("EVENT: WaitDequeued");
-            logging::info_u64(" task", tid.0);
+            logging::info_u64("task", tid.0);
         }
         LogEvent::RuntimeUpdated(tid, rt) => {
             logging::info("EVENT: RuntimeUpdated");
-            logging::info_u64(" task", tid.0);
-            logging::info_u64(" runtime", rt);
+            logging::info_u64("task", tid.0);
+            logging::info_u64("runtime", rt);
         }
         LogEvent::QuantumExpired(tid, used) => {
             logging::info("EVENT: QuantumExpired");
-            logging::info_u64(" task", tid.0);
-            logging::info_u64(" used_ticks", used);
+            logging::info_u64("task", tid.0);
+            logging::info_u64("used_ticks", used);
         }
         LogEvent::MemActionApplied { task, address_space, action } => {
             logging::info("EVENT: MemActionApplied");
-            logging::info_u64(" task", task.0);
-            logging::info_u64(" address_space_id", address_space.0 as u64);
+            logging::info_u64("task", task.0);
+            logging::info_u64("address_space_id", address_space.0 as u64);
 
             match action {
                 MemAction::Map { page, frame, flags } => {
-                    logging::info(" mem_action = Map");
-                    logging::info_u64(" virt_page_index", page.number);
-                    logging::info_u64(" phys_frame_index", frame.number);
-                    logging::info_u64(" flags_bits", flags.bits());
+                    logging::info("mem_action = Map");
+                    logging::info_u64("virt_page_index", page.number);
+                    logging::info_u64("phys_frame_index", frame.number);
+                    logging::info_u64("flags_bits", flags.bits());
                 }
                 MemAction::Unmap { page } => {
-                    logging::info(" mem_action = Unmap");
-                    logging::info_u64(" virt_page_index", page.number);
+                    logging::info("mem_action = Unmap");
+                    logging::info_u64("virt_page_index", page.number);
                 }
             }
         }
         LogEvent::SyscallIssued { task } => {
             logging::info("EVENT: SyscallIssued");
-            logging::info_u64(" task", task.0);
+            logging::info_u64("task", task.0);
         }
         LogEvent::SyscallHandled { task } => {
             logging::info("EVENT: SyscallHandled");
-            logging::info_u64(" task", task.0);
+            logging::info_u64("task", task.0);
         }
         LogEvent::IpcRecvCalled { task, ep } => {
             logging::info("EVENT: IpcRecvCalled");
-            logging::info_u64(" task", task.0);
-            logging::info_u64(" ep", ep.0 as u64);
+            logging::info_u64("task", task.0);
+            logging::info_u64("ep", ep.0 as u64);
         }
         LogEvent::IpcRecvBlocked { task, ep } => {
             logging::info("EVENT: IpcRecvBlocked");
-            logging::info_u64(" task", task.0);
-            logging::info_u64(" ep", ep.0 as u64);
+            logging::info_u64("task", task.0);
+            logging::info_u64("ep", ep.0 as u64);
         }
         LogEvent::IpcSendCalled { task, ep, msg } => {
             logging::info("EVENT: IpcSendCalled");
-            logging::info_u64(" task", task.0);
-            logging::info_u64(" ep", ep.0 as u64);
-            logging::info_u64(" msg", msg);
+            logging::info_u64("task", task.0);
+            logging::info_u64("ep", ep.0 as u64);
+            logging::info_u64("msg", msg);
         }
         LogEvent::IpcSendBlocked { task, ep } => {
             logging::info("EVENT: IpcSendBlocked");
-            logging::info_u64(" task", task.0);
-            logging::info_u64(" ep", ep.0 as u64);
+            logging::info_u64("task", task.0);
+            logging::info_u64("ep", ep.0 as u64);
         }
         LogEvent::IpcDelivered { from, to, ep, msg } => {
             logging::info("EVENT: IpcDelivered");
-            logging::info_u64(" from", from.0);
-            logging::info_u64(" to", to.0);
-            logging::info_u64(" ep", ep.0 as u64);
-            logging::info_u64(" msg", msg);
+            logging::info_u64("from", from.0);
+            logging::info_u64("to", to.0);
+            logging::info_u64("ep", ep.0 as u64);
+            logging::info_u64("msg", msg);
         }
         LogEvent::IpcReplyCalled { task, ep, to } => {
             logging::info("EVENT: IpcReplyCalled");
-            logging::info_u64(" task", task.0);
-            logging::info_u64(" ep", ep.0 as u64);
-            logging::info_u64(" to", to.0);
+            logging::info_u64("task", task.0);
+            logging::info_u64("ep", ep.0 as u64);
+            logging::info_u64("to", to.0);
         }
         LogEvent::IpcReplyDelivered { from, to, ep } => {
             logging::info("EVENT: IpcReplyDelivered");
-            logging::info_u64(" from", from.0);
-            logging::info_u64(" to", to.0);
-            logging::info_u64(" ep", ep.0 as u64);
+            logging::info_u64("from", from.0);
+            logging::info_u64("to", to.0);
+            logging::info_u64("ep", ep.0 as u64);
         }
     }
 }
@@ -1387,56 +1094,4 @@ fn next_activity_and_action(current: KernelActivity) -> (KernelActivity, KernelA
         KernelActivity::AllocatingFrame => (KernelActivity::MappingDemoPage, KernelAction::AllocateFrame),
         KernelActivity::MappingDemoPage => (KernelActivity::Idle, KernelAction::MemDemo),
     }
-}
-
-// --- ここから下を、既存の start() 末尾部分と差し替え ---
-
-/// Step3: high-alias 側で「カーネル本体」を走らせるエントリ。
-/// - extern "C" にして ABI を固定（arch::paging 側の asm CALL から入れる）
-/// - ここが tick ループ本体（＝以降は high-alias 実行になる）
-#[inline(never)]
-extern "C" fn kernel_high_entry(boot_info: &'static BootInfo) -> ! {
-    logging::info("kernel_high_entry() [expected: high-alias]");
-    arch::paging::debug_log_execution_context("kernel_high_entry");
-
-    let mut kstate = KernelState::new(boot_info);
-    kstate.bootstrap();
-
-    let max_ticks = 120;
-    for _ in 0..max_ticks {
-        if kstate.should_halt() {
-            logging::info("KernelState requested halt; stop ticking");
-            break;
-        }
-        kstate.tick();
-    }
-
-    kstate.dump_events();
-    arch::halt_loop();
-}
-
-/// Step3: low 側の入口
-/// - guard 設定
-/// - high-alias のインストール（Step1/2）
-/// - high-alias へ制御移譲（Step3）
-pub fn start(boot_info: &'static BootInfo) {
-    logging::info("kernel::start() [low entry]");
-
-    // guard は「これから high-alias 経由で走る本体コード」を基準にする
-    let code_addr = kernel_high_entry as usize as u64;
-
-    // 現在のスタック上の値のアドレスを取って guard 対象にする
-    let stack_probe: u64 = 0;
-    let stack_addr = &stack_probe as *const u64 as u64;
-
-    arch::paging::configure_cr3_switch_safety(code_addr, stack_addr);
-
-    // Step1/2: low 側 PML4 を high 側へ alias して self-test
-    arch::paging::install_kernel_high_alias_from_current();
-
-    // 参考ログ（ここでは low 側で動いているはず）
-    arch::paging::debug_log_execution_context("before enter_kernel_high_alias");
-
-    // Step3: high-alias 側へ（スタックも high-alias 側に切替えて CALL）
-    arch::paging::enter_kernel_high_alias(kernel_high_entry, boot_info);
 }

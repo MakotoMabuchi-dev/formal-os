@@ -2,8 +2,8 @@
 //
 // IPC（同期: send/recv/reply）
 // - Endpoint に send_queue / recv_waiter / reply_queue を持たせる。
-// - KernelState の ipc_* は、syscall からのみ呼ばれる想定。
-// - キュー順序は swap-remove で抽象化（公平性は後回し）。
+// - KernelState の ipc_* は syscall からのみ呼ばれる想定。
+// - キュー順序は swap-remove（公平性は後回し）。
 
 use super::{
     BlockedReason, EndpointId, KernelState, LogEvent, TaskId, TaskState,
@@ -69,7 +69,6 @@ impl Endpoint {
         if self.sq_len == 0 {
             return None;
         }
-        // swap-remove
         let last = self.sq_len - 1;
         let idx = self.send_queue[last];
         self.sq_len -= 1;
@@ -91,7 +90,6 @@ impl Endpoint {
         if pos >= self.rq_len {
             return None;
         }
-        // swap-remove（順序は抽象化）
         let last = self.rq_len - 1;
         let idx = self.reply_queue[pos];
         self.reply_queue[pos] = self.reply_queue[last];
@@ -132,7 +130,6 @@ impl KernelState {
         let recv_id = self.tasks[recv_idx].id;
         self.push_event(LogEvent::IpcRecvCalled { task: recv_id, ep });
 
-        // sender が待っていれば deliver（send_queue から）
         let send_idx_opt = {
             let e = &mut self.endpoints[ep.0];
             e.dequeue_sender()
@@ -168,7 +165,6 @@ impl KernelState {
             return;
         }
 
-        // sender がいない → recv_waiter に登録して Block
         if self.endpoints[ep.0].recv_waiter.is_some() {
             crate::logging::error("ipc_recv: recv_waiter already exists; recv rejected (prototype)");
             return;
@@ -191,7 +187,6 @@ impl KernelState {
 
         self.push_event(LogEvent::IpcSendCalled { task: send_id, ep, msg });
 
-        // recv_waiter がいれば deliver
         let recv_idx_opt = {
             let e = &mut self.endpoints[ep.0];
             e.recv_waiter.take()
@@ -218,7 +213,6 @@ impl KernelState {
             return;
         }
 
-        // receiver がいない → sender を send_queue に積んで Block
         self.tasks[send_idx].pending_send_msg = Some(msg);
 
         self.block_current(BlockedReason::IpcSend { ep });

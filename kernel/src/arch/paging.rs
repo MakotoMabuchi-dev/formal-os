@@ -6,13 +6,14 @@
 // - Step1/2: kernel high-alias を導入し self-check + exec test
 // - Step3: high-alias に stack を切替えて kernel 本体へ移譲
 //
-// 追加（今回）:
-// - alias 範囲を guard(code/stack) から自動算出し、コピー数を保存して検証に使う
-// - “古い固定定数(KERNEL_ALIAS_COPY_COUNT)” 参照を撤去
+// Step4:
+// - alias 範囲（copy_count）を guard(code/stack) だけで決めず、実行コンテキスト(rip/rsp/rbp)を含めて自動算出
+// - USER_ACCESSIBLE 混入チェックを src 側で fail-stop
+// - high-alias self-check は code/stack の translate を使って継続
 //
 // 設計方針:
-// - fail-stop を優先（壊れているなら早めに panic）
-// - alias 範囲は “安全側” に倒す（+1 の余裕を持たせる）
+// - 壊れていたら早めに panic（fail-stop）
+// - “推測” ではなく “観測(実行コンテキスト)” に寄せて事故率を下げる
 
 use bootloader::BootInfo;
 use bootloader::bootinfo::MemoryRegionType;
@@ -78,15 +79,15 @@ fn enforce_user_mapping_policy(virt: VirtAddr, flags: PageTableFlags) {
 
     if user_accessible && !in_user_slot {
         logging::error("paging policy violation: USER mapping outside reserved user slot");
-        logging::info_u64(" virt_addr", virt.as_u64());
-        logging::info_u64(" flags_bits", flags.bits() as u64);
+        logging::info_u64("virt_addr", virt.as_u64());
+        logging::info_u64("flags_bits", flags.bits() as u64);
         panic!("USER mapping outside reserved user slot");
     }
 
     if !user_accessible && in_user_slot {
         logging::error("paging policy violation: KERNEL mapping inside reserved user slot");
-        logging::info_u64(" virt_addr", virt.as_u64());
-        logging::info_u64(" flags_bits", flags.bits() as u64);
+        logging::info_u64("virt_addr", virt.as_u64());
+        logging::info_u64("flags_bits", flags.bits() as u64);
         panic!("KERNEL mapping inside reserved user slot");
     }
 }
@@ -112,18 +113,18 @@ pub fn init(boot_info: &'static BootInfo) {
         let start = region.range.start_frame_number * 4096;
         let end = region.range.end_frame_number * 4096;
 
-        logging::info(" mem_region:");
-        logging::info_u64("  index", i as u64);
-        logging::info_u64("  start_phys", start);
-        logging::info_u64("  end_phys", end);
+        logging::info("mem_region:");
+        logging::info_u64("index", i as u64);
+        logging::info_u64("start_phys", start);
+        logging::info_u64("end_phys", end);
 
         match region.region_type {
-            MemoryRegionType::Usable => logging::info("  type = Usable"),
-            MemoryRegionType::Reserved => logging::info("  type = Reserved"),
-            MemoryRegionType::AcpiReclaimable => logging::info("  type = AcpiReclaimable"),
-            MemoryRegionType::AcpiNvs => logging::info("  type = AcpiNvs"),
-            MemoryRegionType::BadMemory => logging::info("  type = BadMemory"),
-            _ => logging::info("  type = Other"),
+            MemoryRegionType::Usable => logging::info("type = Usable"),
+            MemoryRegionType::Reserved => logging::info("type = Reserved"),
+            MemoryRegionType::AcpiReclaimable => logging::info("type = AcpiReclaimable"),
+            MemoryRegionType::AcpiNvs => logging::info("type = AcpiNvs"),
+            MemoryRegionType::BadMemory => logging::info("type = BadMemory"),
+            _ => logging::info("type = Other"),
         }
     }
     logging::info("arch::paging::init: memory map dump end");
@@ -177,14 +178,13 @@ unsafe impl<'a> FrameAllocator<Size4KiB> for KernelFrameAllocator<'a> {
     }
 }
 
-/// CR3 切替 guard の設定（low の code/stack を基準に phys を確定させる）
 pub fn configure_cr3_switch_safety(code_addr: u64, stack_addr: u64) {
     logging::info("arch::paging::configure_cr3_switch_safety");
-    logging::info_u64(" code_addr", code_addr);
-    logging::info_u64(" stack_addr", stack_addr);
+    logging::info_u64("code_addr", code_addr);
+    logging::info_u64("stack_addr", stack_addr);
 
     if !ENABLE_REAL_PAGING {
-        logging::info(" CR3 real switch: DISABLED (real paging disabled)");
+        logging::info("CR3 real switch: DISABLED (real paging disabled)");
         ALLOW_REAL_CR3_SWITCH.store(false, Ordering::Relaxed);
         return;
     }
@@ -196,7 +196,7 @@ pub fn configure_cr3_switch_safety(code_addr: u64, stack_addr: u64) {
         let stack_p = mapper.translate_addr(VirtAddr::new(stack_addr)).map(|p| p.as_u64()).unwrap_or(0);
 
         if code_p == 0 || stack_p == 0 {
-            logging::error(" CR3 real switch: DISABLED (translate failed)");
+            logging::error("CR3 real switch: DISABLED (translate failed)");
             ALLOW_REAL_CR3_SWITCH.store(false, Ordering::Relaxed);
             return;
         }
@@ -209,15 +209,14 @@ pub fn configure_cr3_switch_safety(code_addr: u64, stack_addr: u64) {
         GUARD_CODE_HIGH_VIRT.store(virt_layout::kernel_high_alias_of_low(code_addr), Ordering::Relaxed);
         GUARD_STACK_HIGH_VIRT.store(virt_layout::kernel_high_alias_of_low(stack_addr), Ordering::Relaxed);
 
-        logging::info(" CR3 real switch: ENABLED (translate-based guard)");
-        logging::info_u64(" expected_code_phys", code_p);
-        logging::info_u64(" expected_stack_phys", stack_p);
+        logging::info("CR3 real switch: ENABLED (translate-based guard)");
+        logging::info_u64("expected_code_phys", code_p);
+        logging::info_u64("expected_stack_phys", stack_p);
 
         ALLOW_REAL_CR3_SWITCH.store(true, Ordering::Relaxed);
     }
 }
 
-/// high-alias 範囲判定（install 時に確定した copy_count を使う）
 fn is_in_kernel_high_alias_region(addr: u64) -> bool {
     let idx = virt_layout::pml4_index(addr);
     let dst_base = virt_layout::KERNEL_ALIAS_DST_PML4_BASE_INDEX;
@@ -226,11 +225,9 @@ fn is_in_kernel_high_alias_region(addr: u64) -> bool {
     if cnt == 0 {
         return false;
     }
-
     idx >= dst_base && idx < (dst_base + cnt)
 }
 
-/// Step1/2: kernel の low-half mapping を high-half に alias として貼る（copy_count自動化）
 pub fn install_kernel_high_alias_from_current() {
     if !ENABLE_REAL_PAGING {
         logging::info("arch::paging::install_kernel_high_alias_from_current: skipped (real paging disabled)");
@@ -240,33 +237,33 @@ pub fn install_kernel_high_alias_from_current() {
     let code_low = GUARD_CODE_VIRT.load(Ordering::Relaxed);
     let stack_low = GUARD_STACK_VIRT.load(Ordering::Relaxed);
 
-    // まず “最小必要数” を計算
-    let mut copy_count = if code_low != 0 && stack_low != 0 {
-        virt_layout::recommend_alias_copy_count_from_guards(code_low, stack_low)
-    } else {
-        4
+    let (rip, rsp, rbp) = unsafe {
+        let mut rip: u64;
+        let mut rsp: u64;
+        let mut rbp: u64;
+        core::arch::asm!(
+        "lea {rip}, [rip]",
+        "mov {rsp}, rsp",
+        "mov {rbp}, rbp",
+        rip = out(reg) rip,
+        rsp = out(reg) rsp,
+        rbp = out(reg) rbp,
+        options(nomem, nostack, preserves_flags)
+        );
+        (rip, rsp, rbp)
     };
 
-    // ★重要：安全側に 1 スロット余裕（RIP/RSP/RBP が隣接 PML4 を踏むケース対策）
-    copy_count += 1;
-
-    // dst_base からはみ出さないよう clamp
-    let dst_base = virt_layout::KERNEL_ALIAS_DST_PML4_BASE_INDEX;
-    if dst_base >= 512 {
-        panic!("KERNEL_ALIAS_DST_PML4_BASE_INDEX out of range");
-    }
-    if dst_base + copy_count > 512 {
-        copy_count = 512 - dst_base;
-    }
-    if copy_count == 0 {
-        copy_count = 1;
-    }
+    let copy_count = virt_layout::recommend_alias_copy_count_from_addrs(&[
+        code_low, stack_low, rip, rsp, rbp,
+    ]);
 
     ALIAS_COPY_COUNT.store(copy_count, Ordering::Relaxed);
 
+    let dst_base = virt_layout::KERNEL_ALIAS_DST_PML4_BASE_INDEX;
+
     logging::info("arch::paging::install_kernel_high_alias_from_current: start");
-    logging::info_u64(" alias_dst_base_pml4", dst_base as u64);
-    logging::info_u64(" alias_copy_count", copy_count as u64);
+    logging::info_u64("alias_dst_base_pml4", dst_base as u64);
+    logging::info_u64("alias_copy_count", copy_count as u64);
 
     unsafe {
         let pml4 = active_level_4_table();
@@ -278,28 +275,25 @@ pub fn install_kernel_high_alias_from_current() {
                 continue;
             }
 
-            // kernel alias に USER_ACCESSIBLE が混ざったら危険なので fail-stop
             if pml4[src].flags().contains(PageTableFlags::USER_ACCESSIBLE) {
                 logging::error("kernel alias source contains USER_ACCESSIBLE; abort");
-                logging::info_u64(" src_pml4_index", src as u64);
+                logging::info_u64("src_pml4_index", src as u64);
                 panic!("kernel alias source contains USER_ACCESSIBLE");
             }
 
             pml4[dst] = pml4[src].clone();
 
-            logging::info(" installed kernel alias pml4 entry");
-            logging::info_u64("  src_pml4_index", src as u64);
-            logging::info_u64("  dst_pml4_index", dst as u64);
+            logging::info("installed kernel alias pml4 entry");
+            logging::info_u64("src_pml4_index", src as u64);
+            logging::info_u64("dst_pml4_index", dst as u64);
         }
 
-        // CR3 を同値で書き戻して paging-structure cache を更新
         let (frame, flags) = Cr3::read();
         Cr3::write(frame, flags);
     }
 
     logging::info("arch::paging::install_kernel_high_alias_from_current: done");
 
-    // self-check（high-alias の code/stack が low と同じ phys を指すか）
     let code_p_exp = GUARD_CODE_PHYS.load(Ordering::Relaxed);
     let stack_p_exp = GUARD_STACK_PHYS.load(Ordering::Relaxed);
 
@@ -313,18 +307,18 @@ pub fn install_kernel_high_alias_from_current() {
             let stack_p = mapper.translate_addr(VirtAddr::new(stack_high)).map(|p| p.as_u64()).unwrap_or(0);
 
             if code_p != code_p_exp || stack_p != stack_p_exp {
-                logging::error(" kernel high-alias self-check: FAILED");
-                logging::info_u64(" expected_code_phys", code_p_exp);
-                logging::info_u64(" actual_code_phys", code_p);
-                logging::info_u64(" expected_stack_phys", stack_p_exp);
-                logging::info_u64(" actual_stack_phys", stack_p);
+                logging::error("kernel high-alias self-check: FAILED");
+                logging::info_u64("expected_code_phys", code_p_exp);
+                logging::info_u64("actual_code_phys", code_p);
+                logging::info_u64("expected_stack_phys", stack_p_exp);
+                logging::info_u64("actual_stack_phys", stack_p);
                 panic!("kernel high-alias mapping mismatch");
             }
         }
 
-        logging::info(" kernel high-alias self-check: OK");
-        logging::info_u64("  code_high_virt", virt_layout::kernel_high_alias_of_low(code_low));
-        logging::info_u64("  stack_high_virt", virt_layout::kernel_high_alias_of_low(stack_low));
+        logging::info("kernel high-alias self-check: OK");
+        logging::info_u64("code_high_virt", virt_layout::kernel_high_alias_of_low(code_low));
+        logging::info_u64("stack_high_virt", virt_layout::kernel_high_alias_of_low(stack_low));
     }
 
     if ENABLE_HIGH_ALIAS_EXEC_TEST {
@@ -350,20 +344,18 @@ fn run_kernel_high_alias_exec_test() {
     let got = high_fn(arg);
 
     if got != expected {
-        logging::error(" kernel high-alias exec test: FAILED");
-        logging::info_u64(" low_fn_addr", low_addr);
-        logging::info_u64(" high_fn_addr", high_addr);
-        logging::info_u64(" expected", expected);
-        logging::info_u64(" got", got);
+        logging::error("kernel high-alias exec test: FAILED");
+        logging::info_u64("low_fn_addr", low_addr);
+        logging::info_u64("high_fn_addr", high_addr);
+        logging::info_u64("expected", expected);
+        logging::info_u64("got", got);
         panic!("kernel high-alias exec test failed");
     }
 
-    logging::info(" kernel high-alias exec test: OK");
-    logging::info_u64("  low_fn_addr", low_addr);
-    logging::info_u64("  high_fn_addr", high_addr);
+    logging::info("kernel high-alias exec test: OK");
+    logging::info_u64("low_fn_addr", low_addr);
+    logging::info_u64("high_fn_addr", high_addr);
 }
-
-// ---- map/unmap / translate / CR3 switch / user pml4 ----
 
 pub unsafe fn apply_mem_action(action: MemAction, phys_mem: &mut PhysicalMemoryManager) {
     apply_mem_action_with_mapper(action, None, phys_mem);
@@ -398,15 +390,15 @@ unsafe fn apply_mem_action_with_mapper(
             let virt = VirtAddr::new(virt_u64);
             enforce_user_mapping_policy(virt, xflags);
 
-            logging::info_u64(" virt_addr", virt_u64);
-            logging::info_u64(" phys_addr", phys_u64);
-            logging::info_u64(" flags_bits", xflags.bits() as u64);
+            logging::info_u64("virt_addr", virt_u64);
+            logging::info_u64("phys_addr", phys_u64);
+            logging::info_u64("flags_bits", xflags.bits() as u64);
 
             let page4k: Page<Size4KiB> = Page::containing_address(virt);
             let frame4k: PhysFrame<Size4KiB> = PhysFrame::containing_address(PhysAddr::new(phys_u64));
 
             if ENABLE_REAL_PAGING {
-                logging::info(" REAL PAGING: map_to() will be executed");
+                logging::info("REAL PAGING: map_to() will be executed");
 
                 let mut mapper = match root {
                     Some(r) => init_offset_page_table_for_root(r),
@@ -417,28 +409,28 @@ unsafe fn apply_mem_action_with_mapper(
                 match mapper.map_to(page4k, frame4k, xflags, &mut alloc) {
                     Ok(flush) => {
                         flush.flush();
-                        logging::info(" map_to: OK (flush done)");
+                        logging::info("map_to: OK (flush done)");
 
                         if root.is_none() && !xflags.contains(PageTableFlags::USER_ACCESSIBLE) {
                             let ptr = virt_u64 as *mut u64;
                             let test_value: u64 = 0xDEAD_BEEF_DEAD_BEEFu64;
 
-                            logging::info(" mem_test: writing test_value");
+                            logging::info("mem_test: writing test_value");
                             write_volatile(ptr, test_value);
 
                             let read_back = read_volatile(ptr);
-                            logging::info(" mem_test: read_back");
+                            logging::info("mem_test: read_back");
                             logging::info_u64("", read_back);
 
                             if read_back == test_value {
-                                logging::info(" mem_test: OK (value matched)");
+                                logging::info("mem_test: OK (value matched)");
                             } else {
-                                logging::error(" mem_test: MISMATCH!");
+                                logging::error("mem_test: MISMATCH!");
                             }
                         }
                     }
                     Err(e) => {
-                        logging::error(" map_to: ERROR");
+                        logging::error("map_to: ERROR");
                         log_map_to_error(e);
                     }
                 }
@@ -453,12 +445,12 @@ unsafe fn apply_mem_action_with_mapper(
                 virt_u64 = USER_SPACE_BASE + virt_u64;
             }
 
-            logging::info_u64(" virt_addr", virt_u64);
+            logging::info_u64("virt_addr", virt_u64);
 
             let page4k: Page<Size4KiB> = Page::containing_address(VirtAddr::new(virt_u64));
 
             if ENABLE_REAL_PAGING {
-                logging::info(" REAL PAGING: unmap() will be executed");
+                logging::info("REAL PAGING: unmap() will be executed");
 
                 let mut mapper = match root {
                     Some(r) => init_offset_page_table_for_root(r),
@@ -468,10 +460,10 @@ unsafe fn apply_mem_action_with_mapper(
                 match mapper.unmap(page4k) {
                     Ok((_f, flush)) => {
                         flush.flush();
-                        logging::info(" unmap: OK (flush done)");
+                        logging::info("unmap: OK (flush done)");
                     }
                     Err(e) => {
-                        logging::error(" unmap: ERROR");
+                        logging::error("unmap: ERROR");
                         log_unmap_error(e);
                     }
                 }
@@ -482,7 +474,7 @@ unsafe fn apply_mem_action_with_mapper(
 
 pub fn debug_translate_in_root(root: MyPhysFrame, virt_addr_u64: u64) {
     if !ENABLE_REAL_PAGING {
-        logging::info(" debug_translate_in_root: REAL PAGING disabled");
+        logging::info("debug_translate_in_root: REAL PAGING disabled");
         return;
     }
 
@@ -491,13 +483,13 @@ pub fn debug_translate_in_root(root: MyPhysFrame, virt_addr_u64: u64) {
         let v = VirtAddr::new(virt_addr_u64);
         match mapper.translate_addr(v) {
             Some(p) => {
-                logging::info(" translate: OK");
-                logging::info_u64("  virt_addr", virt_addr_u64);
-                logging::info_u64("  phys_addr", p.as_u64());
+                logging::info("translate: OK");
+                logging::info_u64("virt_addr", virt_addr_u64);
+                logging::info_u64("phys_addr", p.as_u64());
             }
             None => {
-                logging::info(" translate: NONE (not mapped)");
-                logging::info_u64("  virt_addr", virt_addr_u64);
+                logging::info("translate: NONE (not mapped)");
+                logging::info_u64("virt_addr", virt_addr_u64);
             }
         }
     }
@@ -505,23 +497,23 @@ pub fn debug_translate_in_root(root: MyPhysFrame, virt_addr_u64: u64) {
 
 fn log_map_to_error(err: MapToError<Size4KiB>) {
     match err {
-        MapToError::FrameAllocationFailed => logging::error("  MapToError::FrameAllocationFailed"),
-        MapToError::ParentEntryHugePage => logging::error("  MapToError::ParentEntryHugePage"),
+        MapToError::FrameAllocationFailed => logging::error("MapToError::FrameAllocationFailed"),
+        MapToError::ParentEntryHugePage => logging::error("MapToError::ParentEntryHugePage"),
         MapToError::PageAlreadyMapped(old) => {
-            logging::error("  MapToError::PageAlreadyMapped");
-            logging::info_u64("   already_mapped_phys_addr", old.start_address().as_u64());
+            logging::error("MapToError::PageAlreadyMapped");
+            logging::info_u64("already_mapped_phys_addr", old.start_address().as_u64());
         }
     }
 }
 
 fn log_unmap_error(err: UnmapError) {
     match err {
-        UnmapError::PageNotMapped => logging::error("  UnmapError::PageNotMapped"),
+        UnmapError::PageNotMapped => logging::error("UnmapError::PageNotMapped"),
         UnmapError::InvalidFrameAddress(p) => {
-            logging::error("  UnmapError::InvalidFrameAddress");
-            logging::info_u64("   invalid_frame_phys_addr", PhysAddr::from(p).as_u64());
+            logging::error("UnmapError::InvalidFrameAddress");
+            logging::info_u64("invalid_frame_phys_addr", PhysAddr::from(p).as_u64());
         }
-        UnmapError::ParentEntryHugePage => logging::error("  UnmapError::ParentEntryHugePage"),
+        UnmapError::ParentEntryHugePage => logging::error("UnmapError::ParentEntryHugePage"),
     }
 }
 
@@ -529,7 +521,7 @@ pub fn switch_address_space(root: Option<MyPhysFrame>) {
     match root {
         Some(frame) => {
             logging::info("switch_address_space: would switch to root_page_frame");
-            logging::info_u64(" root_page_frame_index", frame.number);
+            logging::info_u64("root_page_frame_index", frame.number);
 
             if !ALLOW_REAL_CR3_SWITCH.load(Ordering::Relaxed) {
                 logging::info("switch_address_space: CR3 switch skipped (guard disabled)");
@@ -553,10 +545,10 @@ pub fn switch_address_space(root: Option<MyPhysFrame>) {
 
                 if code_p != code_p_exp || stack_p != stack_p_exp {
                     logging::error("switch_address_space: guard mismatch; CR3 switch aborted");
-                    logging::info_u64(" expected_code_phys", code_p_exp);
-                    logging::info_u64(" actual_code_phys", code_p);
-                    logging::info_u64(" expected_stack_phys", stack_p_exp);
-                    logging::info_u64(" actual_stack_phys", stack_p);
+                    logging::info_u64("expected_code_phys", code_p_exp);
+                    logging::info_u64("actual_code_phys", code_p);
+                    logging::info_u64("expected_stack_phys", stack_p_exp);
+                    logging::info_u64("actual_stack_phys", stack_p);
                     return;
                 }
             }
@@ -572,12 +564,12 @@ pub fn switch_address_space(root: Option<MyPhysFrame>) {
 
                     if code_p != code_p_exp || stack_p != stack_p_exp {
                         logging::error("switch_address_space: high-alias guard mismatch; CR3 switch aborted");
-                        logging::info_u64(" code_high_virt", code_high);
-                        logging::info_u64(" stack_high_virt", stack_high);
-                        logging::info_u64(" expected_code_phys", code_p_exp);
-                        logging::info_u64(" actual_code_phys", code_p);
-                        logging::info_u64(" expected_stack_phys", stack_p_exp);
-                        logging::info_u64(" actual_stack_phys", stack_p);
+                        logging::info_u64("code_high_virt", code_high);
+                        logging::info_u64("stack_high_virt", stack_high);
+                        logging::info_u64("expected_code_phys", code_p_exp);
+                        logging::info_u64("actual_code_phys", code_p);
+                        logging::info_u64("expected_stack_phys", stack_p_exp);
+                        logging::info_u64("actual_stack_phys", stack_p);
                         return;
                     }
                 }
@@ -586,7 +578,10 @@ pub fn switch_address_space(root: Option<MyPhysFrame>) {
             let phys = PhysAddr::new(frame.start_address().0);
             let x86_frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(phys);
 
-            unsafe { Cr3::write(x86_frame, Cr3Flags::empty()); }
+            // ---- B: CR3 flags を empty にせず「現在の flags を引き継ぐ」 ----
+            let (_cur_frame, cur_flags) = Cr3::read();
+            unsafe { Cr3::write(x86_frame, cur_flags); }
+
             logging::info("switch_address_space: CR3 switched (real)");
         }
         None => logging::info("switch_address_space: no root_page_frame (None)"),
@@ -610,12 +605,10 @@ pub fn init_user_pml4_from_current(new_root: MyPhysFrame) {
         }
 
         logging::info("init_user_pml4_from_current: clearing user pml4 entry");
-        logging::info_u64(" pml4_index", USER_PML4_INDEX as u64);
+        logging::info_u64("pml4_index", USER_PML4_INDEX as u64);
         user_p4[USER_PML4_INDEX as usize].set_unused();
     }
 }
-
-// ---- Step3 support ----
 
 pub fn debug_log_execution_context(tag: &str) {
     let (rip, rsp, rbp) = unsafe {
@@ -636,17 +629,17 @@ pub fn debug_log_execution_context(tag: &str) {
 
     logging::info("exec_context:");
     logging::info(tag);
-    logging::info_u64(" rip", rip);
-    logging::info_u64(" rsp", rsp);
-    logging::info_u64(" rbp", rbp);
-    logging::info_u64(" rip_pml4", virt_layout::pml4_index(rip) as u64);
-    logging::info_u64(" rsp_pml4", virt_layout::pml4_index(rsp) as u64);
-    logging::info_u64(" rbp_pml4", virt_layout::pml4_index(rbp) as u64);
+    logging::info_u64("rip", rip);
+    logging::info_u64("rsp", rsp);
+    logging::info_u64("rbp", rbp);
+    logging::info_u64("rip_pml4", virt_layout::pml4_index(rip) as u64);
+    logging::info_u64("rsp_pml4", virt_layout::pml4_index(rsp) as u64);
+    logging::info_u64("rbp_pml4", virt_layout::pml4_index(rbp) as u64);
 
     if is_in_kernel_high_alias_region(rip) {
-        logging::info(" rip is in kernel high-alias region");
+        logging::info("rip is in kernel high-alias region");
     } else {
-        logging::info(" rip is NOT in kernel high-alias region");
+        logging::info("rip is NOT in kernel high-alias region");
     }
 }
 
@@ -672,12 +665,12 @@ pub fn enter_kernel_high_alias(entry: extern "C" fn(&'static BootInfo) -> !, boo
     let rsp_high = virt_layout::kernel_high_alias_of_low(rsp_low) & !0xFu64;
     let rbp_high = virt_layout::kernel_high_alias_of_low(rbp_low);
 
-    logging::info_u64(" low_entry", low_entry);
-    logging::info_u64(" high_entry", high_entry);
-    logging::info_u64(" rsp_low", rsp_low);
-    logging::info_u64(" rsp_high_aligned", rsp_high);
-    logging::info_u64(" rbp_low", rbp_low);
-    logging::info_u64(" rbp_high", rbp_high);
+    logging::info_u64("low_entry", low_entry);
+    logging::info_u64("high_entry", high_entry);
+    logging::info_u64("rsp_low", rsp_low);
+    logging::info_u64("rsp_high_aligned", rsp_high);
+    logging::info_u64("rbp_low", rbp_low);
+    logging::info_u64("rbp_high", rbp_high);
 
     unsafe {
         core::arch::asm!(

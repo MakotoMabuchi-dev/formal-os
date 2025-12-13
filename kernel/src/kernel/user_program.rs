@@ -1,33 +1,30 @@
 // kernel/src/kernel/user_program.rs
 //
 // user program（デモ）
-// - “IpcDemo” の代替として、Running task が自分の意思で syscall を発行する。
-// - ここは「カーネル内部のデモ用状態機械」であり、後でユーザ空間ができたら置き換える想定。
+// - Running task が自分の意思で syscall を発行する。
+// - 後でユーザ空間ができたら置き換える想定。
 
 use super::{
     KernelState, Syscall,
-    IPC_DEMO_EP0, TASK0_INDEX, TASK1_INDEX, TASK2_INDEX,
+    IPC_DEMO_EP0, TASK0_INDEX, TASK1_INDEX, TASK2_INDEX, TaskState,
 };
 
 impl KernelState {
-    //
-    // user program（Running task が syscall を発行する）
-    //
+    /// Running task が 1 tick に 1 回だけ syscall を発行する（デモ）
     pub(super) fn user_step_issue_syscall(&mut self, task_idx: usize) {
         if task_idx >= self.num_tasks {
             return;
         }
-        if self.tasks[task_idx].state != super::TaskState::Running {
+        if self.tasks[task_idx].state != TaskState::Running {
             return;
         }
         if self.tasks[task_idx].pending_syscall.is_some() {
-            // すでに発行済み（まだ処理されていない）なら二重発行しない
             return;
         }
 
         let ep = IPC_DEMO_EP0;
 
-        // Receiver (Task3 = TASK2_INDEX)
+        // Receiver (Task3)
         if task_idx == TASK2_INDEX {
             if self.demo_msgs_delivered < 2 {
                 self.tasks[task_idx].pending_syscall = Some(Syscall::IpcRecv { ep });
@@ -49,7 +46,7 @@ impl KernelState {
             return;
         }
 
-        // Sender A (Task2 = TASK1_INDEX): “recv_waiter が立っている(1回目)” のときだけ送る
+        // Sender A (Task2)
         if task_idx == TASK1_INDEX {
             if !self.demo_sent_by_task2 {
                 let e = &self.endpoints[ep.0];
@@ -65,7 +62,7 @@ impl KernelState {
             return;
         }
 
-        // Sender B (Task1 = TASK0_INDEX): “recv_waiter が立っている(2回目)” のときだけ送る
+        // Sender B (Task1)
         if task_idx == TASK0_INDEX {
             if !self.demo_sent_by_task1 {
                 let e = &self.endpoints[ep.0];

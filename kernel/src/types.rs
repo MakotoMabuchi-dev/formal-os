@@ -1,36 +1,20 @@
+// kernel/src/types.rs
 /*!
  * types
  *
  * 役割:
- *   - カーネル全体で共有する素朴な型・定数を集約する。
+ *   - カーネル全体で共有する素朴な型・定数を集約する（補助）。
  *
- * やること:
- *   - 物理/仮想アドレス、ページサイズ、PML4 index 計算などの共通ユーティリティ。
- *
- * やらないこと:
- *   - ページングや CR3 切替などの arch 依存処理。
- *
- * 設計方針:
- *   - 依存を増やさず、共通処理をここに寄せる。
+ * 方針:
+ *   - 可能な限り mem::addr 側の型を再利用し、二重定義を避ける。
+ *   - “本体の正” は mem::addr / arch::virt_layout とし、ここは補助に留める。
  */
+
+#![allow(dead_code)]
 
 use core::fmt;
 
-pub type PhysAddr = u64;
-pub type VirtAddr = u64;
-
-pub const PAGE_SIZE: u64 = 4096;
-
-pub const PML4_ENTRY_COUNT: usize = 512;
-pub const PML4_INDEX_BITS: u64 = 9;
-pub const PML4_ENTRY_SHIFT: u64 = 39; // 512GiB
-pub const PML4_ENTRY_SIZE: u64 = 1u64 << PML4_ENTRY_SHIFT;
-pub const PML4_INDEX_MASK: u64 = (1u64 << PML4_INDEX_BITS) - 1;
-
-/// 仮想アドレスから PML4 index を取り出す（48-bit 仮想前提）
-pub fn pml4_index(virt: VirtAddr) -> usize {
-    ((virt >> PML4_ENTRY_SHIFT) & PML4_INDEX_MASK) as usize
-}
+pub use crate::mem::addr::PhysAddr;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryRegionType {
@@ -59,6 +43,6 @@ pub struct MemoryRegion {
 
 impl MemoryRegion {
     pub fn size_bytes(&self) -> u64 {
-        self.end_phys.saturating_sub(self.start_phys)
+        self.end_phys.0.saturating_sub(self.start_phys.0)
     }
 }

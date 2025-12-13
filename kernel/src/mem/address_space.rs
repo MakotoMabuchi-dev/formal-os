@@ -3,18 +3,6 @@
 // 役割:
 // - 論理アドレス空間（プロセスやカーネルのメモリ空間）を表現する。
 // - どの仮想ページがどの物理フレームにどの権限でマップされているかを保持する。
-// - kind で「カーネル用かユーザ用か」を明示し、将来の権限チェックのベースにする。
-//
-// 設計方針（プロトタイプ）:
-// - Kernel: VirtPage は “実仮想アドレス / PAGE_SIZE” のページ番号として扱う。
-// - User: VirtPage は “user slot 内 offset / PAGE_SIZE” のページ番号として扱う。
-//   実仮想アドレスは arch::paging 側で USER_SPACE_BASE を加算して作る。
-//   （low-half カーネルの間はこの設計が安全で、high-half 移行時も定数変更で吸収できる）
-//
-// やらないこと（今は）:
-// - 複雑な VMA 管理や demand paging
-// - ユーザ/カーネルの完全分離（high-half 化後に段階導入）
-//
 
 use crate::mem::addr::{PhysFrame, VirtPage};
 use crate::mem::paging::{MemAction, PageFlags};
@@ -27,7 +15,7 @@ pub enum AddressSpaceKind {
 
 #[derive(Clone, Copy)]
 pub struct Mapping {
-    pub page:  VirtPage,
+    pub page: VirtPage,
     pub frame: PhysFrame,
     pub flags: PageFlags,
 }
@@ -64,15 +52,6 @@ impl AddressSpace {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn new_with_kind(kind: AddressSpaceKind) -> Self {
-        AddressSpace {
-            kind,
-            root_page_frame: None,
-            mappings: [None; MAX_MAPPINGS],
-        }
-    }
-
     pub fn apply(&mut self, action: MemAction) -> Result<(), AddressSpaceError> {
         match action {
             MemAction::Map { page, frame, flags } => {
@@ -93,6 +72,7 @@ impl AddressSpace {
 
                 Err(AddressSpaceError::CapacityExceeded)
             }
+
             MemAction::Unmap { page } => {
                 for entry in self.mappings.iter_mut() {
                     if let Some(m) = entry {

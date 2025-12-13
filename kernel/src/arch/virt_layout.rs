@@ -1,98 +1,137 @@
-// kernel/src/arch/virt_layout.rs
-//
-// 【役割】
-//  x86_64 の仮想アドレスレイアウト（low-half / high-half / alias / user slot）を 1 箇所に集約。
-//  paging.rs / kernel.rs に散らばる定数や計算の事故を防ぐ。
-//
-// 【やること】
-//  - PML4 index 抽出
-//  - canonical(48bit) な high 側アドレス生成
-//  - kernel high-alias の “low->high” 変換
-//  - user slot（PML4 1 スロット固定）定義
-//  - guard(code/stack) から alias コピー数を推奨計算
-//
-// 【やらないこと】
-//  - 実際のページテーブル操作（map/unmap）
-//  - BootInfo 依存の配置決定
+/*
+役割:
+- x86_64 の仮想アドレス空間レイアウト（PML4 スロット割り当て）と、
+  その計算を行う純粋関数を提供する。
 
-#![allow(dead_code)]
+やること:
+- USER 空間の PML4 スロット位置と範囲の定義
+- kernel low-half → kernel high-alias 変換（同一物理を別仮想で参照）
+- PML4 index 抽出などのビット演算ヘルパ
+- high-alias に必要な「コピー数」の推奨（guards / 実行コンテキスト）
 
-pub const PAGE_SIZE: u64 = 4096;
+やらないこと:
+- ページテーブルを触る（それは arch::paging 側の責務）
+- 物理メモリ管理（mm 側の責務）
 
-// 1 PML4 entry covers 512 GiB.
-pub const PML4_ENTRY_COVERAGE: u64 = 1u64 << 39;
+設計方針:
+- ここは「アドレス計算だけ」に限定し、副作用を持たせない
+- high-alias は paging 側のコピー規則（dst = base + src）と完全に一致させる
+- 返り値（copy_count）は alias 窓の幅を超えないよう上限を持つ（過大コピー防止）
+*/
 
-// canonical boundary (48-bit)
-pub const CANONICAL_HIGH_MASK: u64 = 0xFFFF_0000_0000_0000;
+/// 1つの PML4 エントリがカバーする仮想アドレス範囲（512GiB）
+pub const PML4_SLOT_SIZE: u64 = 1u64 << 39;
 
-// ----------------------
-// User slot policy
-// ----------------------
-
-// User 空間は PML4 1 スロットに閉じ込める（512GiB）
+/// USER 空間に予約する PML4 index（あなたのログでは 4 を使っている前提）
 pub const USER_PML4_INDEX: usize = 4;
-pub const USER_SPACE_BASE: u64 = (USER_PML4_INDEX as u64) << 39;
-pub const USER_SPACE_SIZE: u64 = 1u64 << 39;
 
-// ----------------------
-// Kernel high-alias policy
-// ----------------------
-//
-// low 側の PML4 index 0..N を high 側の 508..(508+N) にコピーする運用。
-// 508..511 を使うと canonical high になりやすく、衝突もしにくい。
-//
+/// PML4 index の開始アドレス（slot の base）を返す
+#[inline(always)]
+pub const fn pml4_index_base_addr(index: usize) -> u64 {
+    canonicalize_virt((index as u64) << 39)
+}
+
+/// USER 空間ベース（PML4 index 4 の開始アドレス）
+pub const USER_SPACE_BASE: u64 = pml4_index_base_addr(USER_PML4_INDEX);
+
+/// USER 空間サイズ（PML4 1スロット分: 512GiB）
+pub const USER_SPACE_SIZE: u64 = PML4_SLOT_SIZE;
+
+/// kernel high-alias を配置する先の PML4 index（あなたのログの値と一致させる）
 pub const KERNEL_ALIAS_DST_PML4_BASE_INDEX: usize = 508;
 
-// ----------------------
-// Bit helpers
-// ----------------------
+/// base から使えるスロット数（508..=511 の 4スロット）
+pub const KERNEL_ALIAS_MAX_COPY_COUNT: usize = 512 - KERNEL_ALIAS_DST_PML4_BASE_INDEX;
 
-/// PML4 index (bits 47..39)
+/// 指定アドレスの PML4 index（bits 47..39）
+#[inline(always)]
 pub const fn pml4_index(addr: u64) -> usize {
-    ((addr >> 39) & 0x1FF) as usize
+    ((addr >> 39) & 0x1ff) as usize
 }
 
-/// 「その PML4 スロット内オフセット」（下位 39bit）
-pub const fn pml4_slot_offset(addr: u64) -> u64 {
-    addr & (PML4_ENTRY_COVERAGE - 1)
-}
-
-/// idx(0..511) と offset(0..512GiB) から canonical な仮想アドレスを作る
-pub const fn make_canonical_from_pml4(idx: usize, offset: u64) -> u64 {
-    let addr48 = ((idx as u64) << 39) | (offset & (PML4_ENTRY_COVERAGE - 1));
-
-    // idx>=256 なら bit47=1 なので high canonical
-    if idx >= 256 {
-        addr48 | CANONICAL_HIGH_MASK
+/// 48bit canonical への正規化（bit47 を sign-extend）
+#[inline(always)]
+pub const fn canonicalize_virt(addr: u64) -> u64 {
+    let sign_bit = 1u64 << 47;
+    if (addr & sign_bit) != 0 {
+        // 上位を 1 で埋める
+        addr | 0xffff_0000_0000_0000
     } else {
-        addr48
+        // 上位を 0 にする（念のため 48bit に丸める）
+        addr & 0x0000_ffff_ffff_ffff
     }
 }
 
-/// low addr を high-alias addr へ写す
+/// low 側アドレスを、high-alias 側へ写像する。
 ///
-/// - low の PML4 index を保持して dst_base に足し込む
-/// - offset は PML4 スロット内オフセット（下位39bit）
+/// 重要:
+/// - paging 側では `dst = KERNEL_ALIAS_DST_PML4_BASE_INDEX + src` として
+///   PML4 エントリをコピーしている。
+/// - なので、ここでも low の PML4 index を保ったまま、dst 側へ移す必要がある。
 ///
-/// 例: low の pml4=2 のアドレス -> high の pml4=510 の同じ offset
-pub const fn kernel_high_alias_of_low(low_addr: u64) -> u64 {
+/// 例:
+/// - low が PML4=0 の場合 → high は PML4=508
+/// - low が PML4=2 の場合 → high は PML4=510
+#[inline(always)]
+pub fn kernel_high_alias_of_low(low_addr: u64) -> u64 {
     let low_idx = pml4_index(low_addr);
-    let off = pml4_slot_offset(low_addr);
+    let offset_in_slot = low_addr & (PML4_SLOT_SIZE - 1);
+
+    // dst 側は 508..511 の 4スロットを想定
+    // low_idx が 0..3 以外なら、設計（alias 窓の幅）と不一致。
+    debug_assert!(
+        low_idx < KERNEL_ALIAS_MAX_COPY_COUNT,
+        "low pml4 index too large for alias window"
+    );
 
     let high_idx = KERNEL_ALIAS_DST_PML4_BASE_INDEX + low_idx;
-    make_canonical_from_pml4(high_idx, off)
+    pml4_index_base_addr(high_idx) + offset_in_slot
 }
 
-/// guard(code/stack) から「最低限必要な alias copy count」を推奨
-///
-/// 返り値は “src 側でコピーすべき個数” なので、src=0..count-1 をコピーする。
-pub const fn recommend_alias_copy_count_from_guards(code_low: u64, stack_low: u64) -> usize {
-    let mut max_idx = pml4_index(code_low);
-    let s = pml4_index(stack_low);
-    if s > max_idx {
-        max_idx = s;
+/// alias に必要な copy_count を「最大 pml4_index + 1」で返す共通ロジック。
+/// - 返り値は 1..=KERNEL_ALIAS_MAX_COPY_COUNT にクランプする
+/// - 0 アドレス（未初期化値）は無視する
+#[inline(always)]
+pub fn recommend_alias_copy_count_from_addrs(addrs: &[u64]) -> usize {
+    let mut max_idx: usize = 0;
+    let mut any = false;
+
+    for &a in addrs {
+        if a == 0 {
+            continue;
+        }
+        any = true;
+
+        let idx = pml4_index(a);
+        if idx > max_idx {
+            max_idx = idx;
+        }
     }
 
-    // max_idx=0 -> 1個, max_idx=3 -> 4個
-    max_idx + 1
+    // 何も無い（全部0）場合は最小 1 スロットだけコピー（fail-safe）
+    let mut res = if any { max_idx + 1 } else { 1 };
+
+    if res == 0 {
+        res = 1;
+    }
+
+    // alias 窓の幅を超えないように上限を設ける
+    if res > KERNEL_ALIAS_MAX_COPY_COUNT {
+        res = KERNEL_ALIAS_MAX_COPY_COUNT;
+    }
+
+    res
+}
+
+/// guard（code/stack）から alias に必要なコピー数（src 側の 0..N）を推定する。
+/// 返り値 N は「src index 0..N-1 をコピーする」想定の個数。
+#[inline(always)]
+pub fn recommend_alias_copy_count_from_guards(code_low: u64, stack_low: u64) -> usize {
+    recommend_alias_copy_count_from_addrs(&[code_low, stack_low])
+}
+
+/// code/rsp/rbp を使って copy_count を推定したい場合の拡張版。
+#[inline(always)]
+pub fn recommend_alias_copy_count_from_context(code_low: u64, rsp_low: u64, rbp_low: u64) -> usize {
+    recommend_alias_copy_count_from_addrs(&[code_low, rsp_low, rbp_low])
 }

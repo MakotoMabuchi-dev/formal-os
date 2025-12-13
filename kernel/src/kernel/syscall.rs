@@ -8,9 +8,6 @@
 use super::{EndpointId, KernelState, LogEvent};
 
 /// syscall の最小セット（IPCのみ）
-///
-/// 実際の CPU syscall 命令はまだ使わず、
-/// 「タスクが要求を pending に置く → カーネルが処理する」で境界を作る。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Syscall {
     IpcRecv { ep: EndpointId },
