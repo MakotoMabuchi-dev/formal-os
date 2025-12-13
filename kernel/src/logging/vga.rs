@@ -2,14 +2,19 @@
 //
 // VGA テキストモード(0xb8000)への最小限出力。
 // - init(): Writer を初期化
-// - write_str(): 改行なし出力
+// - write_str(): 文字列（改行なし）
 // - write_line(): 文字列＋改行
-// - write_prefixed_line(): prefix + msg を 1 行に出す
+// - write_prefixed_line(prefix, msg): prefix+msg を 1 回のロックで出して改行
+//
+// C対応:
+// - spin::Mutex は割り込み再入でデッドロックしうるため、
+//   ロック取得～書き込みを interrupts::without_interrupts で囲む。
+// - prefix と本体を別々に出すと混ざるので、できるだけ 1 回のロックでまとめる。
 
 use core::fmt::{self, Write};
-
 use spin::Mutex;
 use volatile::Volatile;
+use x86_64::instructions::interrupts;
 
 const BUFFER_HEIGHT: usize = 25;
 const BUFFER_WIDTH: usize = 80;
@@ -97,26 +102,38 @@ pub fn init() {
         color_code: (Color::LightGray as u8) | ((Color::Black as u8) << 4),
         buffer: unsafe { &mut *(0xb8000 as *mut Buffer) },
     };
-    *WRITER.lock() = Some(writer);
+
+    interrupts::without_interrupts(|| {
+        *WRITER.lock() = Some(writer);
+    });
 }
 
+/// 文字列を出す（改行なし）
 pub fn write_str(s: &str) {
-    if let Some(ref mut w) = *WRITER.lock() {
-        let _ = w.write_str(s);
-    }
+    interrupts::without_interrupts(|| {
+        if let Some(ref mut w) = *WRITER.lock() {
+            let _ = w.write_str(s);
+        }
+    });
 }
 
+/// 文字列＋改行
 pub fn write_line(s: &str) {
-    if let Some(ref mut w) = *WRITER.lock() {
-        let _ = w.write_str(s);
-        let _ = w.write_str("\n");
-    }
+    interrupts::without_interrupts(|| {
+        if let Some(ref mut w) = *WRITER.lock() {
+            let _ = w.write_str(s);
+            let _ = w.write_str("\n");
+        }
+    });
 }
 
+/// prefix + msg を 1 回のロックで書いて改行
 pub fn write_prefixed_line(prefix: &str, msg: &str) {
-    if let Some(ref mut w) = *WRITER.lock() {
-        let _ = w.write_str(prefix);
-        let _ = w.write_str(msg);
-        let _ = w.write_str("\n");
-    }
+    interrupts::without_interrupts(|| {
+        if let Some(ref mut w) = *WRITER.lock() {
+            let _ = w.write_str(prefix);
+            let _ = w.write_str(msg);
+            let _ = w.write_str("\n");
+        }
+    });
 }

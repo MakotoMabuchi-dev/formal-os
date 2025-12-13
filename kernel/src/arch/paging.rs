@@ -25,7 +25,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use x86_64::{
     PhysAddr,
     VirtAddr,
-    registers::control::{Cr3, Cr3Flags},
+    registers::control::Cr3,
     structures::paging::{
         FrameAllocator,
         Mapper,
