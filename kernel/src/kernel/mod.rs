@@ -729,6 +729,16 @@ impl KernelState {
     }
 
     fn do_mem_demo(&mut self) {
+        #[cfg(feature = "evil_double_map")]
+        {
+            self.do_mem_demo_evil_double_map();
+            return;
+        }
+
+        self.do_mem_demo_normal();
+    }
+
+    fn do_mem_demo_normal(&mut self) {
         let task_idx = self.current_task;
         let task = self.tasks[task_idx];
         let task_id = task.id;
@@ -762,8 +772,7 @@ impl KernelState {
         let as_idx = task.address_space_id.0;
         let aspace = &mut self.address_spaces[as_idx];
 
-        // (1) まず論理側の apply が成功することを要求
-        //     ここが失敗するのは KernelState 側のバグなので、fail-stop にして不整合を残さない。
+        // 1) 論理側（失敗は fail-stop）
         if let Err(e) = aspace.apply(mem_action) {
             logging::error("address_space.apply: FAILED (inconsistent state)");
             match e {
@@ -774,8 +783,7 @@ impl KernelState {
             panic!("address_space.apply failed; abort to keep state consistent");
         }
 
-        // (2) 次に arch 側の適用。失敗したら fail-stop。
-        //     ここで止めれば「論理は進んだが実機は進んでない」状態で走り続けない。
+        // 2) 実機側（失敗は fail-stop）
         let arch_result = if task_idx == TASK0_INDEX {
             logging::info("mem_demo: applying arch paging (Task0 / current CR3)");
             unsafe { arch::paging::apply_mem_action(mem_action, &mut self.phys_mem) }
@@ -797,7 +805,7 @@ impl KernelState {
             panic!("arch paging apply failed; abort to keep state consistent");
         }
 
-        // (3) ここまで来たら「論理」と「実機」が一致したとみなせるので、状態を進める
+        // 3) 成功後にのみ状態を進める
         self.mem_demo_mapped[task_idx] = !self.mem_demo_mapped[task_idx];
 
         // user の場合は translate を追加で観測
@@ -814,6 +822,70 @@ impl KernelState {
         });
     }
 
+    #[cfg(feature = "evil_double_map")]
+    fn do_mem_demo_evil_double_map(&mut self) {
+        let task_idx = self.current_task;
+        let task = self.tasks[task_idx];
+
+        let page = self.demo_page_for_task(task_idx);
+
+        let flags = if task_idx == TASK0_INDEX {
+            PageFlags::PRESENT | PageFlags::WRITABLE
+        } else {
+            PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER
+        };
+
+        // Unmap を封じて、毎回 Map を出す（2回目で AlreadyMapped を引く）
+        let mem_action = {
+            logging::info("mem_demo: issuing Map (evil double-map test)");
+
+            let frame = match self.get_or_alloc_demo_frame(task_idx) {
+                Some(f) => f,
+                None => {
+                    logging::error("mem_demo: no more usable frames");
+                    self.should_halt = true;
+                    return;
+                }
+            };
+
+            MemAction::Map { page, frame, flags }
+        };
+
+        let as_idx = task.address_space_id.0;
+        let aspace = &mut self.address_spaces[as_idx];
+
+        // ここで2回目は AlreadyMapped になり、panic で止まるのが正しい
+        match aspace.apply(mem_action) {
+            Ok(()) => {
+                logging::info("address_space.apply: OK");
+            }
+            Err(e) => {
+                logging::error("address_space.apply: ERROR");
+                match e {
+                    AddressSpaceError::AlreadyMapped => logging::info("reason = AlreadyMapped"),
+                    AddressSpaceError::NotMapped => logging::info("reason = NotMapped"),
+                    AddressSpaceError::CapacityExceeded => logging::info("reason = CapacityExceeded"),
+                }
+                panic!("AddressSpace.apply failed in evil double-map test");
+            }
+        }
+
+        // ※ここまで来るのは 1回目だけ。2回目は上で panic するはず。
+        if task_idx == TASK0_INDEX {
+            logging::info("mem_demo: applying arch paging (Task0 / current CR3)");
+            let r = unsafe { arch::paging::apply_mem_action(mem_action, &mut self.phys_mem) };
+            if r.is_err() {
+                panic!("arch paging apply failed in evil test");
+            }
+        } else {
+            let root = aspace.root_page_frame.expect("user root_page_frame must exist");
+            logging::info("mem_demo: applying arch paging (User root / no CR3 switch)");
+            let r = unsafe { arch::paging::apply_mem_action_in_root(mem_action, root, &mut self.phys_mem) };
+            if r.is_err() {
+                panic!("arch paging apply failed in evil test");
+            }
+        }
+    }
 
     pub fn tick(&mut self) {
         if self.should_halt {
