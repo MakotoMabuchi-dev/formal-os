@@ -14,6 +14,7 @@
 // 設計方針:
 // - 壊れていたら早めに panic（fail-stop）
 // - “推測” ではなく “観測(実行コンテキスト)” に寄せて事故率を下げる
+// - ★B対応: map/unmap の失敗を Result として返し、上位で fail-stop できるようにする
 
 use bootloader::BootInfo;
 use bootloader::bootinfo::MemoryRegionType;
@@ -65,6 +66,13 @@ static GUARD_STACK_HIGH_VIRT: AtomicU64 = AtomicU64::new(0);
 
 // alias copy count（install 時に確定）
 static ALIAS_COPY_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// ★B対応: arch paging の適用が失敗したことを上位へ返す
+#[derive(Debug, Clone, Copy)]
+pub enum PagingApplyError {
+    MapFailed,
+    UnmapFailed,
+}
 
 #[inline]
 fn is_user_space_addr(v: VirtAddr) -> bool {
@@ -178,6 +186,7 @@ unsafe impl<'a> FrameAllocator<Size4KiB> for KernelFrameAllocator<'a> {
     }
 }
 
+/// CR3 切替 guard の設定（low の code/stack を基準に phys を確定させる）
 pub fn configure_cr3_switch_safety(code_addr: u64, stack_addr: u64) {
     logging::info("arch::paging::configure_cr3_switch_safety");
     logging::info_u64("code_addr", code_addr);
@@ -217,6 +226,7 @@ pub fn configure_cr3_switch_safety(code_addr: u64, stack_addr: u64) {
     }
 }
 
+/// high-alias 範囲判定（install 時に確定した copy_count を使う）
 fn is_in_kernel_high_alias_region(addr: u64) -> bool {
     let idx = virt_layout::pml4_index(addr);
     let dst_base = virt_layout::KERNEL_ALIAS_DST_PML4_BASE_INDEX;
@@ -228,6 +238,7 @@ fn is_in_kernel_high_alias_region(addr: u64) -> bool {
     idx >= dst_base && idx < (dst_base + cnt)
 }
 
+/// Step1/2: kernel の low-half mapping を high-half に alias として貼る（copy_count自動化）
 pub fn install_kernel_high_alias_from_current() {
     if !ENABLE_REAL_PAGING {
         logging::info("arch::paging::install_kernel_high_alias_from_current: skipped (real paging disabled)");
@@ -357,23 +368,28 @@ fn run_kernel_high_alias_exec_test() {
     logging::info_u64("high_fn_addr", high_addr);
 }
 
-pub unsafe fn apply_mem_action(action: MemAction, phys_mem: &mut PhysicalMemoryManager) {
-    apply_mem_action_with_mapper(action, None, phys_mem);
+// ---- map/unmap / translate / CR3 switch / user pml4 ----
+
+pub unsafe fn apply_mem_action(
+    action: MemAction,
+    phys_mem: &mut PhysicalMemoryManager,
+) -> Result<(), PagingApplyError> {
+    apply_mem_action_with_mapper(action, None, phys_mem)
 }
 
 pub unsafe fn apply_mem_action_in_root(
     action: MemAction,
     root: MyPhysFrame,
     phys_mem: &mut PhysicalMemoryManager,
-) {
-    apply_mem_action_with_mapper(action, Some(root), phys_mem);
+) -> Result<(), PagingApplyError> {
+    apply_mem_action_with_mapper(action, Some(root), phys_mem)
 }
 
 unsafe fn apply_mem_action_with_mapper(
     action: MemAction,
     root: Option<MyPhysFrame>,
     phys_mem: &mut PhysicalMemoryManager,
-) {
+) -> Result<(), PagingApplyError> {
     match action {
         MemAction::Map { page, frame, flags } => {
             logging::info("arch::paging::apply_mem_action: Map");
@@ -428,13 +444,17 @@ unsafe fn apply_mem_action_with_mapper(
                                 logging::error("mem_test: MISMATCH!");
                             }
                         }
+                        return Ok(());
                     }
                     Err(e) => {
                         logging::error("map_to: ERROR");
                         log_map_to_error(e);
+                        return Err(PagingApplyError::MapFailed);
                     }
                 }
             }
+
+            Ok(())
         }
 
         MemAction::Unmap { page } => {
@@ -461,13 +481,17 @@ unsafe fn apply_mem_action_with_mapper(
                     Ok((_f, flush)) => {
                         flush.flush();
                         logging::info("unmap: OK (flush done)");
+                        return Ok(());
                     }
                     Err(e) => {
                         logging::error("unmap: ERROR");
                         log_unmap_error(e);
+                        return Err(PagingApplyError::UnmapFailed);
                     }
                 }
             }
+
+            Ok(())
         }
     }
 }
@@ -578,7 +602,7 @@ pub fn switch_address_space(root: Option<MyPhysFrame>) {
             let phys = PhysAddr::new(frame.start_address().0);
             let x86_frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(phys);
 
-            // ---- B: CR3 flags を empty にせず「現在の flags を引き継ぐ」 ----
+            // flags は引き継ぐ（すでに適用済みの B）
             let (_cur_frame, cur_flags) = Cr3::read();
             unsafe { Cr3::write(x86_frame, cur_flags); }
 

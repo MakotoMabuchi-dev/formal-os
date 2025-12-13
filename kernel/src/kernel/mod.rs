@@ -762,45 +762,58 @@ impl KernelState {
         let as_idx = task.address_space_id.0;
         let aspace = &mut self.address_spaces[as_idx];
 
-        match aspace.apply(mem_action) {
-            Ok(()) => {
-                logging::info("address_space.apply: OK");
-                self.mem_demo_mapped[task_idx] = !self.mem_demo_mapped[task_idx];
-
-                if task_idx == TASK0_INDEX {
-                    logging::info("mem_demo: applying arch paging (Task0 / current CR3)");
-                    unsafe {
-                        arch::paging::apply_mem_action(mem_action, &mut self.phys_mem);
-                    }
-                } else {
-                    let root = match aspace.root_page_frame {
-                        Some(r) => r,
-                        None => {
-                            logging::error("mem_demo: user root_page_frame is None (unexpected)");
-                            return;
-                        }
-                    };
-
-                    logging::info("mem_demo: applying arch paging (User root / no CR3 switch)");
-                    unsafe {
-                        arch::paging::apply_mem_action_in_root(mem_action, root, &mut self.phys_mem);
-                    }
-
-                    let virt_addr_u64 = arch::paging::USER_SPACE_BASE + page.start_address().0;
-                    arch::paging::debug_translate_in_root(root, virt_addr_u64);
-                }
-
-                self.push_event(LogEvent::MemActionApplied {
-                    task: task_id,
-                    address_space: task.address_space_id,
-                    action: mem_action,
-                });
+        // (1) まず論理側の apply が成功することを要求
+        //     ここが失敗するのは KernelState 側のバグなので、fail-stop にして不整合を残さない。
+        if let Err(e) = aspace.apply(mem_action) {
+            logging::error("address_space.apply: FAILED (inconsistent state)");
+            match e {
+                AddressSpaceError::AlreadyMapped => logging::info("reason = AlreadyMapped"),
+                AddressSpaceError::NotMapped => logging::info("reason = NotMapped"),
+                AddressSpaceError::CapacityExceeded => logging::info("reason = CapacityExceeded"),
             }
-            Err(AddressSpaceError::AlreadyMapped) => logging::info("address_space.apply: AlreadyMapped"),
-            Err(AddressSpaceError::NotMapped) => logging::info("address_space.apply: NotMapped"),
-            Err(AddressSpaceError::CapacityExceeded) => logging::info("address_space.apply: CapacityExceeded"),
+            panic!("address_space.apply failed; abort to keep state consistent");
         }
+
+        // (2) 次に arch 側の適用。失敗したら fail-stop。
+        //     ここで止めれば「論理は進んだが実機は進んでない」状態で走り続けない。
+        let arch_result = if task_idx == TASK0_INDEX {
+            logging::info("mem_demo: applying arch paging (Task0 / current CR3)");
+            unsafe { arch::paging::apply_mem_action(mem_action, &mut self.phys_mem) }
+        } else {
+            let root = match aspace.root_page_frame {
+                Some(r) => r,
+                None => {
+                    logging::error("mem_demo: user root_page_frame is None (unexpected)");
+                    panic!("user root_page_frame is None");
+                }
+            };
+
+            logging::info("mem_demo: applying arch paging (User root / no CR3 switch)");
+            unsafe { arch::paging::apply_mem_action_in_root(mem_action, root, &mut self.phys_mem) }
+        };
+
+        if arch_result.is_err() {
+            logging::error("mem_demo: arch paging apply FAILED; abort (fail-stop)");
+            panic!("arch paging apply failed; abort to keep state consistent");
+        }
+
+        // (3) ここまで来たら「論理」と「実機」が一致したとみなせるので、状態を進める
+        self.mem_demo_mapped[task_idx] = !self.mem_demo_mapped[task_idx];
+
+        // user の場合は translate を追加で観測
+        if task_idx != TASK0_INDEX {
+            let root = aspace.root_page_frame.expect("root_page_frame must exist");
+            let virt_addr_u64 = arch::paging::USER_SPACE_BASE + page.start_address().0;
+            arch::paging::debug_translate_in_root(root, virt_addr_u64);
+        }
+
+        self.push_event(LogEvent::MemActionApplied {
+            task: task_id,
+            address_space: task.address_space_id,
+            action: mem_action,
+        });
     }
+
 
     pub fn tick(&mut self) {
         if self.should_halt {
