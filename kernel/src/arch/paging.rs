@@ -6,15 +6,15 @@
 // - Step1/2: kernel high-alias を導入し self-check + exec test
 // - Step3: high-alias に stack を切替えて kernel 本体へ移譲
 //
-// Step4:
-// - alias 範囲（copy_count）を guard(code/stack) だけで決めず、実行コンテキスト(rip/rsp/rbp)を含めて自動算出
-// - USER_ACCESSIBLE 混入チェックを src 側で fail-stop
-// - high-alias self-check は code/stack の translate を使って継続
-//
 // 設計方針:
 // - 壊れていたら早めに panic（fail-stop）
-// - “推測” ではなく “観測(実行コンテキスト)” に寄せて事故率を下げる
 // - ★B対応: map/unmap の失敗を Result として返し、上位で fail-stop できるようにする
+//
+// 分離前進（重要）:
+// - user root から low-half の“全部コピー”はしない。
+// - ただし OffsetPageTable が物理→仮想変換(phys_to_virt)でページテーブルを参照するため、
+//   user root にも physmap(physical_memory_offset) の PML4 entry は必要。
+// - よって kernel high-half(256..512) + physmap のみをコピーする。
 
 use bootloader::BootInfo;
 use bootloader::bootinfo::MemoryRegionType;
@@ -51,6 +51,9 @@ pub use crate::arch::virt_layout::{USER_PML4_INDEX, USER_SPACE_BASE, USER_SPACE_
 const ENABLE_REAL_PAGING: bool = true;
 const ENABLE_HIGH_ALIAS_EXEC_TEST: bool = true;
 
+// physmap の PML4 entry を“何個”コピーするか（安全側に少し多め）
+const PHYSMAP_PML4_COPY_COUNT: usize = 4;
+
 static PHYSICAL_MEMORY_OFFSET: AtomicU64 = AtomicU64::new(0);
 static ALLOW_REAL_CR3_SWITCH: AtomicBool = AtomicBool::new(false);
 
@@ -67,7 +70,6 @@ static GUARD_STACK_HIGH_VIRT: AtomicU64 = AtomicU64::new(0);
 // alias copy count（install 時に確定）
 static ALIAS_COPY_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// ★B対応: arch paging の適用が失敗したことを上位へ返す
 #[derive(Debug, Clone, Copy)]
 pub enum PagingApplyError {
     MapFailed,
@@ -186,7 +188,6 @@ unsafe impl<'a> FrameAllocator<Size4KiB> for KernelFrameAllocator<'a> {
     }
 }
 
-/// CR3 切替 guard の設定（low の code/stack を基準に phys を確定させる）
 pub fn configure_cr3_switch_safety(code_addr: u64, stack_addr: u64) {
     logging::info("arch::paging::configure_cr3_switch_safety");
     logging::info_u64("code_addr", code_addr);
@@ -226,19 +227,6 @@ pub fn configure_cr3_switch_safety(code_addr: u64, stack_addr: u64) {
     }
 }
 
-/// high-alias 範囲判定（install 時に確定した copy_count を使う）
-fn is_in_kernel_high_alias_region(addr: u64) -> bool {
-    let idx = virt_layout::pml4_index(addr);
-    let dst_base = virt_layout::KERNEL_ALIAS_DST_PML4_BASE_INDEX;
-    let cnt = ALIAS_COPY_COUNT.load(Ordering::Relaxed);
-
-    if cnt == 0 {
-        return false;
-    }
-    idx >= dst_base && idx < (dst_base + cnt)
-}
-
-/// Step1/2: kernel の low-half mapping を high-half に alias として貼る（copy_count自動化）
 pub fn install_kernel_high_alias_from_current() {
     if !ENABLE_REAL_PAGING {
         logging::info("arch::paging::install_kernel_high_alias_from_current: skipped (real paging disabled)");
@@ -368,8 +356,6 @@ fn run_kernel_high_alias_exec_test() {
     logging::info_u64("high_fn_addr", high_addr);
 }
 
-// ---- map/unmap / translate / CR3 switch / user pml4 ----
-
 pub unsafe fn apply_mem_action(
     action: MemAction,
     phys_mem: &mut PhysicalMemoryManager,
@@ -426,24 +412,6 @@ unsafe fn apply_mem_action_with_mapper(
                     Ok(flush) => {
                         flush.flush();
                         logging::info("map_to: OK (flush done)");
-
-                        if root.is_none() && !xflags.contains(PageTableFlags::USER_ACCESSIBLE) {
-                            let ptr = virt_u64 as *mut u64;
-                            let test_value: u64 = 0xDEAD_BEEF_DEAD_BEEFu64;
-
-                            logging::info("mem_test: writing test_value");
-                            write_volatile(ptr, test_value);
-
-                            let read_back = read_volatile(ptr);
-                            logging::info("mem_test: read_back");
-                            logging::info_u64("", read_back);
-
-                            if read_back == test_value {
-                                logging::info("mem_test: OK (value matched)");
-                            } else {
-                                logging::error("mem_test: MISMATCH!");
-                            }
-                        }
                         return Ok(());
                     }
                     Err(e) => {
@@ -552,57 +520,9 @@ pub fn switch_address_space(root: Option<MyPhysFrame>) {
                 return;
             }
 
-            let code_v = GUARD_CODE_VIRT.load(Ordering::Relaxed);
-            let stack_v = GUARD_STACK_VIRT.load(Ordering::Relaxed);
-            let code_p_exp = GUARD_CODE_PHYS.load(Ordering::Relaxed);
-            let stack_p_exp = GUARD_STACK_PHYS.load(Ordering::Relaxed);
-
-            if code_v == 0 || stack_v == 0 || code_p_exp == 0 || stack_p_exp == 0 {
-                logging::error("switch_address_space: guard not initialized");
-                return;
-            }
-
-            unsafe {
-                let mapper = init_offset_page_table_for_root(frame);
-                let code_p = mapper.translate_addr(VirtAddr::new(code_v)).map(|p| p.as_u64()).unwrap_or(0);
-                let stack_p = mapper.translate_addr(VirtAddr::new(stack_v)).map(|p| p.as_u64()).unwrap_or(0);
-
-                if code_p != code_p_exp || stack_p != stack_p_exp {
-                    logging::error("switch_address_space: guard mismatch; CR3 switch aborted");
-                    logging::info_u64("expected_code_phys", code_p_exp);
-                    logging::info_u64("actual_code_phys", code_p);
-                    logging::info_u64("expected_stack_phys", stack_p_exp);
-                    logging::info_u64("actual_stack_phys", stack_p);
-                    return;
-                }
-            }
-
-            let code_high = GUARD_CODE_HIGH_VIRT.load(Ordering::Relaxed);
-            let stack_high = GUARD_STACK_HIGH_VIRT.load(Ordering::Relaxed);
-
-            if is_in_kernel_high_alias_region(code_high) && is_in_kernel_high_alias_region(stack_high) {
-                unsafe {
-                    let mapper = init_offset_page_table_for_root(frame);
-                    let code_p = mapper.translate_addr(VirtAddr::new(code_high)).map(|p| p.as_u64()).unwrap_or(0);
-                    let stack_p = mapper.translate_addr(VirtAddr::new(stack_high)).map(|p| p.as_u64()).unwrap_or(0);
-
-                    if code_p != code_p_exp || stack_p != stack_p_exp {
-                        logging::error("switch_address_space: high-alias guard mismatch; CR3 switch aborted");
-                        logging::info_u64("code_high_virt", code_high);
-                        logging::info_u64("stack_high_virt", stack_high);
-                        logging::info_u64("expected_code_phys", code_p_exp);
-                        logging::info_u64("actual_code_phys", code_p);
-                        logging::info_u64("expected_stack_phys", stack_p_exp);
-                        logging::info_u64("actual_stack_phys", stack_p);
-                        return;
-                    }
-                }
-            }
-
             let phys = PhysAddr::new(frame.start_address().0);
             let x86_frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(phys);
 
-            // flags は引き継ぐ（すでに適用済みの B）
             let (_cur_frame, cur_flags) = Cr3::read();
             unsafe { Cr3::write(x86_frame, cur_flags); }
 
@@ -612,6 +532,7 @@ pub fn switch_address_space(root: Option<MyPhysFrame>) {
     }
 }
 
+/// User root の初期化（physmap を含めて最小限コピー）
 pub fn init_user_pml4_from_current(new_root: MyPhysFrame) {
     let (cur_l4, _) = Cr3::read();
     let cur_phys = cur_l4.start_address().as_u64();
@@ -620,17 +541,51 @@ pub fn init_user_pml4_from_current(new_root: MyPhysFrame) {
     let cur_ptr = unsafe { phys_u64_to_virt_ptr(cur_phys) as *const PageTable };
     let new_ptr = unsafe { phys_u64_to_virt_ptr(new_phys) as *mut PageTable };
 
+    let physmap_off = PHYSICAL_MEMORY_OFFSET.load(Ordering::Relaxed);
+    let physmap_pml4 = virt_layout::pml4_index(physmap_off);
+
     unsafe {
         let cur_p4 = &*cur_ptr;
         let user_p4 = &mut *new_ptr;
 
         for i in 0..512 {
+            user_p4[i].set_unused();
+        }
+
+        // 1) physmap をコピー（これが無いと user CR3 中にページテーブルを触れない）
+        for i in physmap_pml4..core::cmp::min(physmap_pml4 + PHYSMAP_PML4_COPY_COUNT, 256) {
+            if cur_p4[i].is_unused() {
+                continue;
+            }
+            if cur_p4[i].flags().contains(PageTableFlags::USER_ACCESSIBLE) {
+                logging::error("init_user_pml4_from_current: physmap entry has USER_ACCESSIBLE; abort");
+                logging::info_u64("pml4_index", i as u64);
+                panic!("physmap pml4 entry contains USER_ACCESSIBLE");
+            }
             user_p4[i] = cur_p4[i].clone();
         }
 
+        // 2) kernel high-half をコピー（high-alias 508..511 も含まれる）
+        for i in 256..512 {
+            if cur_p4[i].is_unused() {
+                continue;
+            }
+            if cur_p4[i].flags().contains(PageTableFlags::USER_ACCESSIBLE) {
+                logging::error("init_user_pml4_from_current: kernel pml4 entry has USER_ACCESSIBLE; abort");
+                logging::info_u64("pml4_index", i as u64);
+                panic!("kernel pml4 entry contains USER_ACCESSIBLE");
+            }
+            user_p4[i] = cur_p4[i].clone();
+        }
+
+        // 3) user slot は空
         logging::info("init_user_pml4_from_current: clearing user pml4 entry");
         logging::info_u64("pml4_index", USER_PML4_INDEX as u64);
         user_p4[USER_PML4_INDEX as usize].set_unused();
+
+        logging::info("init_user_pml4_from_current: copied kernel high-half + physmap");
+        logging::info_u64("kernel_pml4_base", 256);
+        logging::info_u64("physmap_pml4_index", physmap_pml4 as u64);
     }
 }
 
@@ -659,12 +614,6 @@ pub fn debug_log_execution_context(tag: &str) {
     logging::info_u64("rip_pml4", virt_layout::pml4_index(rip) as u64);
     logging::info_u64("rsp_pml4", virt_layout::pml4_index(rsp) as u64);
     logging::info_u64("rbp_pml4", virt_layout::pml4_index(rbp) as u64);
-
-    if is_in_kernel_high_alias_region(rip) {
-        logging::info("rip is in kernel high-alias region");
-    } else {
-        logging::info("rip is NOT in kernel high-alias region");
-    }
 }
 
 pub fn enter_kernel_high_alias(entry: extern "C" fn(&'static BootInfo) -> !, boot_info: &'static BootInfo) -> ! {

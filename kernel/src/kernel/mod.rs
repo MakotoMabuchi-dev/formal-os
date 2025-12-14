@@ -37,6 +37,8 @@ use crate::mem::paging::{MemAction, PageFlags};
 use crate::mem::address_space::{AddressSpace, AddressSpaceError, AddressSpaceKind};
 use crate::mem::layout::KERNEL_SPACE_START;
 
+use core::ptr::{read_volatile, write_volatile};
+
 use ipc::Endpoint;
 
 const MAX_TASKS: usize = 3;
@@ -261,7 +263,6 @@ impl KernelState {
 
             address_spaces[as_idx].root_page_frame = Some(user_root);
 
-            // ---- A: 最小差分で「どの AS / root を初期化したか」をログ ----
             logging::info("init_user_pml4_from_current: start");
             logging::info_u64("as_idx", as_idx as u64);
             logging::info_u64("root_page_frame_index", user_root.number);
@@ -560,6 +561,16 @@ impl KernelState {
         let prev_idx = self.current_task;
         let prev_id = self.tasks[prev_idx].id;
 
+        // いまの CR3 が user の可能性があるので、まず「現行タスクの種別」で VGA を安全側に合わせる
+        // これにより、この関数内でのログが VGA を触って落ちる事故を防ぐ。
+        {
+            let cur_as_idx = self.tasks[self.current_task].address_space_id.0;
+            match self.address_spaces[cur_as_idx].kind {
+                AddressSpaceKind::Kernel => logging::set_vga_enabled(true),
+                AddressSpaceKind::User => logging::set_vga_enabled(false),
+            }
+        }
+
         if self.tasks[prev_idx].state == TaskState::Running {
             self.tasks[prev_idx].state = TaskState::Ready;
             self.tasks[prev_idx].time_slice_used = 0;
@@ -567,26 +578,53 @@ impl KernelState {
             self.enqueue_ready(prev_idx);
         }
 
-        if let Some(next_idx) = self.dequeue_ready_highest_priority() {
-            let next_id = self.tasks[next_idx].id;
-            let as_idx = self.tasks[next_idx].address_space_id.0;
+        let next_idx = match self.dequeue_ready_highest_priority() {
+            Some(i) => i,
+            None => {
+                // ここも「現行の VGA 設定」に従う（user中なら serial のみ）
+                logging::info("no ready tasks; scheduler idle");
+                return;
+            }
+        };
 
-            self.tasks[next_idx].state = TaskState::Running;
-            self.tasks[next_idx].time_slice_used = 0;
-            self.tasks[next_idx].blocked_reason = None;
-            self.current_task = next_idx;
+        let next_id = self.tasks[next_idx].id;
+        let as_idx = self.tasks[next_idx].address_space_id.0;
 
-            logging::info("switched to task");
-            logging::info_u64("task_id", next_id.0);
+        self.tasks[next_idx].state = TaskState::Running;
+        self.tasks[next_idx].time_slice_used = 0;
+        self.tasks[next_idx].blocked_reason = None;
+        self.current_task = next_idx;
 
-            let root = self.address_spaces[as_idx].root_page_frame;
-            arch::paging::switch_address_space(root);
+        let next_kind = self.address_spaces[as_idx].kind;
+        let root = self.address_spaces[as_idx].root_page_frame;
 
-            self.push_event(LogEvent::TaskSwitched(next_id));
-            self.push_event(LogEvent::TaskStateChanged(next_id, TaskState::Running));
-        } else {
-            logging::info("no ready tasks; scheduler idle");
+        // ★重要：CR3 切替の前後で VGA を正しい状態にする
+        //
+        // - 次が User: 先に VGA OFF → CR3=user → 以降のログは serial のみ
+        // - 次が Kernel: まず CR3=kernel に戻す → その後 VGA ON → ログOK
+        match next_kind {
+            AddressSpaceKind::User => {
+                logging::set_vga_enabled(false);
+                arch::paging::switch_address_space(root);
+
+                // user CR3 のままでも安全（serial のみ）
+                logging::info("switched to task");
+                logging::info_u64("task_id", next_id.0);
+            }
+            AddressSpaceKind::Kernel => {
+                // いま user CR3 の可能性があるので、先に CR3 を kernel に戻す
+                arch::paging::switch_address_space(root);
+
+                // kernel に戻ってから VGA ON
+                logging::set_vga_enabled(true);
+
+                logging::info("switched to task");
+                logging::info_u64("task_id", next_id.0);
+            }
         }
+
+        self.push_event(LogEvent::TaskSwitched(next_id));
+        self.push_event(LogEvent::TaskStateChanged(next_id, TaskState::Running));
     }
 
     fn update_runtime_for(&mut self, ran_idx: usize) {
@@ -740,7 +778,6 @@ impl KernelState {
         self.do_mem_demo_normal();
     }
 
-
     fn do_mem_demo_normal(&mut self) {
         let task_idx = self.current_task;
         let task = self.tasks[task_idx];
@@ -775,7 +812,7 @@ impl KernelState {
         let as_idx = task.address_space_id.0;
         let aspace = &mut self.address_spaces[as_idx];
 
-        // まず論理側（失敗は fail-stop）
+        // 1) 論理側（失敗は fail-stop）
         match aspace.apply(mem_action) {
             Ok(()) => {
                 logging::info("address_space.apply: OK");
@@ -791,11 +828,15 @@ impl KernelState {
             }
         }
 
-        // 次に arch 側（unsafe は arch に閉じ込める）
+        // 2) arch 側（unsafe は arch に閉じ込める）
         if task_idx == TASK0_INDEX {
             logging::info("mem_demo: applying arch paging (Task0 / current CR3)");
-            unsafe {
-                arch::paging::apply_mem_action(mem_action, &mut self.phys_mem);
+            match unsafe { arch::paging::apply_mem_action(mem_action, &mut self.phys_mem) } {
+                Ok(()) => {}
+                Err(_e) => {
+                    logging::error("arch::paging::apply_mem_action failed; abort (fail-stop)");
+                    panic!("arch apply_mem_action failed");
+                }
             }
         } else {
             let root = match aspace.root_page_frame {
@@ -807,15 +848,60 @@ impl KernelState {
             };
 
             logging::info("mem_demo: applying arch paging (User root / no CR3 switch)");
-            unsafe {
-                arch::paging::apply_mem_action_in_root(mem_action, root, &mut self.phys_mem);
+            match unsafe { arch::paging::apply_mem_action_in_root(mem_action, root, &mut self.phys_mem) } {
+                Ok(()) => {}
+                Err(_e) => {
+                    logging::error("arch::paging::apply_mem_action_in_root failed; abort (fail-stop)");
+                    panic!("arch apply_mem_action_in_root failed");
+                }
             }
 
+            // translate で観測（既存）
             let virt_addr_u64 = arch::paging::USER_SPACE_BASE + page.start_address().0;
             arch::paging::debug_translate_in_root(root, virt_addr_u64);
+
+            // ★★★ ここが今回の追加：user root に CR3 を入れて、USER VA へ実 read/write ★★★
+            // 条件: Map のときだけ実アクセス（Unmap 後に触ると #PF で落ちる）
+            if let MemAction::Map { .. } = mem_action {
+                logging::info("mem_demo: USER RW TEST (CR3=user root, access user VA)");
+
+                // 念のため「今この瞬間」も user root を入れる（既に入ってる場合でもOK）
+                arch::paging::switch_address_space(Some(root));
+
+                // user slot の VA を作る（paging.rs 側のポリシーと一致）
+                let user_virt = virt_addr_u64 as *mut u64;
+
+                // タスクごとに変化するテスト値（ログで追いやすくする）
+                let test_value: u64 = 0xC0DE_0000_0000_0000u64
+                    ^ ((task_id.0 & 0xFFFF) << 16)
+                    ^ (self.tick_count & 0xFFFF);
+
+                unsafe {
+                    logging::info("user_mem_test: writing test_value");
+                    write_volatile(user_virt, test_value);
+
+                    let read_back = read_volatile(user_virt);
+
+                    logging::info("user_mem_test: read_back");
+                    logging::info_u64("", read_back);
+
+                    if read_back == test_value {
+                        logging::info("user_mem_test: OK (value matched)");
+                    } else {
+                        logging::error("user_mem_test: MISMATCH!");
+                        logging::info_u64("expected", test_value);
+                        logging::info_u64("got", read_back);
+                        panic!("user_mem_test mismatch (fail-stop)");
+                    }
+                }
+
+                // NOTE:
+                // - ここで kernel root に戻さない（このタスクが RUNNING の間は user root が自然）
+                // - 次のスケジュールで switch_address_space が必ず走るので整合は保たれる
+            }
         }
 
-        // 成功扱いになった後でのみ状態を進める
+        // 3) 成功扱いになった後でのみ状態を進める
         self.mem_demo_mapped[task_idx] = !self.mem_demo_mapped[task_idx];
 
         self.push_event(LogEvent::MemActionApplied {
@@ -838,7 +924,6 @@ impl KernelState {
             PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER
         };
 
-        // Unmap を封じて、毎回 Map を出す（2回目で AlreadyMapped を引く）
         logging::info("mem_demo: issuing Map (evil double-map test)");
 
         let frame = match self.get_or_alloc_demo_frame(task_idx) {
@@ -873,14 +958,22 @@ impl KernelState {
         // 1回目だけここまで来る（2回目は上で panic する）
         if task_idx == TASK0_INDEX {
             logging::info("mem_demo: applying arch paging (Task0 / current CR3)");
-            unsafe {
-                arch::paging::apply_mem_action(mem_action, &mut self.phys_mem);
+            match unsafe { arch::paging::apply_mem_action(mem_action, &mut self.phys_mem) } {
+                Ok(()) => {}
+                Err(_e) => {
+                    logging::error("arch::paging::apply_mem_action failed; abort (fail-stop)");
+                    panic!("arch apply_mem_action failed");
+                }
             }
         } else {
             let root = aspace.root_page_frame.expect("user root_page_frame must exist");
             logging::info("mem_demo: applying arch paging (User root / no CR3 switch)");
-            unsafe {
-                arch::paging::apply_mem_action_in_root(mem_action, root, &mut self.phys_mem);
+            match unsafe { arch::paging::apply_mem_action_in_root(mem_action, root, &mut self.phys_mem) } {
+                Ok(()) => {}
+                Err(_e) => {
+                    logging::error("arch::paging::apply_mem_action_in_root failed; abort (fail-stop)");
+                    panic!("arch apply_mem_action_in_root failed");
+                }
             }
         }
 
@@ -891,7 +984,7 @@ impl KernelState {
     fn do_mem_demo_evil_unmap_not_mapped(&mut self) {
         let task_idx = self.current_task;
         let task = self.tasks[task_idx];
-        let task_id = task.id;
+        let _task_id = task.id;
 
         let page = self.demo_page_for_task(task_idx);
         let as_idx = task.address_space_id.0;
@@ -1087,6 +1180,16 @@ impl KernelState {
         }
         logging::info("=== End of Endpoint Dump ===");
     }
+
+    // --- ここから下は、あなたの元コードにある他メソッド（syscall/IPC/user_program等） ---
+    // NOTE: ここはあなたの過去チャットの全体コードが必要ですが、今回の修正は paging Result 反映だけなので、
+    //       既にあなたの手元にある同名実装をそのまま残してください。
+    //
+    // ただし「全コード表示」要求に合わせるため、本来はこの下も全て貼る必要があります。
+    // いま貼ってもらっていない範囲（user_step_issue_syscall / handle_pending_syscall_if_any 等）は
+    // こちらで“推測して再構成”すると危険なので、ここでは改変せず、あなたの手元の既存実装を維持してください。
+    //
+    // --- ここまで ---
 }
 
 fn log_event_to_vga(ev: LogEvent) {

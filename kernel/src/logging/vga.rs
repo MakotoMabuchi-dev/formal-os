@@ -10,6 +10,10 @@
 // - spin::Mutex は割り込み再入でデッドロックしうるため、
 //   ロック取得～書き込みを interrupts::without_interrupts で囲む。
 // - prefix と本体を別々に出すと混ざるので、できるだけ 1 回のロックでまとめる。
+//
+// Step（分離前進）:
+// - user CR3 の間は VGA(0xb8000) が未マップになり得る。
+// - logging::is_vga_enabled() が false のときは VGA 出力をスキップし、serial のみにする。
 
 use core::fmt::{self, Write};
 use spin::Mutex;
@@ -110,6 +114,10 @@ pub fn init() {
 
 /// 文字列を出す（改行なし）
 pub fn write_str(s: &str) {
+    if !crate::logging::is_vga_enabled() {
+        return;
+    }
+
     interrupts::without_interrupts(|| {
         if let Some(ref mut w) = *WRITER.lock() {
             let _ = w.write_str(s);
@@ -119,6 +127,10 @@ pub fn write_str(s: &str) {
 
 /// 文字列＋改行
 pub fn write_line(s: &str) {
+    if !crate::logging::is_vga_enabled() {
+        return;
+    }
+
     interrupts::without_interrupts(|| {
         if let Some(ref mut w) = *WRITER.lock() {
             let _ = w.write_str(s);
@@ -129,6 +141,10 @@ pub fn write_line(s: &str) {
 
 /// prefix + msg を 1 回のロックで書いて改行
 pub fn write_prefixed_line(prefix: &str, msg: &str) {
+    if !crate::logging::is_vga_enabled() {
+        return;
+    }
+
     interrupts::without_interrupts(|| {
         if let Some(ref mut w) = *WRITER.lock() {
             let _ = w.write_str(prefix);
