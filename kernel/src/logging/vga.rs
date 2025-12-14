@@ -9,11 +9,6 @@
 // C対応:
 // - spin::Mutex は割り込み再入でデッドロックしうるため、
 //   ロック取得～書き込みを interrupts::without_interrupts で囲む。
-// - prefix と本体を別々に出すと混ざるので、できるだけ 1 回のロックでまとめる。
-//
-// Step（分離前進）:
-// - user CR3 の間は VGA(0xb8000) が未マップになり得る。
-// - logging::is_vga_enabled() が false のときは VGA 出力をスキップし、serial のみにする。
 
 use core::fmt::{self, Write};
 use spin::Mutex;

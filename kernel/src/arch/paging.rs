@@ -15,11 +15,15 @@
 // - ただし OffsetPageTable が物理→仮想変換(phys_to_virt)でページテーブルを参照するため、
 //   user root にも physmap(physical_memory_offset) の PML4 entry は必要。
 // - よって kernel high-half(256..512) + physmap のみをコピーする。
+//
+// ★追加（今回の修正）:
+// - 例外配送（IDT base / handler / IST stack / TSS）が high-alias window (PML4=508..511)
+//   に依存するようになったため、user root にも “必ず” high-alias window をコピーする。
 
 use bootloader::BootInfo;
 use bootloader::bootinfo::MemoryRegionType;
 
-use core::ptr::{read_volatile, write_volatile};
+use core::cmp::min;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use x86_64::{
@@ -397,7 +401,8 @@ unsafe fn apply_mem_action_with_mapper(
             logging::info_u64("flags_bits", xflags.bits() as u64);
 
             let page4k: Page<Size4KiB> = Page::containing_address(virt);
-            let frame4k: PhysFrame<Size4KiB> = PhysFrame::containing_address(PhysAddr::new(phys_u64));
+            let frame4k: PhysFrame<Size4KiB> =
+                PhysFrame::containing_address(PhysAddr::new(phys_u64));
 
             if ENABLE_REAL_PAGING {
                 logging::info("REAL PAGING: map_to() will be executed");
@@ -435,7 +440,8 @@ unsafe fn apply_mem_action_with_mapper(
 
             logging::info_u64("virt_addr", virt_u64);
 
-            let page4k: Page<Size4KiB> = Page::containing_address(VirtAddr::new(virt_u64));
+            let page4k: Page<Size4KiB> =
+                Page::containing_address(VirtAddr::new(virt_u64));
 
             if ENABLE_REAL_PAGING {
                 logging::info("REAL PAGING: unmap() will be executed");
@@ -544,6 +550,13 @@ pub fn init_user_pml4_from_current(new_root: MyPhysFrame) {
     let physmap_off = PHYSICAL_MEMORY_OFFSET.load(Ordering::Relaxed);
     let physmap_pml4 = virt_layout::pml4_index(physmap_off);
 
+    // ★今回の本命: high-alias window を user root にも必ず入れる
+    let alias_base = virt_layout::KERNEL_ALIAS_DST_PML4_BASE_INDEX;
+    let alias_cnt = {
+        let n = ALIAS_COPY_COUNT.load(Ordering::Relaxed);
+        if n == 0 { virt_layout::KERNEL_ALIAS_MAX_COPY_COUNT } else { min(n, virt_layout::KERNEL_ALIAS_MAX_COPY_COUNT) }
+    };
+
     unsafe {
         let cur_p4 = &*cur_ptr;
         let user_p4 = &mut *new_ptr;
@@ -553,7 +566,7 @@ pub fn init_user_pml4_from_current(new_root: MyPhysFrame) {
         }
 
         // 1) physmap をコピー（これが無いと user CR3 中にページテーブルを触れない）
-        for i in physmap_pml4..core::cmp::min(physmap_pml4 + PHYSMAP_PML4_COPY_COUNT, 256) {
+        for i in physmap_pml4..min(physmap_pml4 + PHYSMAP_PML4_COPY_COUNT, 256) {
             if cur_p4[i].is_unused() {
                 continue;
             }
@@ -565,7 +578,7 @@ pub fn init_user_pml4_from_current(new_root: MyPhysFrame) {
             user_p4[i] = cur_p4[i].clone();
         }
 
-        // 2) kernel high-half をコピー（high-alias 508..511 も含まれる）
+        // 2) kernel high-half をコピー（通常の kernel 領域）
         for i in 256..512 {
             if cur_p4[i].is_unused() {
                 continue;
@@ -578,14 +591,33 @@ pub fn init_user_pml4_from_current(new_root: MyPhysFrame) {
             user_p4[i] = cur_p4[i].clone();
         }
 
+        // 2.5) ★high-alias window を明示的にコピー（IDT/IST/TSS/handler がここにある）
+        for i in 0..alias_cnt {
+            let idx = alias_base + i;
+            if idx >= 512 {
+                break;
+            }
+            if cur_p4[idx].is_unused() {
+                continue;
+            }
+            if cur_p4[idx].flags().contains(PageTableFlags::USER_ACCESSIBLE) {
+                logging::error("init_user_pml4_from_current: alias window has USER_ACCESSIBLE; abort");
+                logging::info_u64("pml4_index", idx as u64);
+                panic!("alias window pml4 entry contains USER_ACCESSIBLE");
+            }
+            user_p4[idx] = cur_p4[idx].clone();
+        }
+
         // 3) user slot は空
         logging::info("init_user_pml4_from_current: clearing user pml4 entry");
         logging::info_u64("pml4_index", USER_PML4_INDEX as u64);
-        user_p4[USER_PML4_INDEX as usize].set_unused();
+        user_p4[USER_PML4_INDEX].set_unused();
 
-        logging::info("init_user_pml4_from_current: copied kernel high-half + physmap");
+        logging::info("init_user_pml4_from_current: copied kernel high-half + physmap (+alias window)");
         logging::info_u64("kernel_pml4_base", 256);
         logging::info_u64("physmap_pml4_index", physmap_pml4 as u64);
+        logging::info_u64("alias_dst_base_pml4", alias_base as u64);
+        logging::info_u64("alias_copy_count", alias_cnt as u64);
     }
 }
 
@@ -616,7 +648,10 @@ pub fn debug_log_execution_context(tag: &str) {
     logging::info_u64("rbp_pml4", virt_layout::pml4_index(rbp) as u64);
 }
 
-pub fn enter_kernel_high_alias(entry: extern "C" fn(&'static BootInfo) -> !, boot_info: &'static BootInfo) -> ! {
+pub fn enter_kernel_high_alias(
+    entry: extern "C" fn(&'static BootInfo) -> !,
+    boot_info: &'static BootInfo,
+) -> ! {
     logging::info("enter_kernel_high_alias: switching stack and CALL high entry");
 
     let low_entry = entry as usize as u64;

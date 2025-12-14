@@ -2,6 +2,9 @@
 #![no_std]
 #![no_main]
 
+// nightly: x86-interrupt ABI
+#![feature(abi_x86_interrupt)]
+
 // ─────────────────────────────────────────────
 // formal-os: pre-formal verification kernel
 //

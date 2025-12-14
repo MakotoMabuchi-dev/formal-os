@@ -191,6 +191,10 @@ pub struct KernelState {
     demo_replies_sent: u8,
     demo_sent_by_task2: bool,
     demo_sent_by_task1: bool,
+
+    // pf_demo: 「1回だけ #PF を起こす」ためのフラグ
+    #[cfg(feature = "pf_demo")]
+    pf_demo_done: bool,
 }
 
 impl KernelState {
@@ -312,6 +316,10 @@ impl KernelState {
             demo_replies_sent: 0,
             demo_sent_by_task2: false,
             demo_sent_by_task1: false,
+
+
+            #[cfg(feature = "pf_demo")]
+            pf_demo_done: false,
         }
     }
 

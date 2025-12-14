@@ -3,6 +3,7 @@
 // user program（デモ）
 // - Running task が syscall を発行する。
 // - evil_ipc では「不正ep」を混ぜ、カーネルが安全に拒否/無視できることを観測する。
+// - pf_demo では「未マップ user VA」へアクセスして #PF を観測する（fail-stop）。
 
 use super::{
     EndpointId, KernelState, Syscall, TaskState, IPC_DEMO_EP0, TASK0_INDEX, TASK1_INDEX, TASK2_INDEX,
@@ -18,6 +19,26 @@ impl KernelState {
         }
         if self.tasks[task_idx].pending_syscall.is_some() {
             return;
+        }
+
+        // pf_demo: 「User AS が RUNNING になった最初の1回だけ」必ず #PF を起こす
+        #[cfg(feature = "pf_demo")]
+        {
+            let as_idx = self.tasks[task_idx].address_space_id.0;
+
+            if !self.pf_demo_done && self.address_spaces[as_idx].kind == super::AddressSpaceKind::User {
+                self.pf_demo_done = true;
+
+                crate::logging::error("pf_demo: forcing a page fault by reading unmapped user VA");
+
+                // mem_demo の mapped page と被りにくい位置
+                let unmapped = (crate::arch::paging::USER_SPACE_BASE + 0x4000) as *const u64;
+
+                unsafe {
+                    // ここで #PF → handler が serial に出して halt
+                    let _ = core::ptr::read_volatile(unmapped);
+                }
+            }
         }
 
         // evil_ipc: たまに“不正ep”を投げる（カーネルが安全に拒否/無視できることを確認する）
