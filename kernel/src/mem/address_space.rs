@@ -3,6 +3,11 @@
 // 役割:
 // - 論理アドレス空間（プロセスやカーネルのメモリ空間）を表現する。
 // - どの仮想ページがどの物理フレームにどの権限でマップされているかを保持する。
+//
+// 設計方針（プロトタイプ→フォーマル化を意識）:
+// - unsafe は持ち込まない（arch 側に閉じ込める）。
+// - kill 後始末で「Dead task の user mapping が残らない」を保証できる API を提供する。
+// - 実ページテーブル操作は行わない（論理状態のみ）。
 
 use crate::mem::addr::{PhysFrame, VirtPage};
 use crate::mem::paging::{MemAction, PageFlags};
@@ -98,6 +103,43 @@ impl AddressSpace {
         for entry in self.mappings.iter() {
             if let Some(ref m) = entry {
                 f(m);
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Step1 (Top3): kill 後始末のための補助 API
+    // -------------------------------------------------------------------------
+
+    /// user mapping（flags に USER が付いている mapping）の「ページ」だけを列挙する。
+    ///
+    /// 目的:
+    /// - kill 後始末で「実ページテーブル側の unmap」を確実に行うための材料。
+    /// - Vec を使わず、固定長配列に収集できるようにする（再現性重視）。
+    pub fn for_each_user_mapping_page<F>(&self, mut f: F)
+    where
+        F: FnMut(VirtPage),
+    {
+        for entry in self.mappings.iter() {
+            if let Some(m) = entry {
+                if m.flags.contains(PageFlags::USER) {
+                    f(m.page);
+                }
+            }
+        }
+    }
+
+    /// user mapping（flags に USER が付いている mapping）を論理状態から全て消す。
+    ///
+    /// 注意:
+    /// - これは「論理 AddressSpace の掃除」だけ。
+    /// - 実ページテーブルの unmap は arch 側で別途実行すること。
+    pub fn clear_user_mappings(&mut self) {
+        for entry in self.mappings.iter_mut() {
+            if let Some(m) = entry {
+                if m.flags.contains(PageFlags::USER) {
+                    *entry = None;
+                }
             }
         }
     }

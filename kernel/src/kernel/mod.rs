@@ -36,6 +36,7 @@ use crate::mem::addr::{PhysFrame, VirtPage, PAGE_SIZE};
 use crate::mem::paging::{MemAction, PageFlags};
 use crate::mem::address_space::{AddressSpace, AddressSpaceError, AddressSpaceKind};
 use crate::mem::layout::KERNEL_SPACE_START;
+use crate::kernel::ipc::IPC_ERR_DEAD_PARTNER;
 
 use ipc::Endpoint;
 
@@ -61,6 +62,10 @@ const DEMO_VIRT_PAGE_INDEX_TASK0: u64 = 0x100; // 0x0010_0000
 const DEMO_VIRT_PAGE_INDEX_USER:  u64 = 0x110; // 0x0011_0000 (offset)
 
 const IPC_DEMO_EP0: EndpointId = EndpointId(0);
+
+// ★Step1.5: partner 死亡で reply 待ちが永久ブロックにならないための最小エラー値
+// - last_msg に積むだけ（プロトタイプ用）
+// - ここから先、正式に Result/Err を syscalls に流すなら置き換える
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct TaskId(pub u64);
@@ -92,20 +97,28 @@ pub enum BlockedReason {
 pub struct Task {
     pub id: TaskId,
     pub state: TaskState,
+
+    // ★優先度（スケジューラが使う）
+    pub priority: u8,
+
     pub runtime_ticks: u64,
     pub time_slice_used: u64,
-    pub priority: u8,
 
     pub address_space_id: AddressSpaceId,
     pub blocked_reason: Option<BlockedReason>,
 
-    // IPC demo helper
+    // recv で届いた msg
     pub last_msg: Option<u64>,
+
+    // reply で返ってきた payload
+    pub last_reply: Option<u64>,
+
     pub pending_send_msg: Option<u64>,
 
     // syscall boundary
     pub pending_syscall: Option<Syscall>,
 }
+
 
 // ★Top3: kill reason（最小）
 #[derive(Clone, Copy)]
@@ -221,36 +234,39 @@ impl KernelState {
             Task {
                 id: TASK0_ID,
                 state: TaskState::Running,
+                priority: 1,
                 runtime_ticks: 0,
                 time_slice_used: 0,
-                priority: 1,
                 address_space_id: AddressSpaceId(KERNEL_ASID_INDEX),
                 blocked_reason: None,
                 last_msg: None,
+                last_reply: None,
                 pending_send_msg: None,
                 pending_syscall: None,
             },
             Task {
                 id: TASK1_ID,
                 state: TaskState::Ready,
+                priority: 3,
                 runtime_ticks: 0,
                 time_slice_used: 0,
-                priority: 3,
                 address_space_id: AddressSpaceId(FIRST_USER_ASID_INDEX),
                 blocked_reason: None,
                 last_msg: None,
+                last_reply: None,
                 pending_send_msg: None,
                 pending_syscall: None,
             },
             Task {
                 id: TASK2_ID,
                 state: TaskState::Ready,
+                priority: 2,
                 runtime_ticks: 0,
                 time_slice_used: 0,
-                priority: 2,
                 address_space_id: AddressSpaceId(FIRST_USER_ASID_INDEX + 1),
                 blocked_reason: None,
                 last_msg: None,
+                last_reply: None,
                 pending_send_msg: None,
                 pending_syscall: None,
             },
@@ -348,6 +364,9 @@ impl KernelState {
     }
 
     fn debug_check_invariants(&self) {
+        // -------------------------------------------------------------------------
+        // AddressSpace の基本整合
+        // -------------------------------------------------------------------------
         {
             let kernel_as = &self.address_spaces[KERNEL_ASID_INDEX];
             if kernel_as.kind != AddressSpaceKind::Kernel {
@@ -362,53 +381,91 @@ impl KernelState {
             let aspace = &self.address_spaces[as_idx];
             if aspace.kind != AddressSpaceKind::User {
                 logging::error("INVARIANT VIOLATION: user address space kind is not User");
+                logging::info_u64("as_idx", as_idx as u64);
             }
             if aspace.root_page_frame.is_none() {
                 logging::error("INVARIANT VIOLATION: user address space has no root_page_frame");
+                logging::info_u64("as_idx", as_idx as u64);
             }
         }
 
+        // -------------------------------------------------------------------------
+        // TaskState と BlockedReason の整合
+        // -------------------------------------------------------------------------
         for (idx, t) in self.tasks.iter().enumerate().take(self.num_tasks) {
             match t.state {
                 TaskState::Blocked => {
                     if t.blocked_reason.is_none() {
                         logging::error("INVARIANT VIOLATION: BLOCKED task has no blocked_reason");
                         logging::info_u64("task_index", idx as u64);
+                        logging::info_u64("task_id", t.id.0);
                     }
                 }
                 TaskState::Dead => {
+                    // Dead は blocked_reason を持たない
                     if t.blocked_reason.is_some() {
                         logging::error("INVARIANT VIOLATION: DEAD task has blocked_reason");
                         logging::info_u64("task_index", idx as u64);
+                        logging::info_u64("task_id", t.id.0);
+                    }
+
+                    // Dead は task-local state を残さない（観測ゴミ + 不整合の温床）
+                    if t.last_msg.is_some()
+                        || t.last_reply.is_some()
+                        || t.pending_send_msg.is_some()
+                        || t.pending_syscall.is_some()
+                    {
+                        logging::error("INVARIANT VIOLATION: DEAD task has leftover task-local state");
+                        logging::info_u64("task_index", idx as u64);
+                        logging::info_u64("task_id", t.id.0);
                     }
                 }
                 _ => {
+                    // Blocked 以外は blocked_reason を持たない
                     if t.blocked_reason.is_some() {
                         logging::error("INVARIANT VIOLATION: non-BLOCKED task has blocked_reason");
                         logging::info_u64("task_index", idx as u64);
+                        logging::info_u64("task_id", t.id.0);
                     }
                 }
             }
         }
 
+        // -------------------------------------------------------------------------
+        // current_task の整合（Dead が current になるのは禁止）
+        // -------------------------------------------------------------------------
         if self.current_task >= self.num_tasks {
             logging::error("INVARIANT VIOLATION: current_task out of range");
-        } else if self.tasks[self.current_task].state != TaskState::Running {
-            // Dead/Blocked/Ready で current になってたら壊れてる
-            logging::error("INVARIANT VIOLATION: current_task is not RUNNING");
+        } else {
+            let st = self.tasks[self.current_task].state;
+            if st == TaskState::Dead {
+                logging::error("INVARIANT VIOLATION: current_task is DEAD");
+            } else if st != TaskState::Running {
+                logging::error("INVARIANT VIOLATION: current_task is not RUNNING");
+            }
         }
 
+        // -------------------------------------------------------------------------
+        // User AddressSpace の mapping 整合
+        // - user mapping のみ offset 範囲をチェック（誤検知防止）
+        // -------------------------------------------------------------------------
         for as_idx in FIRST_USER_ASID_INDEX..self.num_tasks {
             let aspace = &self.address_spaces[as_idx];
             if aspace.kind != AddressSpaceKind::User {
                 continue;
             }
+
             aspace.for_each_mapping(|m| {
+                if !m.flags.contains(PageFlags::USER) {
+                    return;
+                }
+
                 let offset = m.page.number * PAGE_SIZE;
 
                 if offset >= arch::paging::USER_SPACE_SIZE {
                     logging::error("INVARIANT VIOLATION: user mapping offset out of user slot range");
                     logging::info_u64("as_idx", as_idx as u64);
+                    logging::info_u64("virt_page_index", m.page.number);
                     logging::info_u64("offset", offset);
                 }
 
@@ -416,60 +473,298 @@ impl KernelState {
             });
         }
 
+        // -------------------------------------------------------------------------
+        // Endpoint の整合（構造チェック：ここに集約）
+        // -------------------------------------------------------------------------
         for e in self.endpoints.iter() {
-            if let Some(idx) = e.recv_waiter {
-                if idx >= self.num_tasks {
+            // recv_waiter: 単独 waiter（IpcRecv 専用）
+            if let Some(tidx) = e.recv_waiter {
+                if tidx >= self.num_tasks {
                     logging::error("INVARIANT VIOLATION: endpoint.recv_waiter out of range");
                 } else {
-                    let t = &self.tasks[idx];
+                    let t = &self.tasks[tidx];
+
                     if t.state == TaskState::Dead {
                         logging::error("INVARIANT VIOLATION: endpoint.recv_waiter points DEAD task");
+                        logging::info_u64("task_id", t.id.0);
                     }
                     if t.state != TaskState::Blocked {
                         logging::error("INVARIANT VIOLATION: recv_waiter is not BLOCKED");
+                        logging::info_u64("task_id", t.id.0);
                     }
+
                     match t.blocked_reason {
                         Some(BlockedReason::IpcRecv { ep }) if ep == e.id => {}
-                        _ => logging::error("INVARIANT VIOLATION: recv_waiter blocked_reason mismatch"),
+                        _ => {
+                            logging::error("INVARIANT VIOLATION: recv_waiter blocked_reason mismatch");
+                            logging::info_u64("task_id", t.id.0);
+                        }
                     }
                 }
             }
 
+            // send_queue: IpcSend waiter のキュー
             for pos in 0..e.sq_len {
-                let idx = e.send_queue[pos];
-                if idx >= self.num_tasks {
+                let tidx = e.send_queue[pos];
+                if tidx >= self.num_tasks {
                     logging::error("INVARIANT VIOLATION: endpoint.send_queue idx out of range");
                     continue;
                 }
-                let t = &self.tasks[idx];
+
+                let t = &self.tasks[tidx];
                 if t.state == TaskState::Dead {
                     logging::error("INVARIANT VIOLATION: send_queue contains DEAD task");
+                    logging::info_u64("task_id", t.id.0);
                 }
                 if t.state != TaskState::Blocked {
                     logging::error("INVARIANT VIOLATION: sender in send_queue is not BLOCKED");
+                    logging::info_u64("task_id", t.id.0);
                 }
+
                 match t.blocked_reason {
                     Some(BlockedReason::IpcSend { ep }) if ep == e.id => {}
-                    _ => logging::error("INVARIANT VIOLATION: sender blocked_reason mismatch"),
+                    _ => {
+                        logging::error("INVARIANT VIOLATION: sender blocked_reason mismatch");
+                        logging::info_u64("task_id", t.id.0);
+                    }
                 }
             }
 
+            // reply_queue: IpcReply waiter のキュー
             for pos in 0..e.rq_len {
-                let idx = e.reply_queue[pos];
-                if idx >= self.num_tasks {
+                let tidx = e.reply_queue[pos];
+                if tidx >= self.num_tasks {
                     logging::error("INVARIANT VIOLATION: endpoint.reply_queue idx out of range");
                     continue;
                 }
-                let t = &self.tasks[idx];
+
+                let t = &self.tasks[tidx];
                 if t.state == TaskState::Dead {
                     logging::error("INVARIANT VIOLATION: reply_queue contains DEAD task");
+                    logging::info_u64("task_id", t.id.0);
                 }
                 if t.state != TaskState::Blocked {
                     logging::error("INVARIANT VIOLATION: reply waiter is not BLOCKED");
+                    logging::info_u64("task_id", t.id.0);
                 }
+
                 match t.blocked_reason {
-                    Some(BlockedReason::IpcReply { ep, .. }) if ep == e.id => {}
-                    _ => logging::error("INVARIANT VIOLATION: reply waiter blocked_reason mismatch"),
+                    Some(BlockedReason::IpcReply { ep, partner }) if ep == e.id => {
+                        // Step1.5 により、本来ここは発生しない（発生したら kill 側の掃除漏れ）
+                        if let Some(pidx) = self.tasks.iter().position(|x| x.id == partner) {
+                            if self.tasks[pidx].state == TaskState::Dead {
+                                logging::error("INVARIANT VIOLATION: IpcReply waiter has DEAD partner");
+                                logging::info_u64("waiter_task_id", t.id.0);
+                                logging::info_u64("partner_task_id", partner.0);
+                            }
+                        }
+                    }
+                    _ => {
+                        logging::error("INVARIANT VIOLATION: reply waiter blocked_reason mismatch");
+                        logging::info_u64("task_id", t.id.0);
+                    }
+                }
+            }
+        }
+
+        // -------------------------------------------------------------------------
+        // Step1（Top3）: Dead task 後始末の invariant
+        // - Dead task は ready_queue / wait_queue にいない
+        // - Dead task の user address space に USER mapping が残っていない
+        // -------------------------------------------------------------------------
+        for (tidx, t) in self.tasks.iter().enumerate().take(self.num_tasks) {
+            if t.state != TaskState::Dead {
+                continue;
+            }
+
+            if self.is_in_ready_queue(tidx) {
+                logging::error("INVARIANT VIOLATION: DEAD task is in ready_queue");
+                logging::info_u64("task_index", tidx as u64);
+                logging::info_u64("task_id", t.id.0);
+            }
+
+            if self.is_in_wait_queue(tidx) {
+                logging::error("INVARIANT VIOLATION: DEAD task is in wait_queue");
+                logging::info_u64("task_index", tidx as u64);
+                logging::info_u64("task_id", t.id.0);
+            }
+
+            let as_idx = t.address_space_id.0;
+            if as_idx < self.num_tasks && self.address_spaces[as_idx].kind == AddressSpaceKind::User {
+                let mut found = false;
+                self.address_spaces[as_idx].for_each_mapping(|m| {
+                    if m.flags.contains(PageFlags::USER) {
+                        found = true;
+                    }
+                });
+
+                if found {
+                    logging::error("INVARIANT VIOLATION: DEAD task address space still has USER mappings");
+                    logging::info_u64("task_index", tidx as u64);
+                    logging::info_u64("task_id", t.id.0);
+                    logging::info_u64("as_idx", as_idx as u64);
+                }
+            }
+        }
+
+        // -------------------------------------------------------------------------
+        // Step2: wait_queue は Sleep 専用（仕様固定）
+        // -------------------------------------------------------------------------
+        // 1) wait_queue 内は必ず Blocked + Sleep
+        for pos in 0..self.wq_len {
+            let idx = self.wait_queue[pos];
+            if idx >= self.num_tasks {
+                logging::error("INVARIANT VIOLATION: wait_queue contains out-of-range idx");
+                continue;
+            }
+
+            let t = &self.tasks[idx];
+
+            if t.state == TaskState::Dead {
+                logging::error("INVARIANT VIOLATION: wait_queue contains DEAD task");
+                logging::info_u64("task_id", t.id.0);
+                continue;
+            }
+
+            if t.state != TaskState::Blocked {
+                logging::error("INVARIANT VIOLATION: wait_queue contains non-BLOCKED task");
+                logging::info_u64("task_id", t.id.0);
+            }
+
+            if t.blocked_reason != Some(BlockedReason::Sleep) {
+                logging::error("INVARIANT VIOLATION: wait_queue contains non-Sleep blocked_reason");
+                logging::info_u64("task_id", t.id.0);
+            }
+        }
+
+        // 2) Sleep で Blocked の task は必ず wait_queue にいる
+        for (idx, t) in self.tasks.iter().enumerate().take(self.num_tasks) {
+            if t.state == TaskState::Dead {
+                continue;
+            }
+            if t.state == TaskState::Blocked && t.blocked_reason == Some(BlockedReason::Sleep) {
+                if !self.is_in_wait_queue(idx) {
+                    logging::error("INVARIANT VIOLATION: Sleep BLOCKED task is not in wait_queue");
+                    logging::info_u64("task_id", t.id.0);
+                }
+            }
+        }
+
+        // -------------------------------------------------------------------------
+        // Step3: 逆向き invariant（Task -> 待ち構造）
+        // - BlockedReason が指す待ち構造に、必ず task が存在する
+        // - wait_queue は Sleep 専用（Step2）なので、IPC は wait_queue に居ない
+        // -------------------------------------------------------------------------
+        for (tidx, t) in self.tasks.iter().enumerate().take(self.num_tasks) {
+            if t.state == TaskState::Dead {
+                continue;
+            }
+            if t.state != TaskState::Blocked {
+                continue;
+            }
+
+            let reason = match t.blocked_reason {
+                Some(r) => r,
+                None => {
+                    logging::error("INVARIANT VIOLATION: BLOCKED task has no blocked_reason (reverse check)");
+                    logging::info_u64("task_id", t.id.0);
+                    continue;
+                }
+            };
+
+            match reason {
+                BlockedReason::Sleep => {
+                    if !self.is_in_wait_queue(tidx) {
+                        logging::error("INVARIANT VIOLATION: Sleep BLOCKED task not in wait_queue (reverse check)");
+                        logging::info_u64("task_id", t.id.0);
+                    }
+                }
+
+                BlockedReason::IpcRecv { ep } => {
+                    if ep.0 >= MAX_ENDPOINTS {
+                        logging::error("INVARIANT VIOLATION: IpcRecv has out-of-range ep (reverse check)");
+                        logging::info_u64("task_id", t.id.0);
+                        logging::info_u64("ep", ep.0 as u64);
+                        continue;
+                    }
+
+                    let e = &self.endpoints[ep.0];
+                    if e.recv_waiter != Some(tidx) {
+                        logging::error("INVARIANT VIOLATION: IpcRecv task not registered as recv_waiter (reverse check)");
+                        logging::info_u64("task_id", t.id.0);
+                        logging::info_u64("ep", ep.0 as u64);
+                    }
+
+                    if self.is_in_wait_queue(tidx) {
+                        logging::error("INVARIANT VIOLATION: IpcRecv task is in wait_queue (reverse check)");
+                        logging::info_u64("task_id", t.id.0);
+                    }
+                }
+
+                BlockedReason::IpcSend { ep } => {
+                    if ep.0 >= MAX_ENDPOINTS {
+                        logging::error("INVARIANT VIOLATION: IpcSend has out-of-range ep (reverse check)");
+                        logging::info_u64("task_id", t.id.0);
+                        logging::info_u64("ep", ep.0 as u64);
+                        continue;
+                    }
+
+                    let e = &self.endpoints[ep.0];
+                    let mut found = false;
+                    for pos in 0..e.sq_len {
+                        if e.send_queue[pos] == tidx {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        logging::error("INVARIANT VIOLATION: IpcSend task not found in endpoint.send_queue (reverse check)");
+                        logging::info_u64("task_id", t.id.0);
+                        logging::info_u64("ep", ep.0 as u64);
+                        logging::info_u64("sq_len", e.sq_len as u64);
+                    }
+
+                    if self.is_in_wait_queue(tidx) {
+                        logging::error("INVARIANT VIOLATION: IpcSend task is in wait_queue (reverse check)");
+                        logging::info_u64("task_id", t.id.0);
+                    }
+                }
+
+                BlockedReason::IpcReply { partner, ep } => {
+                    if ep.0 >= MAX_ENDPOINTS {
+                        logging::error("INVARIANT VIOLATION: IpcReply has out-of-range ep (reverse check)");
+                        logging::info_u64("task_id", t.id.0);
+                        logging::info_u64("ep", ep.0 as u64);
+                        continue;
+                    }
+
+                    let e = &self.endpoints[ep.0];
+                    let mut found = false;
+                    for pos in 0..e.rq_len {
+                        if e.reply_queue[pos] == tidx {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        logging::error("INVARIANT VIOLATION: IpcReply task not found in endpoint.reply_queue (reverse check)");
+                        logging::info_u64("task_id", t.id.0);
+                        logging::info_u64("ep", ep.0 as u64);
+                        logging::info_u64("rq_len", e.rq_len as u64);
+                    }
+
+                    if let Some(pidx) = self.tasks.iter().position(|x| x.id == partner) {
+                        if self.tasks[pidx].state == TaskState::Dead {
+                            logging::error("INVARIANT VIOLATION: IpcReply waiter has DEAD partner (reverse check)");
+                            logging::info_u64("waiter_task_id", t.id.0);
+                            logging::info_u64("partner_task_id", partner.0);
+                        }
+                    }
+
+                    if self.is_in_wait_queue(tidx) {
+                        logging::error("INVARIANT VIOLATION: IpcReply task is in wait_queue (reverse check)");
+                        logging::info_u64("task_id", t.id.0);
+                    }
                 }
             }
         }
@@ -544,53 +839,202 @@ impl KernelState {
     // ★Top3: endpoint から DEAD task を抜く
     fn remove_task_from_endpoints(&mut self, idx: usize) {
         for ep in self.endpoints.iter_mut() {
+            // --------------------------------------------------
+            // recv_waiter の掃除
+            // --------------------------------------------------
             if ep.recv_waiter == Some(idx) {
                 ep.recv_waiter = None;
             }
 
-            // send_queue
-            let mut w = 0usize;
-            for r in 0..ep.sq_len {
-                if ep.send_queue[r] != idx {
-                    ep.send_queue[w] = ep.send_queue[r];
-                    w += 1;
+            // --------------------------------------------------
+            // send_queue の掃除（swap-remove）
+            // --------------------------------------------------
+            let mut pos = 0;
+            while pos < ep.sq_len {
+                if ep.send_queue[pos] == idx {
+                    ep.send_queue[pos] = ep.send_queue[ep.sq_len - 1];
+                    ep.sq_len -= 1;
+                } else {
+                    pos += 1;
                 }
             }
-            ep.sq_len = w;
 
-            // reply_queue
-            let mut w2 = 0usize;
-            for r in 0..ep.rq_len {
-                if ep.reply_queue[r] != idx {
-                    ep.reply_queue[w2] = ep.reply_queue[r];
-                    w2 += 1;
+            // --------------------------------------------------
+            // reply_queue の掃除（swap-remove）
+            // --------------------------------------------------
+            let mut pos = 0;
+            while pos < ep.rq_len {
+                if ep.reply_queue[pos] == idx {
+                    ep.reply_queue[pos] = ep.reply_queue[ep.rq_len - 1];
+                    ep.rq_len -= 1;
+                } else {
+                    pos += 1;
                 }
             }
-            ep.rq_len = w2;
+        }
+    }
+
+    // ★Step1.5: “Dead partner を待っている IpcReply waiter” を Ready に戻す
+    //
+    // 方針:
+    // - 永遠待ちを禁止（フォーマル化向けの liveness）
+    // - waiter の last_msg に最小のエラー値を入れて起床させる
+    // ★Step1.5: “Dead partner を待っている IpcReply waiter” を Ready に戻す（一本化版）
+    //
+    // 方針:
+    // - endpoint.reply_queue を実際に掃除する（swap-remove）
+    // - waiter は last_reply にエラーを入れて起床させる
+    // - endpoints を iter_mut している最中に wake_task_to_ready を呼ばない（E0499回避）
+    fn resolve_ipc_reply_waiters_for_dead_partner(&mut self, dead_partner: TaskId) {
+        let mut wake_list: [Option<usize>; MAX_TASKS] = [None; MAX_TASKS];
+        let mut wake_len: usize = 0;
+
+        for ep in self.endpoints.iter_mut() {
+            let mut pos: usize = 0;
+            while pos < ep.rq_len {
+                let waiter_idx = ep.reply_queue[pos];
+
+                let should_rescue = waiter_idx < self.num_tasks
+                    && self.tasks[waiter_idx].state == TaskState::Blocked
+                    && matches!(
+                    self.tasks[waiter_idx].blocked_reason,
+                    Some(BlockedReason::IpcReply { partner, ep: wep })
+                        if partner == dead_partner && wep == ep.id
+                );
+
+                if should_rescue {
+                    // reply_queue から swap-remove
+                    let last = ep.rq_len - 1;
+                    ep.reply_queue[pos] = ep.reply_queue[last];
+                    ep.rq_len -= 1;
+
+                    // waiter 側に「失敗」を残す（reply側を推奨）
+                    self.tasks[waiter_idx].blocked_reason = None;
+                    self.tasks[waiter_idx].last_reply = Some(IPC_ERR_DEAD_PARTNER);
+
+                    if wake_len < MAX_TASKS {
+                        wake_list[wake_len] = Some(waiter_idx);
+                        wake_len += 1;
+                    }
+
+                    crate::logging::error("ipc: reply waiter rescued due to DEAD partner");
+                    crate::logging::info_u64("waiter_task_id", self.tasks[waiter_idx].id.0);
+                    crate::logging::info_u64("dead_partner_task_id", dead_partner.0);
+
+                    // swap-remove したので pos を進めない
+                    continue;
+                }
+
+                pos += 1;
+            }
+        }
+
+        // endpoints の可変借用が終わってから wake
+        for i in 0..wake_len {
+            if let Some(waiter_idx) = wake_list[i] {
+                self.wake_task_to_ready(waiter_idx);
+            }
         }
     }
 
     // ★Top3: user fault -> kill
+    fn cleanup_user_mappings_of_address_space(&mut self, as_idx: usize) {
+        if as_idx >= self.num_tasks {
+            return;
+        }
+        if self.address_spaces[as_idx].kind != AddressSpaceKind::User {
+            return;
+        }
+
+        let root = match self.address_spaces[as_idx].root_page_frame {
+            Some(r) => r,
+            None => {
+                logging::error("cleanup_user_mappings: user root_page_frame is None");
+                panic!("user root_page_frame is None");
+            }
+        };
+
+        // 1) ページ収集（MAX_MAPPINGS と一致するので必ず収まる）
+        let mut pages: [Option<VirtPage>; 64] = [None; 64];
+        let mut n: usize = 0;
+
+        {
+            let aspace = &self.address_spaces[as_idx];
+            aspace.for_each_user_mapping_page(|page| {
+                // MAX_MAPPINGS=64 なので n は最大 64 まで
+                if n < pages.len() {
+                    pages[n] = Some(page);
+                    n += 1;
+                }
+            });
+        }
+
+        // 2) 論理状態を先にクリア（以後 “論理的には残ってない”）
+        {
+            let aspace = &mut self.address_spaces[as_idx];
+            aspace.clear_user_mappings();
+        }
+
+        // 3) arch unmap（実ページテーブル）
+        for i in 0..n {
+            let page = match pages[i] {
+                Some(p) => p,
+                None => continue,
+            };
+            let mem_action = MemAction::Unmap { page };
+
+            match unsafe { arch::paging::apply_mem_action_in_root(mem_action, root, &mut self.phys_mem) } {
+                Ok(()) => {}
+                Err(_e) => {
+                    logging::error("cleanup_user_mappings: arch unmap failed; abort (fail-stop)");
+                    logging::info_u64("as_idx", as_idx as u64);
+                    logging::info_u64("virt_page_index", page.number);
+                    panic!("cleanup_user_mappings: arch unmap failed");
+                }
+            }
+        }
+
+        logging::info("cleanup_user_mappings: done");
+        logging::info_u64("as_idx", as_idx as u64);
+        logging::info_u64("unmapped_pages", n as u64);
+    }
+
+    // ★既存 kill_task を Step1/Step1.5 対応に拡張
     fn kill_task(&mut self, idx: usize, reason: TaskKillReason) {
         if idx >= self.num_tasks {
             return;
         }
 
-        let id = self.tasks[idx].id;
+        let dead_id = self.tasks[idx].id;
+        let as_idx = self.tasks[idx].address_space_id.0;
 
-        // キュー/endpoint から除去
+        // 1) キュー / endpoint から除去
         let _ = self.remove_from_ready_queue(idx);
         let _ = self.remove_from_wait_queue(idx);
         self.remove_task_from_endpoints(idx);
 
-        // 状態更新
+        // 2) task を Dead にして task-local 掃除
         self.tasks[idx].state = TaskState::Dead;
         self.tasks[idx].blocked_reason = None;
         self.tasks[idx].pending_syscall = None;
         self.tasks[idx].pending_send_msg = None;
+        self.tasks[idx].last_msg = None;
+        self.tasks[idx].last_reply = None;
+        self.tasks[idx].time_slice_used = 0;
 
-        self.push_event(LogEvent::TaskKilled { task: id, reason });
-        self.push_event(LogEvent::TaskStateChanged(id, TaskState::Dead));
+        self.mem_demo_stage[idx] = 0;
+        self.mem_demo_mapped[idx] = false;
+        self.mem_demo_frame[idx] = None;
+
+        // 3) Dead task の user mapping を掃除
+        self.cleanup_user_mappings_of_address_space(as_idx);
+
+        // 4) ★Step1.5: dead partner 待ちを救済（ここで一本化）
+        self.resolve_ipc_reply_waiters_for_dead_partner(dead_id);
+
+        // 5) 観測イベント
+        self.push_event(LogEvent::TaskKilled { task: dead_id, reason });
+        self.push_event(LogEvent::TaskStateChanged(dead_id, TaskState::Dead));
 
         // current を殺したら次へ
         if idx == self.current_task {
@@ -698,7 +1142,14 @@ impl KernelState {
         let next_idx = match self.dequeue_ready_highest_priority() {
             Some(i) => i,
             None => {
-                logging::info("no ready tasks; scheduler idle");
+                // ★修正: current_task が Dead のまま回り続けるのを防ぐ
+                crate::logging::error("no ready tasks; entering halt-safe state");
+
+                if self.current_task < self.num_tasks && self.tasks[self.current_task].state == TaskState::Dead {
+                    crate::logging::error("current_task is DEAD and no runnable tasks; halting");
+                    self.should_halt = true;
+                }
+
                 return;
             }
         };
@@ -716,22 +1167,15 @@ impl KernelState {
 
         match next_kind {
             AddressSpaceKind::User => {
-                // kernel から user へ行くときだけ、切替前にログしてよい
                 logging::set_vga_enabled(false);
                 arch::paging::switch_address_space(root);
-
-                // user CR3 中の logging は危険なので、ここでは出さない
-                // logging::info("switched to task");
-                // logging::info_u64("task_id", next_id.0);
             }
             AddressSpaceKind::Kernel => {
-                // いま user CR3 の可能性があるので、まず quiet に kernel へ戻す（logging禁止区間）
                 let kernel_root = self.address_spaces[KERNEL_ASID_INDEX]
                     .root_page_frame
                     .expect("kernel root_page_frame must exist");
                 arch::paging::switch_address_space_quiet(kernel_root);
 
-                // kernel に戻ってから VGA ON + logging OK
                 logging::set_vga_enabled(true);
 
                 logging::info("switched to task");
@@ -742,6 +1186,7 @@ impl KernelState {
         self.push_event(LogEvent::TaskSwitched(next_id));
         self.push_event(LogEvent::TaskStateChanged(next_id, TaskState::Running));
     }
+
 
     fn update_runtime_for(&mut self, ran_idx: usize) {
         if ran_idx >= self.num_tasks {
@@ -761,12 +1206,30 @@ impl KernelState {
         let idx = self.current_task;
         let id = self.tasks[idx].id;
 
+        // すでに Dead なら何もしない（安全側）
+        if self.tasks[idx].state == TaskState::Dead {
+            logging::error("block_current: called for DEAD task; ignore");
+            return;
+        }
+
         self.tasks[idx].state = TaskState::Blocked;
         self.tasks[idx].blocked_reason = Some(reason);
         self.tasks[idx].time_slice_used = 0;
 
         self.push_event(LogEvent::TaskStateChanged(id, TaskState::Blocked));
-        self.enqueue_wait(idx);
+
+        // ★Step2: wait_queue は Sleep 専用
+        // - IPC 待ちは Endpoint 側の recv_waiter/send_queue/reply_queue のみに載せる
+        match reason {
+            BlockedReason::Sleep => {
+                self.enqueue_wait(idx);
+            }
+            BlockedReason::IpcRecv { .. }
+            | BlockedReason::IpcSend { .. }
+            | BlockedReason::IpcReply { .. } => {
+                // ここでは enqueue_wait しない
+            }
+        }
     }
 
     fn wake_task_to_ready(&mut self, idx: usize) {
@@ -781,7 +1244,15 @@ impl KernelState {
             return;
         }
 
-        let _ = self.remove_from_wait_queue(idx);
+        // ★Step2: endpoint 側の参照残りを常に掃除（IPC/Sleep どちらでも安全）
+        self.remove_task_from_endpoints(idx);
+
+        // ★Step2: wait_queue は Sleep 専用
+        // - Sleep 以外の BlockedReason のときは wait_queue を触らない
+        if self.tasks[idx].blocked_reason == Some(BlockedReason::Sleep) {
+            let _ = self.remove_from_wait_queue(idx);
+        }
+
         let id = self.tasks[idx].id;
 
         self.tasks[idx].state = TaskState::Ready;
@@ -1341,6 +1812,87 @@ impl KernelState {
         }
         logging::info("=== End of Event Log ===");
 
+        // -------------------------------------------------------------------------
+        // Task Dump（状態 + IPC）
+        // - IPC/スケジューラ不整合の切り分けのため、ここが最重要
+        // -------------------------------------------------------------------------
+        logging::info("=== Task Dump ===");
+        for i in 0..self.num_tasks {
+            let task = &self.tasks[i];
+
+            logging::info("TASK:");
+            logging::info_u64("task_index", i as u64);
+            logging::info_u64("task_id", task.id.0);
+
+            match task.state {
+                TaskState::Ready => logging::info("state = Ready"),
+                TaskState::Running => logging::info("state = Running"),
+                TaskState::Blocked => logging::info("state = Blocked"),
+                TaskState::Dead => logging::info("state = Dead"),
+            }
+
+            // AddressSpace
+            logging::info_u64("address_space_id", task.address_space_id.0 as u64);
+
+            // BlockedReason
+            match task.blocked_reason {
+                None => logging::info("blocked_reason = None"),
+                Some(BlockedReason::Sleep) => logging::info("blocked_reason = Sleep"),
+                Some(BlockedReason::IpcRecv { ep }) => {
+                    logging::info("blocked_reason = IpcRecv");
+                    logging::info_u64("blocked_ep", ep.0 as u64);
+                }
+                Some(BlockedReason::IpcSend { ep }) => {
+                    logging::info("blocked_reason = IpcSend");
+                    logging::info_u64("blocked_ep", ep.0 as u64);
+                }
+                Some(BlockedReason::IpcReply { partner, ep }) => {
+                    logging::info("blocked_reason = IpcReply");
+                    logging::info_u64("blocked_ep", ep.0 as u64);
+                    logging::info_u64("blocked_partner_task_id", partner.0);
+                }
+            }
+
+            // Syscall boundary（pending が残っていると「取りこぼし」が分かる）
+            match task.pending_syscall {
+                Some(_) => logging::info("pending_syscall = Some"),
+                None => logging::info("pending_syscall = None"),
+            }
+
+            // IPC task-local
+            match task.pending_send_msg {
+                Some(v) => {
+                    logging::info("pending_send_msg = Some");
+                    logging::info_u64("pending_send_msg_value", v);
+                }
+                None => logging::info("pending_send_msg = None"),
+            }
+
+            match task.last_msg {
+                Some(v) => {
+                    logging::info("last_msg = Some");
+                    logging::info_u64("last_msg_value", v);
+                }
+                None => logging::info("last_msg = None"),
+            }
+
+            // last_reply を持っている実装向け（ないならこのブロックは消してください）
+            #[allow(unused_variables)]
+            {
+                // フィールドが存在する前提。存在しない場合はコンパイルエラーになるので削除。
+                if let Some(v) = task.last_reply {
+                    logging::info("last_reply = Some");
+                    logging::info_u64("last_reply_value", v);
+                } else {
+                    logging::info("last_reply = None");
+                }
+            }
+        }
+        logging::info("=== End of Task Dump ===");
+
+        // -------------------------------------------------------------------------
+        // AddressSpace Dump（per task）
+        // -------------------------------------------------------------------------
         logging::info("=== AddressSpace Dump (per task) ===");
         for i in 0..self.num_tasks {
             let task = self.tasks[i];
@@ -1381,6 +1933,9 @@ impl KernelState {
         }
         logging::info("=== End of AddressSpace Dump ===");
 
+        // -------------------------------------------------------------------------
+        // Endpoint Dump
+        // -------------------------------------------------------------------------
         logging::info("=== Endpoint Dump ===");
         for ep in self.endpoints.iter() {
             logging::info("ENDPOINT:");
@@ -1416,6 +1971,7 @@ impl KernelState {
         }
         logging::info("=== End of Endpoint Dump ===");
     }
+
 
     // --- ここから下は、あなたの元コードにある他メソッド（syscall/IPC/user_program等） ---
     // （あなたの注釈どおり：この下は手元既存実装を維持でOK）
