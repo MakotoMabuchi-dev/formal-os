@@ -16,10 +16,31 @@ extern "C" fn kernel_high_entry(boot_info: &'static BootInfo) -> ! {
     let mut kstate = KernelState::new(boot_info);
     kstate.bootstrap();
 
+    // 通常運転の tick 数（デモ）
+    // - ここは適宜増やしてOK（ログが増えるだけで意味は壊れない）
     let max_ticks = 120;
+
     for _ in 0..max_ticks {
         if kstate.should_halt() {
             logging::info("KernelState requested halt; stop ticking");
+            break;
+        }
+        kstate.tick();
+    }
+
+    // ★追加: drain ticks
+    //
+    // 目的:
+    // - 最終 tick が「IpcSend 直後」などの途中状態で終わりやすい。
+    // - 特に今回のログでは、Task0 が IpcReply 待ちのまま終了していた。
+    // - ここで数 tick 余分に回して、reply などの後続を進めてから dump する。
+    //
+    // 方針:
+    // - should_halt を尊重
+    // - 数は少なく固定（再現性重視）
+    let drain_ticks = 4;
+    for _ in 0..drain_ticks {
+        if kstate.should_halt() {
             break;
         }
         kstate.tick();
@@ -41,7 +62,7 @@ pub fn start(boot_info: &'static BootInfo) {
 
     arch::paging::install_kernel_high_alias_from_current();
 
-    // ★ここが重要：high-alias 導入後に IDT を “high base + high handlers” に切り替える
+    // ★high-alias 導入後に IDT を “high base + high handlers” に切り替える
     arch::interrupts::reload_idt_high_alias();
 
     arch::paging::debug_log_execution_context("before enter_kernel_high_alias");

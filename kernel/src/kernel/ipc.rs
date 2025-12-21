@@ -10,20 +10,34 @@
 // - reply は “待っている sender(=reply_waiter)” に対して deliver する。
 // - Dead partner を待つ reply_waiter は永遠待ちになるため、kill 側で救済する（mod.rs 側で実施）。
 //
-// このファイルの役割:
-// - Endpoint データ構造と、ipc_recv / ipc_send / ipc_reply の基本遷移を提供する。
-// - Dead partner 救済（reply_waiter rescue）は kill_task() 側（kernel/mod.rs）に置く。
+// ★fastpath/slowpath 分離 + counters:
+// - send/recv の fastpath/slowpath でカウンタを増やす（ログ量は増やさない）
+//
+// ★ipc_trace_paths（観測性）:
+// - feature 有効時だけ、fast/slow / reply の結果を「必ず1行」で出す
+// - TaskId / EndpointId を u64 にキャストしない（型依存バグ回避）
+// - ログは最小（経路のみ）で、フォーマル化しやすい形にする
 
 use super::{
     BlockedReason, EndpointId, KernelState, LogEvent, TaskId, TaskState, IPC_DEMO_EP0, MAX_ENDPOINTS, MAX_TASKS,
 };
 
 /// reply エラーコード（Dead partner を待っていた等）
-///
-/// NOTE:
-/// - user_program は last_reply を見て “reply を受け取った” 扱いにできる。
-/// - 値はプロトタイプ用の固定値（フォーマル化時に仕様として固定する）。
 pub const IPC_ERR_DEAD_PARTNER: u64 = 0xDEAD_DEAD_DEAD_DEAD;
+
+/// ipc_trace_paths 用：経路ログ（feature on の時だけ出す）
+#[inline(always)]
+fn ipc_trace_paths(line: &'static str) {
+    #[cfg(feature = "ipc_trace_paths")]
+    {
+        // 文字列だけ出す：型変換やフォーマット依存を避け、壊れにくくする
+        crate::logging::info(line);
+    }
+    #[cfg(not(feature = "ipc_trace_paths"))]
+    {
+        let _ = line;
+    }
+}
 
 /// Endpoint（reply_queue 版）
 #[derive(Clone, Copy)]
@@ -145,9 +159,88 @@ impl KernelState {
         None
     }
 
-    /// recv:
-    /// - sender が待っていれば即 deliver（sender は reply 待ちへ）
-    /// - sender がいなければ recv_waiter に登録して Block
+    // -------------------------------------------------------------------------
+    // recv (fastpath/slowpath)
+    // -------------------------------------------------------------------------
+
+    fn ipc_recv_fastpath(&mut self, ep: EndpointId, recv_idx: usize) -> bool {
+        let send_idx_opt = {
+            let e = &mut self.endpoints[ep.0];
+            e.dequeue_sender()
+        };
+
+        let send_idx = match send_idx_opt {
+            Some(i) => i,
+            None => return false,
+        };
+
+        if send_idx >= self.num_tasks {
+            crate::logging::error("ipc_recv_fastpath: dequeued sender idx out of range");
+            return false;
+        }
+        if self.tasks[send_idx].state == TaskState::Dead {
+            crate::logging::error("ipc_recv_fastpath: dequeued sender is DEAD; abort deliver");
+            return false;
+        }
+
+        let msg = match self.tasks[send_idx].pending_send_msg.take() {
+            Some(m) => m,
+            None => {
+                crate::logging::error("ipc_recv_fastpath: sender had no pending_send_msg; abort deliver");
+                return false;
+            }
+        };
+
+        let recv_id = self.tasks[recv_idx].id;
+        let send_id = self.tasks[send_idx].id;
+
+        // sender -> reply wait
+        self.tasks[send_idx].state = TaskState::Blocked;
+        self.tasks[send_idx].blocked_reason = Some(BlockedReason::IpcReply { partner: recv_id, ep });
+        self.tasks[send_idx].time_slice_used = 0;
+
+        {
+            let e = &mut self.endpoints[ep.0];
+            e.enqueue_reply_waiter(send_idx);
+        }
+
+        self.tasks[recv_idx].last_msg = Some(msg);
+
+        if ep == IPC_DEMO_EP0 && recv_idx == super::TASK2_INDEX && self.demo_msgs_delivered < 2 {
+            self.demo_msgs_delivered += 1;
+        }
+
+        // ★counters
+        self.counters.ipc_recv_fast += 1;
+
+        // ★ipc_trace_paths（必ず1行）
+        ipc_trace_paths("ipc_trace_paths recv=fast");
+
+        self.push_event(LogEvent::IpcDelivered { from: send_id, to: recv_id, ep, msg });
+        true
+    }
+
+    fn ipc_recv_slowpath(&mut self, ep: EndpointId, recv_idx: usize) {
+        let recv_id = self.tasks[recv_idx].id;
+
+        if self.endpoints[ep.0].recv_waiter.is_some() {
+            crate::logging::error("ipc_recv_slowpath: recv_waiter already exists; recv rejected (prototype)");
+            return;
+        }
+
+        // ★counters
+        self.counters.ipc_recv_slow += 1;
+
+        // ★ipc_trace_paths（必ず1行）
+        ipc_trace_paths("ipc_trace_paths recv=slow");
+
+        self.block_current(BlockedReason::IpcRecv { ep });
+        self.endpoints[ep.0].recv_waiter = Some(recv_idx);
+
+        self.push_event(LogEvent::IpcRecvBlocked { task: recv_id, ep });
+        self.schedule_next_task();
+    }
+
     pub(super) fn ipc_recv(&mut self, ep: EndpointId) {
         if ep.0 >= MAX_ENDPOINTS {
             crate::logging::error("ipc_recv: ep out of range");
@@ -166,73 +259,95 @@ impl KernelState {
         let recv_id = self.tasks[recv_idx].id;
         self.push_event(LogEvent::IpcRecvCalled { task: recv_id, ep });
 
-        // sender が待っていれば deliver（send_queue から）
-        let send_idx_opt = {
+        if self.ipc_recv_fastpath(ep, recv_idx) {
+            return;
+        }
+
+        self.ipc_recv_slowpath(ep, recv_idx);
+    }
+
+    // -------------------------------------------------------------------------
+    // send (fastpath/slowpath)
+    // -------------------------------------------------------------------------
+
+    fn ipc_send_fastpath(&mut self, ep: EndpointId, send_idx: usize, msg: u64) -> bool {
+        let recv_idx_opt = {
             let e = &mut self.endpoints[ep.0];
-            e.dequeue_sender()
+            e.recv_waiter.take()
         };
 
-        if let Some(send_idx) = send_idx_opt {
-            if send_idx >= self.num_tasks {
-                crate::logging::error("ipc_recv: dequeued sender idx out of range");
-                return;
-            }
-            if self.tasks[send_idx].state == TaskState::Dead {
-                crate::logging::error("ipc_recv: dequeued sender is DEAD; abort deliver");
-                return;
-            }
+        let recv_idx = match recv_idx_opt {
+            Some(i) => i,
+            None => return false,
+        };
 
-            // sender が持つ msg を取り出す（無いなら fail-safe）
-            let msg = match self.tasks[send_idx].pending_send_msg.take() {
-                Some(m) => m,
-                None => {
-                    crate::logging::error("ipc_recv: sender had no pending_send_msg; abort deliver");
-                    return;
-                }
-            };
-
-            let send_id = self.tasks[send_idx].id;
-
-            // sender は reply 待ちに遷移（Blocked）
-            self.tasks[send_idx].state = TaskState::Blocked;
-            self.tasks[send_idx].blocked_reason = Some(BlockedReason::IpcReply { partner: recv_id, ep });
-            self.tasks[send_idx].time_slice_used = 0;
-
-            // ★重要(Step2): IPC 待ちは wait_queue に載せない
-            // - reply_queue のみに登録する
-            {
-                let e = &mut self.endpoints[ep.0];
-                e.enqueue_reply_waiter(send_idx);
-            }
-
-            // receiver へ msg を渡す（receiver は RUNNING のまま）
-            self.tasks[recv_idx].last_msg = Some(msg);
-
-            // デモ観測
-            if ep == IPC_DEMO_EP0 && recv_idx == super::TASK2_INDEX && self.demo_msgs_delivered < 2 {
-                self.demo_msgs_delivered += 1;
-            }
-
-            self.push_event(LogEvent::IpcDelivered { from: send_id, to: recv_id, ep, msg });
-            return;
+        if recv_idx >= self.num_tasks {
+            crate::logging::error("ipc_send_fastpath: recv_waiter idx out of range");
+            return false;
+        }
+        if self.tasks[recv_idx].state == TaskState::Dead {
+            crate::logging::error("ipc_send_fastpath: recv_waiter is DEAD; abort deliver");
+            return false;
         }
 
-        // sender がいない → recv_waiter に登録して Block
-        if self.endpoints[ep.0].recv_waiter.is_some() {
-            crate::logging::error("ipc_recv: recv_waiter already exists; recv rejected (prototype)");
-            return;
+        match self.tasks[recv_idx].blocked_reason {
+            Some(BlockedReason::IpcRecv { ep: rep }) if rep == ep => {}
+            _ => {
+                crate::logging::error("ipc_send_fastpath: recv_waiter blocked_reason mismatch; abort deliver");
+                return false;
+            }
         }
 
-        self.block_current(BlockedReason::IpcRecv { ep });
-        self.endpoints[ep.0].recv_waiter = Some(recv_idx);
+        let send_id = self.tasks[send_idx].id;
+        let recv_id = self.tasks[recv_idx].id;
 
-        self.push_event(LogEvent::IpcRecvBlocked { task: recv_id, ep });
+        self.wake_task_to_ready(recv_idx);
+        self.tasks[recv_idx].last_msg = Some(msg);
+
+        // sender -> reply wait
+        self.block_current(BlockedReason::IpcReply { partner: recv_id, ep });
+        {
+            let e = &mut self.endpoints[ep.0];
+            e.enqueue_reply_waiter(send_idx);
+        }
+
+        if ep == IPC_DEMO_EP0 && recv_idx == super::TASK2_INDEX && self.demo_msgs_delivered < 2 {
+            self.demo_msgs_delivered += 1;
+        }
+
+        // ★counters
+        self.counters.ipc_send_fast += 1;
+
+        // ★ipc_trace_paths（必ず1行）
+        ipc_trace_paths("ipc_trace_paths send=fast");
+
+        self.push_event(LogEvent::IpcDelivered { from: send_id, to: recv_id, ep, msg });
+
+        self.schedule_next_task();
+        true
+    }
+
+    fn ipc_send_slowpath(&mut self, ep: EndpointId, send_idx: usize, msg: u64) {
+        let send_id = self.tasks[send_idx].id;
+
+        // ★counters
+        self.counters.ipc_send_slow += 1;
+
+        // ★ipc_trace_paths（必ず1行）
+        ipc_trace_paths("ipc_trace_paths send=slow");
+
+        self.tasks[send_idx].pending_send_msg = Some(msg);
+
+        self.block_current(BlockedReason::IpcSend { ep });
+        {
+            let e = &mut self.endpoints[ep.0];
+            e.enqueue_sender(send_idx);
+        }
+
+        self.push_event(LogEvent::IpcSendBlocked { task: send_id, ep });
         self.schedule_next_task();
     }
 
-    /// send:
-    /// - recv_waiter がいれば即 deliver（sender は reply 待ちへ）
-    /// - recv_waiter がいなければ send_queue に積んで Block
     pub(super) fn ipc_send(&mut self, ep: EndpointId, msg: u64) {
         if ep.0 >= MAX_ENDPOINTS {
             crate::logging::error("ipc_send: ep out of range");
@@ -251,70 +366,17 @@ impl KernelState {
         let send_id = self.tasks[send_idx].id;
         self.push_event(LogEvent::IpcSendCalled { task: send_id, ep, msg });
 
-        // recv_waiter がいれば deliver
-        let recv_idx_opt = {
-            let e = &mut self.endpoints[ep.0];
-            e.recv_waiter.take()
-        };
-
-        if let Some(recv_idx) = recv_idx_opt {
-            if recv_idx >= self.num_tasks {
-                crate::logging::error("ipc_send: recv_waiter idx out of range");
-                return;
-            }
-            if self.tasks[recv_idx].state == TaskState::Dead {
-                crate::logging::error("ipc_send: recv_waiter is DEAD; abort deliver");
-                return;
-            }
-
-            // recv_waiter は「BLOCKED + IpcRecv」のはず。崩れていたら fail-safe
-            match self.tasks[recv_idx].blocked_reason {
-                Some(BlockedReason::IpcRecv { ep: rep }) if rep == ep => {}
-                _ => {
-                    crate::logging::error("ipc_send: recv_waiter blocked_reason mismatch; abort deliver");
-                    return;
-                }
-            }
-
-            let recv_id = self.tasks[recv_idx].id;
-
-            // receiver を READY に戻す（endpoint 側参照も掃除される想定）
-            self.wake_task_to_ready(recv_idx);
-            self.tasks[recv_idx].last_msg = Some(msg);
-
-            // sender は reply 待ちに遷移（wait_queue には載せない）
-            self.block_current(BlockedReason::IpcReply { partner: recv_id, ep });
-            {
-                let e = &mut self.endpoints[ep.0];
-                e.enqueue_reply_waiter(send_idx);
-            }
-
-            // デモ観測
-            if ep == IPC_DEMO_EP0 && recv_idx == super::TASK2_INDEX && self.demo_msgs_delivered < 2 {
-                self.demo_msgs_delivered += 1;
-            }
-
-            self.push_event(LogEvent::IpcDelivered { from: send_id, to: recv_id, ep, msg });
-            self.schedule_next_task();
+        if self.ipc_send_fastpath(ep, send_idx, msg) {
             return;
         }
 
-        // receiver がいない → sender を send_queue に積んで Block
-        self.tasks[send_idx].pending_send_msg = Some(msg);
-
-        self.block_current(BlockedReason::IpcSend { ep });
-        {
-            let e = &mut self.endpoints[ep.0];
-            e.enqueue_sender(send_idx);
-        }
-
-        self.push_event(LogEvent::IpcSendBlocked { task: send_id, ep });
-        self.schedule_next_task();
+        self.ipc_send_slowpath(ep, send_idx, msg);
     }
 
-    /// reply:
-    /// - current task（receiver）が、reply_waiter（sender）へ返信する。
-    /// - msg は “結果/ack” として sender 側の last_reply に格納される。
+    // -------------------------------------------------------------------------
+    // reply
+    // -------------------------------------------------------------------------
+
     pub(super) fn ipc_reply(&mut self, ep: EndpointId, msg: u64) {
         if ep.0 >= MAX_ENDPOINTS {
             crate::logging::error("ipc_reply: ep out of range");
@@ -335,7 +397,8 @@ impl KernelState {
         let send_idx = match self.take_reply_waiter_for_partner(ep, recv_id) {
             Some(i) => i,
             None => {
-                // 返信対象がいないのは “正常系でもあり得る”(まだ届いてない等)
+                // ★ipc_trace_paths（必ず1行）
+                ipc_trace_paths("ipc_trace_paths reply=no_waiter");
                 return;
             }
         };
@@ -349,7 +412,6 @@ impl KernelState {
             return;
         }
 
-        // sender は本来 BLOCKED(IpcReply{partner=recv_id}) のはず。崩れてたら fail-safe
         match self.tasks[send_idx].blocked_reason {
             Some(BlockedReason::IpcReply { partner, ep: pep }) if partner == recv_id && pep == ep => {}
             _ => {
@@ -360,19 +422,20 @@ impl KernelState {
 
         let send_id = self.tasks[send_idx].id;
 
-        // ★LogEvent の定義に合わせる
-        // - もし LogEvent::IpcReplyCalled が { task, ep, to } を持つならこのまま
-        // - もし { task, ep } だけなら、下の行を to 無し版に変えてください
         self.push_event(LogEvent::IpcReplyCalled { task: recv_id, ep, to: send_id });
 
-        // sender を READY に戻し、返信を渡す
         self.tasks[send_idx].last_reply = Some(msg);
         self.wake_task_to_ready(send_idx);
 
-        // デモ観測
         if ep == IPC_DEMO_EP0 && recv_idx == super::TASK2_INDEX && self.demo_replies_sent < 2 {
             self.demo_replies_sent += 1;
         }
+
+        // ★counters
+        self.counters.ipc_reply_delivered += 1;
+
+        // ★ipc_trace_paths（必ず1行）
+        ipc_trace_paths("ipc_trace_paths reply=delivered");
 
         self.push_event(LogEvent::IpcReplyDelivered { from: recv_id, to: send_id, ep });
     }

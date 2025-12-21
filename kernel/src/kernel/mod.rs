@@ -17,6 +17,14 @@
 // - tick 中に schedule が走って current_task が変わるのは自然に起こりうる。
 //   * time_slice 更新は「その tick の最後まで同じ task が RUNNING の場合のみ」行う。
 // - event_log はリングバッファ化し、直近のログを保持する（観測性改善）。
+//
+// ★追加（計測）:
+// - IPC/スケジューラの fast/slow を数える counters を KernelState に持たせる。
+// - ログの量を増やさず、dump にまとめる（観測性と比較容易性を両立）。
+//
+// ★追加（デモ安定化）:
+// - send_queue 経由を確実に踏ませるための専用フラグを追加する。
+//   （「既存フラグ流用」は長期的に事故るので禁止）
 
 mod entry;
 mod ipc;
@@ -62,10 +70,6 @@ const DEMO_VIRT_PAGE_INDEX_TASK0: u64 = 0x100; // 0x0010_0000
 const DEMO_VIRT_PAGE_INDEX_USER:  u64 = 0x110; // 0x0011_0000 (offset)
 
 const IPC_DEMO_EP0: EndpointId = EndpointId(0);
-
-// ★Step1.5: partner 死亡で reply 待ちが永久ブロックにならないための最小エラー値
-// - last_msg に積むだけ（プロトタイプ用）
-// - ここから先、正式に Result/Err を syscalls に流すなら置き換える
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct TaskId(pub u64);
@@ -177,6 +181,40 @@ enum KernelAction {
     MemDemo,
 }
 
+// -----------------------------------------------------------------------------
+// counters (計測)
+// -----------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+pub struct KernelCounters {
+    // scheduler
+    pub sched_switches: u64,
+
+    // IPC
+    pub ipc_send_fast: u64,
+    pub ipc_send_slow: u64,
+    pub ipc_recv_fast: u64,
+    pub ipc_recv_slow: u64,
+    pub ipc_reply_delivered: u64,
+
+    // faults / kill
+    pub task_killed_user_pf: u64,
+}
+
+impl KernelCounters {
+    pub const fn new() -> Self {
+        KernelCounters {
+            sched_switches: 0,
+            ipc_send_fast: 0,
+            ipc_send_slow: 0,
+            ipc_recv_fast: 0,
+            ipc_recv_slow: 0,
+            ipc_reply_delivered: 0,
+            task_killed_user_pf: 0,
+        }
+    }
+}
+
 pub struct KernelState {
     phys_mem: PhysicalMemoryManager,
 
@@ -215,8 +253,15 @@ pub struct KernelState {
     demo_sent_by_task2: bool,
     demo_sent_by_task1: bool,
 
+    // ★追加（専用フラグ）:
+    // send_queue 経由（recv_fastpath）を確実に踏ませるための early send を 1 回だけ発行する
+    demo_early_sent_by_task0: bool,
+
     #[cfg(feature = "pf_demo")]
     pf_demo_done: bool,
+
+    // ★追加: counters
+    pub counters: KernelCounters,
 }
 
 impl KernelState {
@@ -343,8 +388,12 @@ impl KernelState {
             demo_sent_by_task2: false,
             demo_sent_by_task1: false,
 
+            demo_early_sent_by_task0: false,
+
             #[cfg(feature = "pf_demo")]
             pf_demo_done: false,
+
+            counters: KernelCounters::new(),
         }
     }
 
@@ -402,14 +451,12 @@ impl KernelState {
                     }
                 }
                 TaskState::Dead => {
-                    // Dead は blocked_reason を持たない
                     if t.blocked_reason.is_some() {
                         logging::error("INVARIANT VIOLATION: DEAD task has blocked_reason");
                         logging::info_u64("task_index", idx as u64);
                         logging::info_u64("task_id", t.id.0);
                     }
 
-                    // Dead は task-local state を残さない（観測ゴミ + 不整合の温床）
                     if t.last_msg.is_some()
                         || t.last_reply.is_some()
                         || t.pending_send_msg.is_some()
@@ -421,7 +468,6 @@ impl KernelState {
                     }
                 }
                 _ => {
-                    // Blocked 以外は blocked_reason を持たない
                     if t.blocked_reason.is_some() {
                         logging::error("INVARIANT VIOLATION: non-BLOCKED task has blocked_reason");
                         logging::info_u64("task_index", idx as u64);
@@ -447,7 +493,6 @@ impl KernelState {
 
         // -------------------------------------------------------------------------
         // User AddressSpace の mapping 整合
-        // - user mapping のみ offset 範囲をチェック（誤検知防止）
         // -------------------------------------------------------------------------
         for as_idx in FIRST_USER_ASID_INDEX..self.num_tasks {
             let aspace = &self.address_spaces[as_idx];
@@ -474,10 +519,9 @@ impl KernelState {
         }
 
         // -------------------------------------------------------------------------
-        // Endpoint の整合（構造チェック：ここに集約）
+        // Endpoint の整合（構造チェック）
         // -------------------------------------------------------------------------
         for e in self.endpoints.iter() {
-            // recv_waiter: 単独 waiter（IpcRecv 専用）
             if let Some(tidx) = e.recv_waiter {
                 if tidx >= self.num_tasks {
                     logging::error("INVARIANT VIOLATION: endpoint.recv_waiter out of range");
@@ -503,7 +547,6 @@ impl KernelState {
                 }
             }
 
-            // send_queue: IpcSend waiter のキュー
             for pos in 0..e.sq_len {
                 let tidx = e.send_queue[pos];
                 if tidx >= self.num_tasks {
@@ -530,7 +573,6 @@ impl KernelState {
                 }
             }
 
-            // reply_queue: IpcReply waiter のキュー
             for pos in 0..e.rq_len {
                 let tidx = e.reply_queue[pos];
                 if tidx >= self.num_tasks {
@@ -550,7 +592,6 @@ impl KernelState {
 
                 match t.blocked_reason {
                     Some(BlockedReason::IpcReply { ep, partner }) if ep == e.id => {
-                        // Step1.5 により、本来ここは発生しない（発生したら kill 側の掃除漏れ）
                         if let Some(pidx) = self.tasks.iter().position(|x| x.id == partner) {
                             if self.tasks[pidx].state == TaskState::Dead {
                                 logging::error("INVARIANT VIOLATION: IpcReply waiter has DEAD partner");
@@ -569,8 +610,6 @@ impl KernelState {
 
         // -------------------------------------------------------------------------
         // Step1（Top3）: Dead task 後始末の invariant
-        // - Dead task は ready_queue / wait_queue にいない
-        // - Dead task の user address space に USER mapping が残っていない
         // -------------------------------------------------------------------------
         for (tidx, t) in self.tasks.iter().enumerate().take(self.num_tasks) {
             if t.state != TaskState::Dead {
@@ -608,9 +647,8 @@ impl KernelState {
         }
 
         // -------------------------------------------------------------------------
-        // Step2: wait_queue は Sleep 専用（仕様固定）
+        // Step2: wait_queue は Sleep 専用
         // -------------------------------------------------------------------------
-        // 1) wait_queue 内は必ず Blocked + Sleep
         for pos in 0..self.wq_len {
             let idx = self.wait_queue[pos];
             if idx >= self.num_tasks {
@@ -637,7 +675,6 @@ impl KernelState {
             }
         }
 
-        // 2) Sleep で Blocked の task は必ず wait_queue にいる
         for (idx, t) in self.tasks.iter().enumerate().take(self.num_tasks) {
             if t.state == TaskState::Dead {
                 continue;
@@ -652,8 +689,6 @@ impl KernelState {
 
         // -------------------------------------------------------------------------
         // Step3: 逆向き invariant（Task -> 待ち構造）
-        // - BlockedReason が指す待ち構造に、必ず task が存在する
-        // - wait_queue は Sleep 専用（Step2）なので、IPC は wait_queue に居ない
         // -------------------------------------------------------------------------
         for (tidx, t) in self.tasks.iter().enumerate().take(self.num_tasks) {
             if t.state == TaskState::Dead {
@@ -836,19 +871,12 @@ impl KernelState {
         false
     }
 
-    // ★Top3: endpoint から DEAD task を抜く
     fn remove_task_from_endpoints(&mut self, idx: usize) {
         for ep in self.endpoints.iter_mut() {
-            // --------------------------------------------------
-            // recv_waiter の掃除
-            // --------------------------------------------------
             if ep.recv_waiter == Some(idx) {
                 ep.recv_waiter = None;
             }
 
-            // --------------------------------------------------
-            // send_queue の掃除（swap-remove）
-            // --------------------------------------------------
             let mut pos = 0;
             while pos < ep.sq_len {
                 if ep.send_queue[pos] == idx {
@@ -859,9 +887,6 @@ impl KernelState {
                 }
             }
 
-            // --------------------------------------------------
-            // reply_queue の掃除（swap-remove）
-            // --------------------------------------------------
             let mut pos = 0;
             while pos < ep.rq_len {
                 if ep.reply_queue[pos] == idx {
@@ -874,17 +899,6 @@ impl KernelState {
         }
     }
 
-    // ★Step1.5: “Dead partner を待っている IpcReply waiter” を Ready に戻す
-    //
-    // 方針:
-    // - 永遠待ちを禁止（フォーマル化向けの liveness）
-    // - waiter の last_msg に最小のエラー値を入れて起床させる
-    // ★Step1.5: “Dead partner を待っている IpcReply waiter” を Ready に戻す（一本化版）
-    //
-    // 方針:
-    // - endpoint.reply_queue を実際に掃除する（swap-remove）
-    // - waiter は last_reply にエラーを入れて起床させる
-    // - endpoints を iter_mut している最中に wake_task_to_ready を呼ばない（E0499回避）
     fn resolve_ipc_reply_waiters_for_dead_partner(&mut self, dead_partner: TaskId) {
         let mut wake_list: [Option<usize>; MAX_TASKS] = [None; MAX_TASKS];
         let mut wake_len: usize = 0;
@@ -897,18 +911,16 @@ impl KernelState {
                 let should_rescue = waiter_idx < self.num_tasks
                     && self.tasks[waiter_idx].state == TaskState::Blocked
                     && matches!(
-                    self.tasks[waiter_idx].blocked_reason,
-                    Some(BlockedReason::IpcReply { partner, ep: wep })
-                        if partner == dead_partner && wep == ep.id
-                );
+                        self.tasks[waiter_idx].blocked_reason,
+                        Some(BlockedReason::IpcReply { partner, ep: wep })
+                            if partner == dead_partner && wep == ep.id
+                    );
 
                 if should_rescue {
-                    // reply_queue から swap-remove
                     let last = ep.rq_len - 1;
                     ep.reply_queue[pos] = ep.reply_queue[last];
                     ep.rq_len -= 1;
 
-                    // waiter 側に「失敗」を残す（reply側を推奨）
                     self.tasks[waiter_idx].blocked_reason = None;
                     self.tasks[waiter_idx].last_reply = Some(IPC_ERR_DEAD_PARTNER);
 
@@ -921,7 +933,6 @@ impl KernelState {
                     crate::logging::info_u64("waiter_task_id", self.tasks[waiter_idx].id.0);
                     crate::logging::info_u64("dead_partner_task_id", dead_partner.0);
 
-                    // swap-remove したので pos を進めない
                     continue;
                 }
 
@@ -929,7 +940,6 @@ impl KernelState {
             }
         }
 
-        // endpoints の可変借用が終わってから wake
         for i in 0..wake_len {
             if let Some(waiter_idx) = wake_list[i] {
                 self.wake_task_to_ready(waiter_idx);
@@ -937,7 +947,6 @@ impl KernelState {
         }
     }
 
-    // ★Top3: user fault -> kill
     fn cleanup_user_mappings_of_address_space(&mut self, as_idx: usize) {
         if as_idx >= self.num_tasks {
             return;
@@ -954,14 +963,12 @@ impl KernelState {
             }
         };
 
-        // 1) ページ収集（MAX_MAPPINGS と一致するので必ず収まる）
         let mut pages: [Option<VirtPage>; 64] = [None; 64];
         let mut n: usize = 0;
 
         {
             let aspace = &self.address_spaces[as_idx];
             aspace.for_each_user_mapping_page(|page| {
-                // MAX_MAPPINGS=64 なので n は最大 64 まで
                 if n < pages.len() {
                     pages[n] = Some(page);
                     n += 1;
@@ -969,13 +976,11 @@ impl KernelState {
             });
         }
 
-        // 2) 論理状態を先にクリア（以後 “論理的には残ってない”）
         {
             let aspace = &mut self.address_spaces[as_idx];
             aspace.clear_user_mappings();
         }
 
-        // 3) arch unmap（実ページテーブル）
         for i in 0..n {
             let page = match pages[i] {
                 Some(p) => p,
@@ -999,7 +1004,6 @@ impl KernelState {
         logging::info_u64("unmapped_pages", n as u64);
     }
 
-    // ★既存 kill_task を Step1/Step1.5 対応に拡張
     fn kill_task(&mut self, idx: usize, reason: TaskKillReason) {
         if idx >= self.num_tasks {
             return;
@@ -1008,12 +1012,10 @@ impl KernelState {
         let dead_id = self.tasks[idx].id;
         let as_idx = self.tasks[idx].address_space_id.0;
 
-        // 1) キュー / endpoint から除去
         let _ = self.remove_from_ready_queue(idx);
         let _ = self.remove_from_wait_queue(idx);
         self.remove_task_from_endpoints(idx);
 
-        // 2) task を Dead にして task-local 掃除
         self.tasks[idx].state = TaskState::Dead;
         self.tasks[idx].blocked_reason = None;
         self.tasks[idx].pending_syscall = None;
@@ -1026,17 +1028,16 @@ impl KernelState {
         self.mem_demo_mapped[idx] = false;
         self.mem_demo_frame[idx] = None;
 
-        // 3) Dead task の user mapping を掃除
+        // ★ベストプラクティス: デモ用状態も kill で一貫して掃除しておく（観測の再現性）
+        self.demo_early_sent_by_task0 = false;
+
         self.cleanup_user_mappings_of_address_space(as_idx);
 
-        // 4) ★Step1.5: dead partner 待ちを救済（ここで一本化）
         self.resolve_ipc_reply_waiters_for_dead_partner(dead_id);
 
-        // 5) 観測イベント
         self.push_event(LogEvent::TaskKilled { task: dead_id, reason });
         self.push_event(LogEvent::TaskStateChanged(dead_id, TaskState::Dead));
 
-        // current を殺したら次へ
         if idx == self.current_task {
             self.schedule_next_task();
         }
@@ -1064,7 +1065,6 @@ impl KernelState {
             return None;
         }
 
-        // 念のため: READY 以外が混入しても落ちないように（混入は invariant で検出）
         let mut best_pos: Option<usize> = None;
         let mut best_idx: usize = 0;
         let mut best_prio: u8 = 0;
@@ -1085,7 +1085,6 @@ impl KernelState {
         let best_pos = match best_pos {
             Some(p) => p,
             None => {
-                // 全部壊れてるのでクリア
                 self.rq_len = 0;
                 return None;
             }
@@ -1121,9 +1120,7 @@ impl KernelState {
 
     fn schedule_next_task(&mut self) {
         let prev_idx = self.current_task;
-        let prev_id = self.tasks[prev_idx].id;
 
-        // いまの CR3 が user の可能性があるので、まず「現行タスクの種別」で VGA を安全側に合わせる
         {
             let cur_as_idx = self.tasks[self.current_task].address_space_id.0;
             match self.address_spaces[cur_as_idx].kind {
@@ -1131,6 +1128,28 @@ impl KernelState {
                 AddressSpaceKind::User => logging::set_vga_enabled(false),
             }
         }
+
+        if self.rq_len == 0 {
+            let st = self.tasks[prev_idx].state;
+            match st {
+                TaskState::Running => {
+                    logging::info("schedule_next_task: no ready tasks; keep running");
+                    return;
+                }
+                TaskState::Blocked | TaskState::Dead => {
+                    logging::error("schedule_next_task: no runnable tasks; entering halt-safe state");
+                    self.should_halt = true;
+                    return;
+                }
+                TaskState::Ready => {
+                    logging::error("schedule_next_task: current is READY but no ready_queue; halt-safe");
+                    self.should_halt = true;
+                    return;
+                }
+            }
+        }
+
+        let prev_id = self.tasks[prev_idx].id;
 
         if self.tasks[prev_idx].state == TaskState::Running {
             self.tasks[prev_idx].state = TaskState::Ready;
@@ -1142,14 +1161,8 @@ impl KernelState {
         let next_idx = match self.dequeue_ready_highest_priority() {
             Some(i) => i,
             None => {
-                // ★修正: current_task が Dead のまま回り続けるのを防ぐ
-                crate::logging::error("no ready tasks; entering halt-safe state");
-
-                if self.current_task < self.num_tasks && self.tasks[self.current_task].state == TaskState::Dead {
-                    crate::logging::error("current_task is DEAD and no runnable tasks; halting");
-                    self.should_halt = true;
-                }
-
+                logging::error("schedule_next_task: ready_queue broken; halt-safe");
+                self.should_halt = true;
                 return;
             }
         };
@@ -1183,10 +1196,13 @@ impl KernelState {
             }
         }
 
+        if next_idx != prev_idx {
+            self.counters.sched_switches += 1;
+        }
+
         self.push_event(LogEvent::TaskSwitched(next_id));
         self.push_event(LogEvent::TaskStateChanged(next_id, TaskState::Running));
     }
-
 
     fn update_runtime_for(&mut self, ran_idx: usize) {
         if ran_idx >= self.num_tasks {
@@ -1206,7 +1222,6 @@ impl KernelState {
         let idx = self.current_task;
         let id = self.tasks[idx].id;
 
-        // すでに Dead なら何もしない（安全側）
         if self.tasks[idx].state == TaskState::Dead {
             logging::error("block_current: called for DEAD task; ignore");
             return;
@@ -1218,17 +1233,13 @@ impl KernelState {
 
         self.push_event(LogEvent::TaskStateChanged(id, TaskState::Blocked));
 
-        // ★Step2: wait_queue は Sleep 専用
-        // - IPC 待ちは Endpoint 側の recv_waiter/send_queue/reply_queue のみに載せる
         match reason {
             BlockedReason::Sleep => {
                 self.enqueue_wait(idx);
             }
             BlockedReason::IpcRecv { .. }
             | BlockedReason::IpcSend { .. }
-            | BlockedReason::IpcReply { .. } => {
-                // ここでは enqueue_wait しない
-            }
+            | BlockedReason::IpcReply { .. } => {}
         }
     }
 
@@ -1244,11 +1255,8 @@ impl KernelState {
             return;
         }
 
-        // ★Step2: endpoint 側の参照残りを常に掃除（IPC/Sleep どちらでも安全）
         self.remove_task_from_endpoints(idx);
 
-        // ★Step2: wait_queue は Sleep 専用
-        // - Sleep 以外の BlockedReason のときは wait_queue を触らない
         if self.tasks[idx].blocked_reason == Some(BlockedReason::Sleep) {
             let _ = self.remove_from_wait_queue(idx);
         }
@@ -1310,8 +1318,16 @@ impl KernelState {
         logging::info_u64("time_slice_used", self.tasks[ran_idx].time_slice_used);
 
         if self.tasks[ran_idx].time_slice_used >= self.quantum {
-            logging::info("quantum expired; scheduling next task");
+            logging::info("quantum expired");
             self.push_event(LogEvent::QuantumExpired(id, self.tasks[ran_idx].time_slice_used));
+
+            if self.rq_len == 0 {
+                logging::info("quantum expired but no ready tasks; continue running");
+                self.tasks[ran_idx].time_slice_used = 0;
+                return;
+            }
+
+            logging::info("quantum expired; scheduling next task");
             self.schedule_next_task();
         }
     }
@@ -1380,12 +1396,6 @@ impl KernelState {
         self.do_mem_demo_normal();
     }
 
-    // ★Top3: user fault(#PF) -> kill の入口
-    //
-    // 重要:
-    // - いまの段階では ring3 ではなく、kernel が user VA を “代行アクセス” して #PF を起こす。
-    // - この #PF は「task が起こした fault」として扱いたい（＝ user fault 扱いで kill）。
-    // - そのため、ここでは AddressSpaceKind::Kernel の場合でも panic しない。
     fn kill_current_task_due_to_user_pf(&mut self, pf: arch::paging::PageFaultInfo) {
         let idx = self.current_task;
         let task_id = self.tasks[idx].id;
@@ -1406,6 +1416,8 @@ impl KernelState {
         logging::info_u64("addr", pf.addr);
         logging::info_u64("err", pf.err);
         logging::info_u64("rip", pf.rip);
+
+        self.counters.task_killed_user_pf += 1;
 
         self.kill_task(
             idx,
@@ -1433,13 +1445,6 @@ impl KernelState {
         let as_idx = task.address_space_id.0;
         let aspace = &mut self.address_spaces[as_idx];
 
-        // ---------------------------------------------------------------------
-        // User tasks: stage machine (最も再現性が高く、フォーマル化しやすい)
-        //  0: Map
-        //  1: RW (success expected)
-        //  2: Unmap
-        //  3: RW (should #PF -> kill)
-        // ---------------------------------------------------------------------
         if task_idx != TASK0_INDEX {
             let root = match aspace.root_page_frame {
                 Some(r) => r,
@@ -1454,11 +1459,9 @@ impl KernelState {
             let stage = self.mem_demo_stage[task_idx];
 
             match stage {
-                // ---- stage 0: Map ----
                 0 => {
                     logging::info("mem_demo[user]: stage0 Map");
 
-                    // ★先に frame を取る（ここでは aspace を借りない）
                     let frame = match self.get_or_alloc_demo_frame(task_idx) {
                         Some(f) => f,
                         None => {
@@ -1470,7 +1473,6 @@ impl KernelState {
 
                     let mem_action = MemAction::Map { page, frame, flags };
 
-                    // ★ここで初めて aspace を短く借りる
                     let apply_res = {
                         let aspace = &mut self.address_spaces[as_idx];
                         aspace.apply(mem_action)
@@ -1519,9 +1521,7 @@ impl KernelState {
                     return;
                 }
 
-                // ---- stage 1: RW ok ----
                 1 => {
-                    // user CR3 中：logging 禁止
                     let user_virt = virt_addr_u64 as *mut u64;
 
                     let test_value: u64 = 0xC0DE_0000_0000_0000u64
@@ -1530,7 +1530,6 @@ impl KernelState {
 
                     let rw_result = arch::paging::guarded_user_rw_u64(user_virt, test_value);
 
-                    // kernel CR3 に静かに戻す（ここから logging OK）
                     let kernel_root = self.address_spaces[KERNEL_ASID_INDEX]
                         .root_page_frame
                         .expect("kernel root_page_frame must exist");
@@ -1562,19 +1561,16 @@ impl KernelState {
                     return;
                 }
 
-                // ---- stage 2: Unmap ----
                 2 => {
                     logging::info("mem_demo[user]: stage2 Unmap");
 
                     let mem_action = MemAction::Unmap { page };
 
-                    // 1) logical
                     match aspace.apply(mem_action) {
                         Ok(()) => {
                             logging::info("address_space.apply: OK");
                         }
                         Err(AddressSpaceError::NotMapped) => {
-                            // すでに unmap 済みなら stage3 へ進める
                             logging::error("address_space.apply: ERROR");
                             logging::info("reason = NotMapped");
                             self.mem_demo_stage[task_idx] = 3;
@@ -1585,13 +1581,12 @@ impl KernelState {
                             match e {
                                 AddressSpaceError::AlreadyMapped => logging::info("reason = AlreadyMapped"),
                                 AddressSpaceError::CapacityExceeded => logging::info("reason = CapacityExceeded"),
-                                AddressSpaceError::NotMapped => {} // 上で処理済み
+                                AddressSpaceError::NotMapped => {}
                             }
                             panic!("address_space.apply failed in stage2 Unmap");
                         }
                     }
 
-                    // 2) arch
                     logging::info("mem_demo: applying arch paging (User root / no CR3 switch)");
                     match unsafe { arch::paging::apply_mem_action_in_root(mem_action, root, &mut self.phys_mem) } {
                         Ok(()) => {}
@@ -1614,7 +1609,6 @@ impl KernelState {
                     return;
                 }
 
-                // ---- stage 3: RW after Unmap => should #PF -> kill ----
                 _ => {
                     let user_virt = virt_addr_u64 as *mut u64;
 
@@ -1633,16 +1627,13 @@ impl KernelState {
 
                     match rw_result {
                         Ok(read_back) => {
-                            // Unmap 後に成功は危険（本来 #PF のはず）
                             logging::error("UNEXPECTED: RW succeeded after Unmap");
                             logging::info_u64("read_back", read_back);
 
-                            // デモとしては一旦リセットして回し続ける
                             self.mem_demo_stage[task_idx] = 0;
                             return;
                         }
                         Err(pf) => {
-                            // ここが狙い：user fault として kill
                             self.kill_current_task_due_to_user_pf(pf);
                             self.mem_demo_stage[task_idx] = 0;
                             return;
@@ -1652,13 +1643,9 @@ impl KernelState {
             }
         }
 
-        // ---------------------------------------------------------------------
-        // Kernel task (Task0): 既存の mem_demo_mapped で Map/Unmap を交互
-        // ---------------------------------------------------------------------
         let mem_action = if !self.mem_demo_mapped[task_idx] {
             logging::info("mem_demo: issuing Map (for current task)");
 
-            // ★先に frame を取る（aspace を借りない）
             let frame = match self.get_or_alloc_demo_frame(task_idx) {
                 Some(f) => f,
                 None => {
@@ -1674,7 +1661,6 @@ impl KernelState {
             MemAction::Unmap { page }
         };
 
-        // ★aspace の借用は短くする
         let apply_res = {
             let aspace = &mut self.address_spaces[as_idx];
             aspace.apply(mem_action)
@@ -1712,8 +1698,6 @@ impl KernelState {
             action: mem_action,
         });
     }
-
-    // （evil_* はあなたのコード通り。ここでは省略せず貼るならそのままコピペでOK）
 
     pub fn tick(&mut self) {
         if self.should_halt {
@@ -1761,7 +1745,6 @@ impl KernelState {
             }
         }
 
-        // ★Top3: この tick 中に ran_idx が死んだら、以降の処理はスキップ（整合性優先）
         if ran_idx < self.num_tasks && self.tasks[ran_idx].state == TaskState::Dead {
             logging::info("tick: running task died in this tick; skip syscall/runtime/quantum updates");
             self.activity = next_activity;
@@ -1812,10 +1795,6 @@ impl KernelState {
         }
         logging::info("=== End of Event Log ===");
 
-        // -------------------------------------------------------------------------
-        // Task Dump（状態 + IPC）
-        // - IPC/スケジューラ不整合の切り分けのため、ここが最重要
-        // -------------------------------------------------------------------------
         logging::info("=== Task Dump ===");
         for i in 0..self.num_tasks {
             let task = &self.tasks[i];
@@ -1831,10 +1810,8 @@ impl KernelState {
                 TaskState::Dead => logging::info("state = Dead"),
             }
 
-            // AddressSpace
             logging::info_u64("address_space_id", task.address_space_id.0 as u64);
 
-            // BlockedReason
             match task.blocked_reason {
                 None => logging::info("blocked_reason = None"),
                 Some(BlockedReason::Sleep) => logging::info("blocked_reason = Sleep"),
@@ -1853,13 +1830,11 @@ impl KernelState {
                 }
             }
 
-            // Syscall boundary（pending が残っていると「取りこぼし」が分かる）
             match task.pending_syscall {
                 Some(_) => logging::info("pending_syscall = Some"),
                 None => logging::info("pending_syscall = None"),
             }
 
-            // IPC task-local
             match task.pending_send_msg {
                 Some(v) => {
                     logging::info("pending_send_msg = Some");
@@ -1876,10 +1851,7 @@ impl KernelState {
                 None => logging::info("last_msg = None"),
             }
 
-            // last_reply を持っている実装向け（ないならこのブロックは消してください）
-            #[allow(unused_variables)]
             {
-                // フィールドが存在する前提。存在しない場合はコンパイルエラーになるので削除。
                 if let Some(v) = task.last_reply {
                     logging::info("last_reply = Some");
                     logging::info_u64("last_reply_value", v);
@@ -1890,9 +1862,6 @@ impl KernelState {
         }
         logging::info("=== End of Task Dump ===");
 
-        // -------------------------------------------------------------------------
-        // AddressSpace Dump（per task）
-        // -------------------------------------------------------------------------
         logging::info("=== AddressSpace Dump (per task) ===");
         for i in 0..self.num_tasks {
             let task = self.tasks[i];
@@ -1933,9 +1902,6 @@ impl KernelState {
         }
         logging::info("=== End of AddressSpace Dump ===");
 
-        // -------------------------------------------------------------------------
-        // Endpoint Dump
-        // -------------------------------------------------------------------------
         logging::info("=== Endpoint Dump ===");
         for ep in self.endpoints.iter() {
             logging::info("ENDPOINT:");
@@ -1970,11 +1936,19 @@ impl KernelState {
             }
         }
         logging::info("=== End of Endpoint Dump ===");
+
+        logging::info("=== Counters Dump ===");
+        logging::info_u64("sched_switches", self.counters.sched_switches);
+
+        logging::info_u64("ipc_send_fast", self.counters.ipc_send_fast);
+        logging::info_u64("ipc_send_slow", self.counters.ipc_send_slow);
+        logging::info_u64("ipc_recv_fast", self.counters.ipc_recv_fast);
+        logging::info_u64("ipc_recv_slow", self.counters.ipc_recv_slow);
+        logging::info_u64("ipc_reply_delivered", self.counters.ipc_reply_delivered);
+
+        logging::info_u64("task_killed_user_pf", self.counters.task_killed_user_pf);
+        logging::info("=== End of Counters Dump ===");
     }
-
-
-    // --- ここから下は、あなたの元コードにある他メソッド（syscall/IPC/user_program等） ---
-    // （あなたの注釈どおり：この下は手元既存実装を維持でOK）
 }
 
 fn log_event_to_vga(ev: LogEvent) {

@@ -2,23 +2,31 @@
 //
 // 役割:
 // - IPC(send/recv/reply) が「最低1回は成立する」ことを最短で確認するデモ。
-// - 循環条件で send が一度も起きない（recv_waiter待ち）を避けるため、最初の send を強制する。
+// - 観測性を高めるため、専用 feature で “デモの仕様” を固定できるようにする。
 //
-// やること:
-// - Task1 と Task0 が、それぞれ 1 回だけ IpcSend を発行して “kick” する。
-// - それ以外（Task3想定）は IpcRecv を待ち、受信したら IpcReply を返す。
-// - 返信先は Syscall::IpcReply に to が無い設計なので、kernel 側の「reply_waiter/partner」解決に任せる。
+// 仕様（通常）:
+// - Task1: 最初の kick send（1回だけ）
+// - Task0: 周期 kick-send
+// - Task2: IPC server (recv -> reply)
 //
-// やらないこと:
-// - 送信元追跡の厳密化や多段プロトコルはしない（まず成立優先）。
+// 仕様（feature = ipc_demo_single_slow）:
+// - 目的: “send_queue 経由の slow send” を 1 回に固定しやすくする
+// - Task1: kick send をしない（ノイズ源を除去）
+// - Task0:
+//   (A) Task0 が最初に RUNNING になった最初の tick に 1 回だけ early send
+//   (B) 以後は周期 kick-send だが、recv_waiter が居るときだけ送る（fast のみ）
+// - Task2: IPC server (recv -> reply)
 //
+// 方針:
+// - デモは「再現性」が最重要。時刻依存ではなく「Task0 初回実行」等に固定する。
 
 use crate::kernel::{
     EndpointId, KernelState, Syscall, TaskState, IPC_DEMO_EP0, TASK0_INDEX, TASK1_INDEX, TASK2_INDEX,
 };
 
 impl KernelState {
-    /// 各 tick の終盤で「ユーザ側が発行したい syscall」をセットする。
+    const IPC_KICK_PERIOD_TICKS: u64 = 8;
+
     pub fn user_step_issue_syscall(&mut self, task_idx: usize) {
         if task_idx >= self.num_tasks {
             return;
@@ -42,12 +50,80 @@ impl KernelState {
         let ep: EndpointId = IPC_DEMO_EP0;
 
         // ------------------------------------------------------------
+        // Task0: driver
+        // ------------------------------------------------------------
+        if task_idx == TASK0_INDEX {
+            // reply が来てたら観測してクリア
+            if let Some(v) = self.tasks[task_idx].last_reply {
+                crate::logging::info("ipc_reply_received");
+                crate::logging::info_u64("task_id", self.tasks[task_idx].id.0);
+                crate::logging::info_u64("reply", v);
+                self.tasks[task_idx].last_reply = None;
+            }
+
+            // --------------------------------------------------------
+            // feature: ipc_demo_single_slow
+            // --------------------------------------------------------
+            #[cfg(feature = "ipc_demo_single_slow")]
+            {
+                // (A) Task0 初回 RUNNING の瞬間に 1 回だけ early send
+                if !self.demo_early_sent_by_task0 {
+                    self.demo_early_sent_by_task0 = true;
+
+                    let msg: u64 = 0xEEEE_0000_0000_0000u64 ^ (self.tick_count & 0xFFFF);
+                    self.tasks[task_idx].pending_syscall = Some(Syscall::IpcSend { ep, msg });
+                    return;
+                }
+
+                // (B) 周期 kick-send は “recv_waiter が居る時だけ” 実施（fast だけに寄せる）
+                //
+                // これにより、Task0 の周期送信が send_queue に積まれる（slow）可能性を抑える。
+                if self.tick_count != 0 && (self.tick_count % Self::IPC_KICK_PERIOD_TICKS) == 0 {
+                    // Endpoint0 の recv_waiter が居るかだけを見る（プロトタイプなので簡略）
+                    let can_fast_send = self.endpoints[ep.0].recv_waiter.is_some();
+
+                    if can_fast_send {
+                        let msg: u64 = 0xD0D0_0000_0000_0000u64 ^ (self.tick_count & 0xFFFF);
+                        self.tasks[task_idx].pending_syscall = Some(Syscall::IpcSend { ep, msg });
+                        return;
+                    }
+                }
+
+                return;
+            }
+
+            // --------------------------------------------------------
+            // 通常モード
+            // --------------------------------------------------------
+            if self.tick_count != 0 && (self.tick_count % Self::IPC_KICK_PERIOD_TICKS) == 0 {
+                let msg: u64 = 0xD0D0_0000_0000_0000u64 ^ (self.tick_count & 0xFFFF);
+                self.tasks[task_idx].pending_syscall = Some(Syscall::IpcSend { ep, msg });
+                return;
+            }
+
+            return;
+        }
+
+        // ------------------------------------------------------------
         // Task1: 最初の kick send（1回だけ）
         // ------------------------------------------------------------
         if task_idx == TASK1_INDEX {
+            // feature モードでは Task1 はノイズ源になりうるので送らない
+            #[cfg(feature = "ipc_demo_single_slow")]
+            {
+                if let Some(v) = self.tasks[task_idx].last_reply {
+                    crate::logging::info("ipc_reply_received");
+                    crate::logging::info_u64("task_id", self.tasks[task_idx].id.0);
+                    crate::logging::info_u64("reply", v);
+                    self.tasks[task_idx].last_reply = None;
+                }
+                return;
+            }
+
+            // 通常モード：最初の kick send
             if !self.demo_sent_by_task1 {
                 self.demo_sent_by_task1 = true;
-                let msg: u64 = 0x1111_0000_0000_0000 ^ (self.tick_count & 0xFFFF);
+                let msg: u64 = 0x1111_0000_0000_0000u64 ^ (self.tick_count & 0xFFFF);
                 self.tasks[task_idx].pending_syscall = Some(Syscall::IpcSend { ep, msg });
                 return;
             }
@@ -63,37 +139,15 @@ impl KernelState {
         }
 
         // ------------------------------------------------------------
-        // Task0: 2回目の kick send（1回だけ）
-        // ------------------------------------------------------------
-        if task_idx == TASK0_INDEX {
-            if !self.demo_sent_by_task2 {
-                self.demo_sent_by_task2 = true;
-                let msg: u64 = 0x2222_0000_0000_0000 ^ (self.tick_count & 0xFFFF);
-                self.tasks[task_idx].pending_syscall = Some(Syscall::IpcSend { ep, msg });
-                return;
-            }
-
-            if let Some(v) = self.tasks[task_idx].last_reply {
-                crate::logging::info("ipc_reply_received");
-                crate::logging::info_u64("task_id", self.tasks[task_idx].id.0);
-                crate::logging::info_u64("reply", v);
-                self.tasks[task_idx].last_reply = None;
-            }
-            return;
-        }
-
-        // ------------------------------------------------------------
-        // Task2 (task_index=2 / task_id=3): IPC server (recv -> reply)
+        // Task2: IPC server (recv -> reply)
         // ------------------------------------------------------------
         if task_idx == TASK2_INDEX {
-            let ep: EndpointId = IPC_DEMO_EP0;
-
             if let Some(msg) = self.tasks[task_idx].last_msg {
                 crate::logging::info("ipc_msg_received");
                 crate::logging::info_u64("task_id", self.tasks[task_idx].id.0);
                 crate::logging::info_u64("msg", msg);
 
-                let reply: u64 = 0xABCD_0000_0000_0000 ^ (msg & 0xFFFF);
+                let reply: u64 = 0xABCD_0000_0000_0000u64 ^ (msg & 0xFFFF);
 
                 self.tasks[task_idx].last_msg = None;
                 self.tasks[task_idx].pending_syscall = Some(Syscall::IpcReply { ep, msg: reply });
@@ -105,17 +159,15 @@ impl KernelState {
             return;
         }
 
-
         // ------------------------------------------------------------
-        // それ以外（Task3想定）: recv → reply
+        // それ以外
         // ------------------------------------------------------------
         if let Some(msg) = self.tasks[task_idx].last_msg {
             crate::logging::info("ipc_msg_received");
             crate::logging::info_u64("task_id", self.tasks[task_idx].id.0);
             crate::logging::info_u64("msg", msg);
 
-            // デモ返信（送信元の特定は kernel 側の reply_waiter 解決に任せる）
-            let reply: u64 = 0xABCD_0000_0000_0000 ^ (msg & 0xFFFF);
+            let reply: u64 = 0xABCD_0000_0000_0000u64 ^ (msg & 0xFFFF);
 
             self.tasks[task_idx].last_msg = None;
             self.tasks[task_idx].pending_syscall = Some(Syscall::IpcReply { ep, msg: reply });
