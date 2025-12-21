@@ -36,3 +36,8 @@ ipc_trace_paths = ["ipc_trace_syscall"]
 
 # --- 互換 alias（古い呼び名が残ってても壊さない） ---
 evil_mem_double_map = ["evil_double_map"]
+
+# --- kill cleanup を検証するためのテスト用 ---
+kill_cleanup_test = []
+
+dead_partner_test = []

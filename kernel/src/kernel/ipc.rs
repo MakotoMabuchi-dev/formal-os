@@ -17,27 +17,15 @@
 // - feature 有効時だけ、fast/slow / reply の結果を「必ず1行」で出す
 // - TaskId / EndpointId を u64 にキャストしない（型依存バグ回避）
 // - ログは最小（経路のみ）で、フォーマル化しやすい形にする
+// - 実装は trace.rs に集約し、ここでは “イベント種別” だけ渡す
 
 use super::{
-    BlockedReason, EndpointId, KernelState, LogEvent, TaskId, TaskState, IPC_DEMO_EP0, MAX_ENDPOINTS, MAX_TASKS,
+    trace, BlockedReason, EndpointId, KernelState, LogEvent, TaskId, TaskState, IPC_DEMO_EP0, MAX_ENDPOINTS, MAX_TASKS,
 };
+use super::AddressSpaceKind;
 
 /// reply エラーコード（Dead partner を待っていた等）
 pub const IPC_ERR_DEAD_PARTNER: u64 = 0xDEAD_DEAD_DEAD_DEAD;
-
-/// ipc_trace_paths 用：経路ログ（feature on の時だけ出す）
-#[inline(always)]
-fn ipc_trace_paths(line: &'static str) {
-    #[cfg(feature = "ipc_trace_paths")]
-    {
-        // 文字列だけ出す：型変換やフォーマット依存を避け、壊れにくくする
-        crate::logging::info(line);
-    }
-    #[cfg(not(feature = "ipc_trace_paths"))]
-    {
-        let _ = line;
-    }
-}
 
 /// Endpoint（reply_queue 版）
 #[derive(Clone, Copy)]
@@ -133,6 +121,18 @@ impl Endpoint {
 }
 
 impl KernelState {
+    /// 指定タスクが Kernel address space かどうか（IPC の方針判断用）
+    fn is_kernel_task_index(&self, idx: usize) -> bool {
+        if idx >= self.num_tasks {
+            return false;
+        }
+        let as_idx = self.tasks[idx].address_space_id.0;
+        if as_idx >= self.num_tasks {
+            return false;
+        }
+        self.address_spaces[as_idx].kind == AddressSpaceKind::Kernel
+    }
+
     /// reply_queue から「partner を待っている waiter」を 1つ取り出す
     fn take_reply_waiter_for_partner(&mut self, ep: EndpointId, partner: TaskId) -> Option<usize> {
         if ep.0 >= MAX_ENDPOINTS {
@@ -214,7 +214,7 @@ impl KernelState {
         self.counters.ipc_recv_fast += 1;
 
         // ★ipc_trace_paths（必ず1行）
-        ipc_trace_paths("ipc_trace_paths recv=fast");
+        trace::trace_ipc_path(trace::IpcPathEvent::RecvFast);
 
         self.push_event(LogEvent::IpcDelivered { from: send_id, to: recv_id, ep, msg });
         true
@@ -232,7 +232,18 @@ impl KernelState {
         self.counters.ipc_recv_slow += 1;
 
         // ★ipc_trace_paths（必ず1行）
-        ipc_trace_paths("ipc_trace_paths recv=slow");
+        trace::trace_ipc_path(trace::IpcPathEvent::RecvSlow);
+
+        // ★重要: Kernel task は recv で block しない（recv_waiter にも登録しない）
+        if self.is_kernel_task_index(recv_idx) {
+            crate::logging::error("ipc_recv_slowpath: kernel would block; convert to error (no recv_waiter)");
+            crate::logging::info_u64("task_id", recv_id.0);
+            crate::logging::info_u64("ep_id", ep.0 as u64);
+
+            // 既存流用（本当は WOULD_BLOCK を用意したい）
+            self.tasks[recv_idx].last_reply = Some(IPC_ERR_DEAD_PARTNER);
+            return;
+        }
 
         self.block_current(BlockedReason::IpcRecv { ep });
         self.endpoints[ep.0].recv_waiter = Some(recv_idx);
@@ -319,7 +330,7 @@ impl KernelState {
         self.counters.ipc_send_fast += 1;
 
         // ★ipc_trace_paths（必ず1行）
-        ipc_trace_paths("ipc_trace_paths send=fast");
+        trace::trace_ipc_path(trace::IpcPathEvent::SendFast);
 
         self.push_event(LogEvent::IpcDelivered { from: send_id, to: recv_id, ep, msg });
 
@@ -334,7 +345,22 @@ impl KernelState {
         self.counters.ipc_send_slow += 1;
 
         // ★ipc_trace_paths（必ず1行）
-        ipc_trace_paths("ipc_trace_paths send=slow");
+        trace::trace_ipc_path(trace::IpcPathEvent::SendSlow);
+
+        // ★重要: Kernel task は send で block しない（send_queue にも積まない）
+        //   ここで enqueue してしまうと「send_queue 内の sender は BLOCKED」という invariant を壊す。
+        if self.is_kernel_task_index(send_idx) {
+            crate::logging::error("ipc_send_slowpath: kernel would block; convert to error (no enqueue)");
+            crate::logging::info_u64("task_id", send_id.0);
+            crate::logging::info_u64("ep_id", ep.0 as u64);
+
+            // pending/send_queue を絶対に残さない
+            self.tasks[send_idx].pending_send_msg = None;
+
+            // 既存流用（本当は WOULD_BLOCK を用意したい）
+            self.tasks[send_idx].last_reply = Some(IPC_ERR_DEAD_PARTNER);
+            return;
+        }
 
         self.tasks[send_idx].pending_send_msg = Some(msg);
 
@@ -398,7 +424,7 @@ impl KernelState {
             Some(i) => i,
             None => {
                 // ★ipc_trace_paths（必ず1行）
-                ipc_trace_paths("ipc_trace_paths reply=no_waiter");
+                trace::trace_ipc_path(trace::IpcPathEvent::ReplyNoWaiter);
                 return;
             }
         };
@@ -435,7 +461,7 @@ impl KernelState {
         self.counters.ipc_reply_delivered += 1;
 
         // ★ipc_trace_paths（必ず1行）
-        ipc_trace_paths("ipc_trace_paths reply=delivered");
+        trace::trace_ipc_path(trace::IpcPathEvent::ReplyDelivered);
 
         self.push_event(LogEvent::IpcReplyDelivered { from: recv_id, to: send_id, ep });
     }

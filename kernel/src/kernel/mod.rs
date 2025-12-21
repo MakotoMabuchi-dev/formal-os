@@ -31,6 +31,7 @@ mod ipc;
 mod pagetable_init;
 mod syscall;
 mod user_program;
+mod trace;
 
 pub use entry::start;
 pub use syscall::Syscall;
@@ -257,12 +258,18 @@ pub struct KernelState {
     // send_queue 経由（recv_fastpath）を確実に踏ませるための early send を 1 回だけ発行する
     demo_early_sent_by_task0: bool,
 
+    // ★追加（kill_cleanup_test 専用）:
+    // Task1 の stage0 Map 完了直後に 1 回だけ kill する（cleanup 検証）
+    #[cfg(feature = "kill_cleanup_test")]
+    kill_cleanup_test_fired: bool,
+
     #[cfg(feature = "pf_demo")]
     pf_demo_done: bool,
 
     // ★追加: counters
     pub counters: KernelCounters,
 }
+
 
 impl KernelState {
     pub fn new(boot_info: &'static BootInfo) -> Self {
@@ -325,7 +332,6 @@ impl KernelState {
 
         address_spaces[KERNEL_ASID_INDEX].root_page_frame = Some(root_frame_for_task0);
 
-        // User PML4 を 2つ作る
         for as_idx in FIRST_USER_ASID_INDEX..MAX_TASKS {
             let user_root = match pagetable_init::allocate_new_l4_table(&mut phys_mem) {
                 Some(f) => f,
@@ -389,6 +395,9 @@ impl KernelState {
             demo_sent_by_task1: false,
 
             demo_early_sent_by_task0: false,
+
+            #[cfg(feature = "kill_cleanup_test")]
+            kill_cleanup_test_fired: false,
 
             #[cfg(feature = "pf_demo")]
             pf_demo_done: false,
@@ -959,37 +968,73 @@ impl KernelState {
             Some(r) => r,
             None => {
                 logging::error("cleanup_user_mappings: user root_page_frame is None");
-                panic!("user root_page_frame is None");
+                panic!("cleanup_user_mappings: user root_page_frame is None");
             }
         };
 
+        // ---- 観測性: 事前情報 ----
+        logging::info("cleanup_user_mappings: start");
+        logging::info_u64("as_idx", as_idx as u64);
+        logging::info_u64("root_page_frame_index", root.number);
+
+        let before_count = self.address_spaces[as_idx].mapping_count();
+        logging::info_u64("cleanup_user_mappings: before clear mapping_count", before_count as u64);
+
+        // ---- 重要: USER フラグの mapping を “AddressSpace の全 mapping” から拾う ----
+        // for_each_user_mapping_page() が将来壊れても、ここで拾えるようにする
         let mut pages: [Option<VirtPage>; 64] = [None; 64];
         let mut n: usize = 0;
 
         {
             let aspace = &self.address_spaces[as_idx];
-            aspace.for_each_user_mapping_page(|page| {
+            aspace.for_each_mapping(|m| {
+                if !m.flags.contains(PageFlags::USER) {
+                    return;
+                }
                 if n < pages.len() {
-                    pages[n] = Some(page);
+                    pages[n] = Some(m.page);
                     n += 1;
+                } else {
+                    // 64を超えるなら、まずは “検証用途なので” ここで止める（必要なら後で拡張）
+                    logging::error("cleanup_user_mappings: too many USER mappings; truncated");
                 }
             });
         }
 
+        logging::info_u64("cleanup_user_mappings: collected_user_pages", n as u64);
+
+        // ---- AddressSpace 側の“ユーザマッピング記録”を消す（論理状態）----
         {
             let aspace = &mut self.address_spaces[as_idx];
             aspace.clear_user_mappings();
         }
+
+        let after_clear_count = self.address_spaces[as_idx].mapping_count();
+        logging::info_u64("cleanup_user_mappings: after clear mapping_count", after_clear_count as u64);
+
+        // ---- arch の実ページテーブル側を unmap（物理状態）----
+        let mut applied: usize = 0;
 
         for i in 0..n {
             let page = match pages[i] {
                 Some(p) => p,
                 None => continue,
             };
+
             let mem_action = MemAction::Unmap { page };
 
             match unsafe { arch::paging::apply_mem_action_in_root(mem_action, root, &mut self.phys_mem) } {
-                Ok(()) => {}
+                Ok(()) => {
+                    applied += 1;
+
+                    // うるさくなりすぎないように先頭数件だけ translate を確認
+                    if i < 4 {
+                        let virt_addr_u64 = arch::paging::USER_SPACE_BASE + page.start_address().0;
+                        logging::info("cleanup_user_mappings: debug_translate_after_unmap");
+                        logging::info_u64("virt_addr", virt_addr_u64);
+                        arch::paging::debug_translate_in_root(root, virt_addr_u64);
+                    }
+                }
                 Err(_e) => {
                     logging::error("cleanup_user_mappings: arch unmap failed; abort (fail-stop)");
                     logging::info_u64("as_idx", as_idx as u64);
@@ -999,12 +1044,22 @@ impl KernelState {
             }
         }
 
+        logging::info_u64("cleanup_user_mappings: arch_unmap_applied", applied as u64);
+
+        let after_unmap_count = self.address_spaces[as_idx].mapping_count();
+        logging::info_u64("cleanup_user_mappings: after unmap mapping_count", after_unmap_count as u64);
+
         logging::info("cleanup_user_mappings: done");
-        logging::info_u64("as_idx", as_idx as u64);
-        logging::info_u64("unmapped_pages", n as u64);
     }
 
     fn kill_task(&mut self, idx: usize, reason: TaskKillReason) {
+        // counters を “reason” ベースで一元管理（経路差でズレないようにする）
+        match reason {
+            TaskKillReason::UserPageFault { .. } => {
+                self.counters.task_killed_user_pf += 1;
+            }
+        }
+
         if idx >= self.num_tasks {
             return;
         }
@@ -1121,6 +1176,7 @@ impl KernelState {
     fn schedule_next_task(&mut self) {
         let prev_idx = self.current_task;
 
+        // VGA 切替（そのまま）
         {
             let cur_as_idx = self.tasks[self.current_task].address_space_id.0;
             match self.address_spaces[cur_as_idx].kind {
@@ -1129,26 +1185,64 @@ impl KernelState {
             }
         }
 
+        // -------------------------------------------------------------
+        // 重要: ready が無いときに halt しない
+        // - Sleep がいれば wake を試みる
+        // - それでも無ければ “Idle(task0)” を RUNNING にして継続
+        // -------------------------------------------------------------
         if self.rq_len == 0 {
-            let st = self.tasks[prev_idx].state;
-            match st {
-                TaskState::Running => {
-                    logging::info("schedule_next_task: no ready tasks; keep running");
-                    return;
+            // Sleep waiter がいれば 1 つ起こす
+            if self.wq_len > 0 {
+                logging::info("schedule_next_task: no ready tasks; try wake sleep waiter");
+                self.maybe_wake_one_sleep_task();
+            }
+
+            // wake により ready ができたなら通常スケジュールへ
+            if self.rq_len == 0 {
+                logging::info("schedule_next_task: still no ready tasks; run idle(task0) and continue");
+
+                // current が RUNNING 以外なら、task0 を強制 RUNNING にして invariant を守る
+                if self.tasks[self.current_task].state != TaskState::Running {
+                    let idle_idx = TASK0_INDEX;
+
+                    // もし task0 が Dead なら致命的（設計上ありえない前提）
+                    if self.tasks[idle_idx].state == TaskState::Dead {
+                        logging::error("schedule_next_task: idle task is DEAD; halt-safe");
+                        self.should_halt = true;
+                        return;
+                    }
+
+                    // いまの current が Running なら Ready に戻しておく
+                    if self.tasks[prev_idx].state == TaskState::Running && prev_idx != idle_idx {
+                        let prev_id = self.tasks[prev_idx].id;
+                        self.tasks[prev_idx].state = TaskState::Ready;
+                        self.tasks[prev_idx].time_slice_used = 0;
+                        self.push_event(LogEvent::TaskStateChanged(prev_id, TaskState::Ready));
+                        self.enqueue_ready(prev_idx);
+                    }
+
+                    // idle を RUNNING に
+                    self.tasks[idle_idx].state = TaskState::Running;
+                    self.tasks[idle_idx].blocked_reason = None;
+                    self.tasks[idle_idx].time_slice_used = 0;
+                    self.current_task = idle_idx;
+
+                    let kernel_root = self.address_spaces[KERNEL_ASID_INDEX]
+                        .root_page_frame
+                        .expect("kernel root_page_frame must exist");
+                    arch::paging::switch_address_space_quiet(kernel_root);
+                    logging::set_vga_enabled(true);
+
+                    self.push_event(LogEvent::TaskSwitched(self.tasks[idle_idx].id));
+                    self.push_event(LogEvent::TaskStateChanged(self.tasks[idle_idx].id, TaskState::Running));
                 }
-                TaskState::Blocked | TaskState::Dead => {
-                    logging::error("schedule_next_task: no runnable tasks; entering halt-safe state");
-                    self.should_halt = true;
-                    return;
-                }
-                TaskState::Ready => {
-                    logging::error("schedule_next_task: current is READY but no ready_queue; halt-safe");
-                    self.should_halt = true;
-                    return;
-                }
+
+                // “継続”するだけ
+                return;
             }
         }
 
+        // ここから先は元のロジック（ready がある前提）
         let prev_id = self.tasks[prev_idx].id;
 
         if self.tasks[prev_idx].state == TaskState::Running {
@@ -1188,9 +1282,7 @@ impl KernelState {
                     .root_page_frame
                     .expect("kernel root_page_frame must exist");
                 arch::paging::switch_address_space_quiet(kernel_root);
-
                 logging::set_vga_enabled(true);
-
                 logging::info("switched to task");
                 logging::info_u64("task_id", next_id.0);
             }
@@ -1225,6 +1317,34 @@ impl KernelState {
         if self.tasks[idx].state == TaskState::Dead {
             logging::error("block_current: called for DEAD task; ignore");
             return;
+        }
+
+        // ---------------------------------------------------------------------
+        // 重要: Kernel task は IPC で BLOCK させない
+        // - ここで BLOCK すると「全タスク Blocked → halt」になりやすい
+        // - “would block” は last_reply にエラーを入れて RUNNING 継続
+        // ---------------------------------------------------------------------
+        let as_idx = self.tasks[idx].address_space_id.0;
+        if as_idx < self.num_tasks && self.address_spaces[as_idx].kind == AddressSpaceKind::Kernel {
+            match reason {
+                BlockedReason::IpcRecv { ep }
+                | BlockedReason::IpcSend { ep }
+                | BlockedReason::IpcReply { ep, .. } => {
+                    logging::error("block_current: kernel task would block on IPC; convert to error");
+                    logging::info_u64("task_id", id.0);
+                    logging::info_u64("ep", ep.0 as u64);
+
+                    // 既存の “エラー返信” を流用（最小）
+                    self.tasks[idx].last_reply = Some(IPC_ERR_DEAD_PARTNER);
+                    // ★重要: 送信待ちのゴミを残さない（invariant/観測の安定化）
+                    self.tasks[idx].pending_send_msg = None;
+                    return;
+;
+                }
+                BlockedReason::Sleep => {
+                    // kernel の Sleep block は許可（必要なら）
+                }
+            }
         }
 
         self.tasks[idx].state = TaskState::Blocked;
@@ -1417,8 +1537,6 @@ impl KernelState {
         logging::info_u64("err", pf.err);
         logging::info_u64("rip", pf.rip);
 
-        self.counters.task_killed_user_pf += 1;
-
         self.kill_task(
             idx,
             TaskKillReason::UserPageFault { addr: pf.addr, err: pf.err, rip: pf.rip },
@@ -1445,6 +1563,9 @@ impl KernelState {
         let as_idx = task.address_space_id.0;
         let aspace = &mut self.address_spaces[as_idx];
 
+        // -------------------------------------------------------------------------
+        // User mem demo: Map -> RW -> Unmap -> RW(after unmap => #PF expected)
+        // -------------------------------------------------------------------------
         if task_idx != TASK0_INDEX {
             let root = match aspace.root_page_frame {
                 Some(r) => r,
@@ -1459,6 +1580,7 @@ impl KernelState {
             let stage = self.mem_demo_stage[task_idx];
 
             match stage {
+                // --- stage0: Map ---
                 0 => {
                     logging::info("mem_demo[user]: stage0 Map");
 
@@ -1473,6 +1595,7 @@ impl KernelState {
 
                     let mem_action = MemAction::Map { page, frame, flags };
 
+                    // 論理状態（AddressSpace）に反映
                     let apply_res = {
                         let aspace = &mut self.address_spaces[as_idx];
                         aspace.apply(mem_action)
@@ -1499,6 +1622,7 @@ impl KernelState {
                         }
                     }
 
+                    // 物理状態（ページテーブル）に反映：User root を直接使って map
                     logging::info("mem_demo: applying arch paging (User root / no CR3 switch)");
                     match unsafe { arch::paging::apply_mem_action_in_root(mem_action, root, &mut self.phys_mem) } {
                         Ok(()) => {}
@@ -1508,8 +1632,10 @@ impl KernelState {
                         }
                     }
 
+                    // 参考：translate を出しておく
                     arch::paging::debug_translate_in_root(root, virt_addr_u64);
 
+                    // stage 遷移
                     self.mem_demo_stage[task_idx] = 1;
 
                     self.push_event(LogEvent::MemActionApplied {
@@ -1518,9 +1644,34 @@ impl KernelState {
                         action: mem_action,
                     });
 
+                    // -----------------------------------------------------------------
+                    // kill_cleanup_test:
+                    //   Map 直後（USER mapping が確実に残っている状態）で kill を発火し、
+                    //   cleanup_user_mappings_of_address_space() が「実PTも掃除できる」か検証する。
+                    //   うるさくならないように “1回だけ” 発火させる。
+                    // -----------------------------------------------------------------
+                    #[cfg(feature = "kill_cleanup_test")]
+                    {
+                        // Task1（task_id=2）だけ、stage0 Map直後に1回だけ kill して cleanup を検証する
+                        if task_id == TASK1_ID && !self.kill_cleanup_test_fired {
+                            self.kill_cleanup_test_fired = true;
+
+                            logging::error("kill_cleanup_test: force kill right after Task1 user stage0 Map");
+                            self.kill_task(
+                                task_idx,
+                                TaskKillReason::UserPageFault {
+                                    addr: virt_addr_u64,
+                                    err: 0,
+                                    rip: 0,
+                                },
+                            );
+                            return;
+                        }
+                    }
                     return;
                 }
 
+                // --- stage1: RW ---
                 1 => {
                     let user_virt = virt_addr_u64 as *mut u64;
 
@@ -1528,8 +1679,11 @@ impl KernelState {
                         ^ ((task_id.0 & 0xFFFF) << 16)
                         ^ (self.tick_count & 0xFFFF);
 
+                    // ここは「カーネルの CR3 のまま」ガード付きで user ptr を触る
                     let rw_result = arch::paging::guarded_user_rw_u64(user_virt, test_value);
 
+                    // guarded_user_rw_u64 が user root に切り替えている可能性があるので、
+                    // 絶対に kernel CR3 に戻してからログを出す（観測の安定化）
                     let kernel_root = self.address_spaces[KERNEL_ASID_INDEX]
                         .root_page_frame
                         .expect("kernel root_page_frame must exist");
@@ -1561,11 +1715,13 @@ impl KernelState {
                     return;
                 }
 
+                // --- stage2: Unmap ---
                 2 => {
                     logging::info("mem_demo[user]: stage2 Unmap");
 
                     let mem_action = MemAction::Unmap { page };
 
+                    // 論理状態（AddressSpace）から削除
                     match aspace.apply(mem_action) {
                         Ok(()) => {
                             logging::info("address_space.apply: OK");
@@ -1587,6 +1743,7 @@ impl KernelState {
                         }
                     }
 
+                    // 物理状態（ページテーブル）も unmap
                     logging::info("mem_demo: applying arch paging (User root / no CR3 switch)");
                     match unsafe { arch::paging::apply_mem_action_in_root(mem_action, root, &mut self.phys_mem) } {
                         Ok(()) => {}
@@ -1609,6 +1766,7 @@ impl KernelState {
                     return;
                 }
 
+                // --- stage3: RW after unmap (=> #PF expected) ---
                 _ => {
                     let user_virt = virt_addr_u64 as *mut u64;
 
@@ -1627,6 +1785,7 @@ impl KernelState {
 
                     match rw_result {
                         Ok(read_back) => {
+                            // ここが成功したら PT/ガードが壊れてる
                             logging::error("UNEXPECTED: RW succeeded after Unmap");
                             logging::info_u64("read_back", read_back);
 
@@ -1634,6 +1793,7 @@ impl KernelState {
                             return;
                         }
                         Err(pf) => {
+                            // 期待通り：ユーザ領域アクセスで #PF → タスク kill
                             self.kill_current_task_due_to_user_pf(pf);
                             self.mem_demo_stage[task_idx] = 0;
                             return;
@@ -1643,6 +1803,9 @@ impl KernelState {
             }
         }
 
+        // -------------------------------------------------------------------------
+        // Kernel task mem demo: Map <-> Unmap を繰り返すだけ
+        // -------------------------------------------------------------------------
         let mem_action = if !self.mem_demo_mapped[task_idx] {
             logging::info("mem_demo: issuing Map (for current task)");
 
