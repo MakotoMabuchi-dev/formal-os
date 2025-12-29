@@ -18,4 +18,7 @@ FEATURES="ipc_demo_single_slow ipc_trace_paths" ./scripts/build-kernel.sh >/dev/
 echo "[ci] 4) build: pf_demo"
 FEATURES="pf_demo" ./scripts/build-kernel.sh >/dev/null
 
+echo "[ci] 5) build: endpoint_close_test"
+FEATURES="endpoint_close_test" ./scripts/build-kernel.sh >/dev/null
+
 echo "[ci] OK"

@@ -41,3 +41,5 @@ evil_mem_double_map = ["evil_double_map"]
 kill_cleanup_test = []
 
 dead_partner_test = []
+
+endpoint_close_test = []

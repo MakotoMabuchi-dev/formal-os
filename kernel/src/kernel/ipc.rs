@@ -13,11 +13,13 @@
 // ★fastpath/slowpath 分離 + counters:
 // - send/recv の fastpath/slowpath でカウンタを増やす（ログ量は増やさない）
 //
-// ★ipc_trace_paths（観測性）:
-// - feature 有効時だけ、fast/slow / reply の結果を「必ず1行」で出す
-// - TaskId / EndpointId を u64 にキャストしない（型依存バグ回避）
-// - ログは最小（経路のみ）で、フォーマル化しやすい形にする
-// - 実装は trace.rs に集約し、ここでは “イベント種別” だけ渡す
+// ★Step1:
+// - Kernel task の IPC 参加を入口で禁止（endpoint に触らない）
+//
+// ★Step2:
+// - Endpoint の “close” を導入する（owner が死んだら close）。
+// - close 時に waiters を READY に戻し、last_reply にエラーを入れる（永遠待ち防止）。
+// - open/closed は endpoint の仕様として扱い、invariant でも検知する。
 
 use super::{
     trace, BlockedReason, EndpointId, KernelState, LogEvent, TaskId, TaskState, IPC_DEMO_EP0, MAX_ENDPOINTS, MAX_TASKS,
@@ -27,10 +29,20 @@ use super::AddressSpaceKind;
 /// reply エラーコード（Dead partner を待っていた等）
 pub const IPC_ERR_DEAD_PARTNER: u64 = 0xDEAD_DEAD_DEAD_DEAD;
 
+/// endpoint close エラーコード（owner dead 等）
+pub const IPC_ERR_ENDPOINT_CLOSED: u64 = 0xC105_ED00_C105_ED00;
+
+
 /// Endpoint（reply_queue 版）
 #[derive(Clone, Copy)]
 pub struct Endpoint {
     pub id: EndpointId,
+
+    /// Step2: owner（このタスクが死んだら endpoint は close される）
+    pub owner: Option<TaskId>,
+
+    /// Step2: close フラグ（closed の endpoint では send/recv/reply しない）
+    pub is_closed: bool,
 
     /// “受信待ち” は単独 waiter（prototype）
     pub recv_waiter: Option<usize>,
@@ -48,6 +60,8 @@ impl Endpoint {
     pub const fn new(id: EndpointId) -> Self {
         Endpoint {
             id,
+            owner: None,
+            is_closed: false,
             recv_waiter: None,
             send_queue: [0; MAX_TASKS],
             sq_len: 0,
@@ -133,6 +147,109 @@ impl KernelState {
         self.address_spaces[as_idx].kind == AddressSpaceKind::Kernel
     }
 
+    /// Step1: Kernel task の IPC を入口で禁止（endpoint に触らない）
+    fn reject_ipc_if_kernel_current(&mut self, api_name: &'static str, ep: EndpointId) -> bool {
+        let idx = self.current_task;
+        if idx >= self.num_tasks {
+            return true;
+        }
+        if self.tasks[idx].state == TaskState::Dead {
+            return true;
+        }
+
+        if self.is_kernel_task_index(idx) {
+            let tid = self.tasks[idx].id;
+            crate::logging::error("ipc: kernel task is forbidden to call IPC (rejected at entry)");
+            crate::logging::info(api_name);
+            crate::logging::info_u64("task_id", tid.0);
+            crate::logging::info_u64("ep_id", ep.0 as u64);
+
+            // 最小のエラー返し（pending_send_msg 等は触らない）
+            self.tasks[idx].last_reply = Some(IPC_ERR_DEAD_PARTNER);
+            return true;
+        }
+
+        false
+    }
+
+    /// Step2: endpoint が closed なら、入口で拒否（状態は壊さない）
+    fn reject_ipc_if_endpoint_closed(&mut self, api_name: &'static str, ep: EndpointId) -> bool {
+        if ep.0 >= MAX_ENDPOINTS {
+            return true;
+        }
+        if self.endpoints[ep.0].is_closed {
+            let idx = self.current_task;
+            if idx < self.num_tasks && self.tasks[idx].state != TaskState::Dead {
+                let tid = self.tasks[idx].id;
+                crate::logging::error("ipc: endpoint is CLOSED (rejected at entry)");
+                crate::logging::info(api_name);
+                crate::logging::info_u64("task_id", tid.0);
+                crate::logging::info_u64("ep_id", ep.0 as u64);
+                self.tasks[idx].last_reply = Some(IPC_ERR_ENDPOINT_CLOSED);
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Step2: endpoint を close し、待ちタスクを rescue する
+    pub(super) fn close_endpoint_and_rescue_waiters(&mut self, ep: EndpointId) {
+        if ep.0 >= MAX_ENDPOINTS {
+            return;
+        }
+
+        // close マーク（再入を避ける）
+        if self.endpoints[ep.0].is_closed {
+            return;
+        }
+        self.endpoints[ep.0].is_closed = true;
+
+        crate::logging::error("ipc: endpoint CLOSED; rescuing waiters");
+        crate::logging::info_u64("ep_id", ep.0 as u64);
+
+        // 1) recv_waiter rescue
+        if let Some(recv_idx) = self.endpoints[ep.0].recv_waiter.take() {
+            if recv_idx < self.num_tasks && self.tasks[recv_idx].state != TaskState::Dead {
+                // blocked_reason を外し、エラーを返して READY に戻す
+                self.tasks[recv_idx].blocked_reason = None;
+                self.tasks[recv_idx].last_reply = Some(IPC_ERR_ENDPOINT_CLOSED);
+                self.wake_task_to_ready(recv_idx);
+            }
+        }
+
+        // 2) send_queue rescue（全員）
+        let pos = 0;
+        while pos < self.endpoints[ep.0].sq_len {
+            let send_idx = self.endpoints[ep.0].send_queue[pos];
+            // swap-remove 的に詰めるため、pos は進めない
+            let last = self.endpoints[ep.0].sq_len - 1;
+            self.endpoints[ep.0].send_queue[pos] = self.endpoints[ep.0].send_queue[last];
+            self.endpoints[ep.0].sq_len -= 1;
+
+            if send_idx < self.num_tasks && self.tasks[send_idx].state != TaskState::Dead {
+                self.tasks[send_idx].pending_send_msg = None;
+                self.tasks[send_idx].blocked_reason = None;
+                self.tasks[send_idx].last_reply = Some(IPC_ERR_ENDPOINT_CLOSED);
+                self.wake_task_to_ready(send_idx);
+            }
+        }
+
+        // 3) reply_queue rescue（全員）
+        let pos = 0;
+        while pos < self.endpoints[ep.0].rq_len {
+            let widx = self.endpoints[ep.0].reply_queue[pos];
+            let last = self.endpoints[ep.0].rq_len - 1;
+            self.endpoints[ep.0].reply_queue[pos] = self.endpoints[ep.0].reply_queue[last];
+            self.endpoints[ep.0].rq_len -= 1;
+
+            if widx < self.num_tasks && self.tasks[widx].state != TaskState::Dead {
+                self.tasks[widx].blocked_reason = None;
+                self.tasks[widx].last_reply = Some(IPC_ERR_ENDPOINT_CLOSED);
+                self.wake_task_to_ready(widx);
+            }
+        }
+    }
+
     /// reply_queue から「partner を待っている waiter」を 1つ取り出す
     fn take_reply_waiter_for_partner(&mut self, ep: EndpointId, partner: TaskId) -> Option<usize> {
         if ep.0 >= MAX_ENDPOINTS {
@@ -142,7 +259,6 @@ impl KernelState {
 
         let e = &mut self.endpoints[ep.0];
 
-        // swap-remove 前提なので逆順でも OK
         for pos in (0..e.rq_len).rev() {
             let idx = e.reply_queue[pos];
             if idx >= self.num_tasks {
@@ -210,10 +326,7 @@ impl KernelState {
             self.demo_msgs_delivered += 1;
         }
 
-        // ★counters
         self.counters.ipc_recv_fast += 1;
-
-        // ★ipc_trace_paths（必ず1行）
         trace::trace_ipc_path(trace::IpcPathEvent::RecvFast);
 
         self.push_event(LogEvent::IpcDelivered { from: send_id, to: recv_id, ep, msg });
@@ -228,22 +341,8 @@ impl KernelState {
             return;
         }
 
-        // ★counters
         self.counters.ipc_recv_slow += 1;
-
-        // ★ipc_trace_paths（必ず1行）
         trace::trace_ipc_path(trace::IpcPathEvent::RecvSlow);
-
-        // ★重要: Kernel task は recv で block しない（recv_waiter にも登録しない）
-        if self.is_kernel_task_index(recv_idx) {
-            crate::logging::error("ipc_recv_slowpath: kernel would block; convert to error (no recv_waiter)");
-            crate::logging::info_u64("task_id", recv_id.0);
-            crate::logging::info_u64("ep_id", ep.0 as u64);
-
-            // 既存流用（本当は WOULD_BLOCK を用意したい）
-            self.tasks[recv_idx].last_reply = Some(IPC_ERR_DEAD_PARTNER);
-            return;
-        }
 
         self.block_current(BlockedReason::IpcRecv { ep });
         self.endpoints[ep.0].recv_waiter = Some(recv_idx);
@@ -255,6 +354,12 @@ impl KernelState {
     pub(super) fn ipc_recv(&mut self, ep: EndpointId) {
         if ep.0 >= MAX_ENDPOINTS {
             crate::logging::error("ipc_recv: ep out of range");
+            return;
+        }
+        if self.reject_ipc_if_kernel_current("api=ipc_recv", ep) {
+            return;
+        }
+        if self.reject_ipc_if_endpoint_closed("api=ipc_recv", ep) {
             return;
         }
 
@@ -315,7 +420,6 @@ impl KernelState {
         self.wake_task_to_ready(recv_idx);
         self.tasks[recv_idx].last_msg = Some(msg);
 
-        // sender -> reply wait
         self.block_current(BlockedReason::IpcReply { partner: recv_id, ep });
         {
             let e = &mut self.endpoints[ep.0];
@@ -326,10 +430,7 @@ impl KernelState {
             self.demo_msgs_delivered += 1;
         }
 
-        // ★counters
         self.counters.ipc_send_fast += 1;
-
-        // ★ipc_trace_paths（必ず1行）
         trace::trace_ipc_path(trace::IpcPathEvent::SendFast);
 
         self.push_event(LogEvent::IpcDelivered { from: send_id, to: recv_id, ep, msg });
@@ -341,26 +442,8 @@ impl KernelState {
     fn ipc_send_slowpath(&mut self, ep: EndpointId, send_idx: usize, msg: u64) {
         let send_id = self.tasks[send_idx].id;
 
-        // ★counters
         self.counters.ipc_send_slow += 1;
-
-        // ★ipc_trace_paths（必ず1行）
         trace::trace_ipc_path(trace::IpcPathEvent::SendSlow);
-
-        // ★重要: Kernel task は send で block しない（send_queue にも積まない）
-        //   ここで enqueue してしまうと「send_queue 内の sender は BLOCKED」という invariant を壊す。
-        if self.is_kernel_task_index(send_idx) {
-            crate::logging::error("ipc_send_slowpath: kernel would block; convert to error (no enqueue)");
-            crate::logging::info_u64("task_id", send_id.0);
-            crate::logging::info_u64("ep_id", ep.0 as u64);
-
-            // pending/send_queue を絶対に残さない
-            self.tasks[send_idx].pending_send_msg = None;
-
-            // 既存流用（本当は WOULD_BLOCK を用意したい）
-            self.tasks[send_idx].last_reply = Some(IPC_ERR_DEAD_PARTNER);
-            return;
-        }
 
         self.tasks[send_idx].pending_send_msg = Some(msg);
 
@@ -377,6 +460,12 @@ impl KernelState {
     pub(super) fn ipc_send(&mut self, ep: EndpointId, msg: u64) {
         if ep.0 >= MAX_ENDPOINTS {
             crate::logging::error("ipc_send: ep out of range");
+            return;
+        }
+        if self.reject_ipc_if_kernel_current("api=ipc_send", ep) {
+            return;
+        }
+        if self.reject_ipc_if_endpoint_closed("api=ipc_send", ep) {
             return;
         }
 
@@ -408,6 +497,12 @@ impl KernelState {
             crate::logging::error("ipc_reply: ep out of range");
             return;
         }
+        if self.reject_ipc_if_kernel_current("api=ipc_reply", ep) {
+            return;
+        }
+        if self.reject_ipc_if_endpoint_closed("api=ipc_reply", ep) {
+            return;
+        }
 
         let recv_idx = self.current_task;
         if recv_idx >= self.num_tasks {
@@ -423,7 +518,6 @@ impl KernelState {
         let send_idx = match self.take_reply_waiter_for_partner(ep, recv_id) {
             Some(i) => i,
             None => {
-                // ★ipc_trace_paths（必ず1行）
                 trace::trace_ipc_path(trace::IpcPathEvent::ReplyNoWaiter);
                 return;
             }
@@ -457,10 +551,7 @@ impl KernelState {
             self.demo_replies_sent += 1;
         }
 
-        // ★counters
         self.counters.ipc_reply_delivered += 1;
-
-        // ★ipc_trace_paths（必ず1行）
         trace::trace_ipc_path(trace::IpcPathEvent::ReplyDelivered);
 
         self.push_event(LogEvent::IpcReplyDelivered { from: recv_id, to: send_id, ep });

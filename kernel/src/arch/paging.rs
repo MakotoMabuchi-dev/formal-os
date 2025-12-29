@@ -203,7 +203,7 @@ pub fn guarded_user_rw_u64(ptr: *mut u64, value: u64) -> Result<u64, PageFaultIn
     let active_ptr:  *mut u64 = unsafe { guard_u64_ptr(&PF_GUARD_ACTIVE     as *const AtomicU64 as u64) };
     let hit_ptr:     *mut u64 = unsafe { guard_u64_ptr(&PF_GUARD_HIT        as *const AtomicU64 as u64) };
 
-    let mut read_back: u64 = 0;
+    let mut read_back: u64;
 
     unsafe {
         core::arch::asm!(
@@ -564,6 +564,12 @@ pub fn switch_address_space_quiet(frame: MyPhysFrame) {
 
     let (_cur_frame, cur_flags) = Cr3::read();
     unsafe { Cr3::write(x86_frame, cur_flags); }
+
+    // ★ログなし検証（fail-stop）
+    let (now, _) = Cr3::read();
+    if now.start_address().as_u64() != frame.start_address().0 {
+        panic!("CR3 write failed (readback mismatch)");
+    }
 }
 
 pub fn switch_address_space(root: Option<MyPhysFrame>) {
@@ -579,13 +585,8 @@ pub fn switch_address_space(root: Option<MyPhysFrame>) {
 
             preflight_check_before_cr3_write(frame);
 
-            let phys = PhysAddr::new(frame.start_address().0);
-            let x86_frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(phys);
-
-            let (_cur_frame, cur_flags) = Cr3::read();
-
-            // ★ここから先は logging 禁止
-            unsafe { Cr3::write(x86_frame, cur_flags); }
+            // ★ここに寄せる
+            switch_address_space_quiet(frame);
         }
         None => {
             logging::info("switch_address_space: no root_page_frame (None)");

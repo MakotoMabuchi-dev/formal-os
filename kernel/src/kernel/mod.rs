@@ -103,7 +103,6 @@ pub struct Task {
     pub id: TaskId,
     pub state: TaskState,
 
-    // ★優先度（スケジューラが使う）
     pub priority: u8,
 
     pub runtime_ticks: u64,
@@ -112,15 +111,16 @@ pub struct Task {
     pub address_space_id: AddressSpaceId,
     pub blocked_reason: Option<BlockedReason>,
 
-    // recv で届いた msg
     pub last_msg: Option<u64>,
-
-    // reply で返ってきた payload
     pub last_reply: Option<u64>,
 
-    pub pending_send_msg: Option<u64>,
+    // syscall（mem 系など）の戻り値
+    pub last_syscall_ret: Option<u64>,
 
-    // syscall boundary
+    // syscall 戻り値の「未読」フラグ（ログ出力を1回にする）
+    pub last_syscall_ret_unread: bool,
+
+    pub pending_send_msg: Option<u64>,
     pub pending_syscall: Option<Syscall>,
 }
 
@@ -293,6 +293,8 @@ impl KernelState {
                 blocked_reason: None,
                 last_msg: None,
                 last_reply: None,
+                last_syscall_ret: None,
+                last_syscall_ret_unread: false,
                 pending_send_msg: None,
                 pending_syscall: None,
             },
@@ -306,6 +308,8 @@ impl KernelState {
                 blocked_reason: None,
                 last_msg: None,
                 last_reply: None,
+                last_syscall_ret: None,
+                last_syscall_ret_unread: false,
                 pending_send_msg: None,
                 pending_syscall: None,
             },
@@ -319,6 +323,8 @@ impl KernelState {
                 blocked_reason: None,
                 last_msg: None,
                 last_reply: None,
+                last_syscall_ret: None,
+                last_syscall_ret_unread: false,
                 pending_send_msg: None,
                 pending_syscall: None,
             },
@@ -355,7 +361,7 @@ impl KernelState {
         let ready_queue = [TASK1_INDEX, TASK2_INDEX, 0];
         let rq_len = 2;
 
-        KernelState {
+        let mut ks = KernelState {
             phys_mem,
             tick_count: 0,
             time_ticks: 0,
@@ -403,7 +409,24 @@ impl KernelState {
             pf_demo_done: false,
 
             counters: KernelCounters::new(),
+        };
+
+        // ---------------------------------------------------------------------
+        // Step2: endpoint owner の設定（テスト時だけ）
+        // - endpoint_close_test のときだけ ep0 の owner を Task3（TASK2_ID）にする
+        // - 通常ビルドでは owner=None のまま（close の発火源を排除）
+        // ---------------------------------------------------------------------
+        #[cfg(feature = "endpoint_close_test")]
+        {
+            ks.endpoints[IPC_DEMO_EP0.0].owner = Some(TASK2_ID);
         }
+
+        #[cfg(not(feature = "endpoint_close_test"))]
+        {
+            ks.endpoints[IPC_DEMO_EP0.0].owner = None;
+        }
+
+        ks
     }
 
     fn push_event(&mut self, ev: LogEvent) {
@@ -528,14 +551,50 @@ impl KernelState {
         }
 
         // -------------------------------------------------------------------------
+        // Step1: Kernel task は endpoint 構造に絶対に現れない（混入検知）
+        // -------------------------------------------------------------------------
+        let is_kernel_task_index = |tidx: usize| -> bool {
+            if tidx >= self.num_tasks {
+                return false;
+            }
+            let as_idx = self.tasks[tidx].address_space_id.0;
+            if as_idx >= self.num_tasks {
+                return false;
+            }
+            self.address_spaces[as_idx].kind == AddressSpaceKind::Kernel
+        };
+
+        // -------------------------------------------------------------------------
         // Endpoint の整合（構造チェック）
         // -------------------------------------------------------------------------
         for e in self.endpoints.iter() {
+            // -----------------------------------------------------------------
+            // Step2: closed endpoint は待ち構造を持たない（close で rescue 済みのはず）
+            // -----------------------------------------------------------------
+            if e.is_closed {
+                if e.recv_waiter.is_some() || e.sq_len != 0 || e.rq_len != 0 {
+                    logging::error("INVARIANT VIOLATION: CLOSED endpoint has waiters/queues");
+                    logging::info_u64("ep_id", e.id.0 as u64);
+                    logging::info_u64("sq_len", e.sq_len as u64);
+                    logging::info_u64("rq_len", e.rq_len as u64);
+                    if let Some(w) = e.recv_waiter {
+                        logging::info_u64("recv_waiter_task_index", w as u64);
+                    }
+                }
+            }
+
             if let Some(tidx) = e.recv_waiter {
                 if tidx >= self.num_tasks {
                     logging::error("INVARIANT VIOLATION: endpoint.recv_waiter out of range");
                 } else {
                     let t = &self.tasks[tidx];
+
+                    // ★Step1: kernel task 混入検知
+                    if is_kernel_task_index(tidx) {
+                        logging::error("INVARIANT VIOLATION: kernel task appears as endpoint.recv_waiter");
+                        logging::info_u64("task_id", t.id.0);
+                        logging::info_u64("ep_id", e.id.0 as u64);
+                    }
 
                     if t.state == TaskState::Dead {
                         logging::error("INVARIANT VIOLATION: endpoint.recv_waiter points DEAD task");
@@ -564,6 +623,14 @@ impl KernelState {
                 }
 
                 let t = &self.tasks[tidx];
+
+                // ★Step1: kernel task 混入検知
+                if is_kernel_task_index(tidx) {
+                    logging::error("INVARIANT VIOLATION: kernel task appears in endpoint.send_queue");
+                    logging::info_u64("task_id", t.id.0);
+                    logging::info_u64("ep_id", e.id.0 as u64);
+                }
+
                 if t.state == TaskState::Dead {
                     logging::error("INVARIANT VIOLATION: send_queue contains DEAD task");
                     logging::info_u64("task_id", t.id.0);
@@ -590,6 +657,14 @@ impl KernelState {
                 }
 
                 let t = &self.tasks[tidx];
+
+                // ★Step1: kernel task 混入検知
+                if is_kernel_task_index(tidx) {
+                    logging::error("INVARIANT VIOLATION: kernel task appears in endpoint.reply_queue");
+                    logging::info_u64("task_id", t.id.0);
+                    logging::info_u64("ep_id", e.id.0 as u64);
+                }
+
                 if t.state == TaskState::Dead {
                     logging::error("INVARIANT VIOLATION: reply_queue contains DEAD task");
                     logging::info_u64("task_id", t.id.0);
@@ -1077,6 +1152,8 @@ impl KernelState {
         self.tasks[idx].pending_send_msg = None;
         self.tasks[idx].last_msg = None;
         self.tasks[idx].last_reply = None;
+        self.tasks[idx].last_syscall_ret = None;
+        self.tasks[idx].last_syscall_ret_unread = false;
         self.tasks[idx].time_slice_used = 0;
 
         self.mem_demo_stage[idx] = 0;
@@ -1088,6 +1165,33 @@ impl KernelState {
 
         self.cleanup_user_mappings_of_address_space(as_idx);
 
+        // ---------------------------------------------------------------------
+        // Step2: owner が死んだ endpoint を close し、waiters を rescue する
+        // - close を先に実行して “CLOSED を優先” する（DEAD_PARTNER より優先）
+        // - Rust の借用規則のため、ep_id を先に集めてから close を呼ぶ
+        // ---------------------------------------------------------------------
+        let mut to_close: [Option<EndpointId>; MAX_ENDPOINTS] = [None; MAX_ENDPOINTS];
+        let mut n: usize = 0;
+
+        for e in self.endpoints.iter() {
+            if e.owner == Some(dead_id) {
+                if n < MAX_ENDPOINTS {
+                    to_close[n] = Some(e.id);
+                    n += 1;
+                }
+            }
+        }
+
+        for i in 0..n {
+            if let Some(ep_id) = to_close[i] {
+                self.close_endpoint_and_rescue_waiters(ep_id);
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // 既存: dead partner を待つ reply_waiter を rescue
+        // - endpoint close を先に実行したので、ここは補助的（残骸拾い）
+        // ---------------------------------------------------------------------
         self.resolve_ipc_reply_waiters_for_dead_partner(dead_id);
 
         self.push_event(LogEvent::TaskKilled { task: dead_id, reason });
@@ -1339,7 +1443,6 @@ impl KernelState {
                     // ★重要: 送信待ちのゴミを残さない（invariant/観測の安定化）
                     self.tasks[idx].pending_send_msg = None;
                     return;
-;
                 }
                 BlockedReason::Sleep => {
                     // kernel の Sleep block は許可（必要なら）
@@ -1537,10 +1640,27 @@ impl KernelState {
         logging::info_u64("err", pf.err);
         logging::info_u64("rip", pf.rip);
 
-        self.kill_task(
-            idx,
-            TaskKillReason::UserPageFault { addr: pf.addr, err: pf.err, rip: pf.rip },
-        );
+        // ------------------------------------------------------------
+        // デモ安定化:
+        // - mem_demo の stage3 は「Unmap 後アクセスで #PF が出る」確認用。
+        // - ただし通常デモでは sender が死んで IPC が止まるので、kill は feature 時のみ。
+        // ------------------------------------------------------------
+        #[cfg(feature = "pf_demo")]
+        {
+            self.kill_task(
+                idx,
+                TaskKillReason::UserPageFault { addr: pf.addr, err: pf.err, rip: pf.rip },
+            );
+        }
+
+        #[cfg(not(feature = "pf_demo"))]
+        {
+            logging::error("USER PAGE FAULT (demo): ignored (pf_demo feature disables this)");
+            logging::info_u64("task_id", task_id.0);
+            // 再実行ループを避けたい場合は stage を巻き戻す等もあるが、
+            // まずは “kill しない” だけで IPC の継続観測を優先する。
+        }
+
     }
 
     fn do_mem_demo_normal(&mut self) {
@@ -1561,13 +1681,25 @@ impl KernelState {
         };
 
         let as_idx = task.address_space_id.0;
-        let aspace = &mut self.address_spaces[as_idx];
+        let aspace_kind = if as_idx < self.num_tasks {
+            self.address_spaces[as_idx].kind
+        } else {
+            AddressSpaceKind::Kernel
+        };
 
         // -------------------------------------------------------------------------
         // User mem demo: Map -> RW -> Unmap -> RW(after unmap => #PF expected)
+        // ★変更点:
+        // - stage0/stage2 の map/unmap は「必ず syscall 経由」にする
+        // - ここ（デモ直呼び）では arch::paging::apply_mem_action_in_root を呼ばない
         // -------------------------------------------------------------------------
         if task_idx != TASK0_INDEX {
-            let root = match aspace.root_page_frame {
+            if aspace_kind != AddressSpaceKind::User {
+                logging::error("mem_demo[user]: task is not User; skip");
+                return;
+            }
+
+            let root = match self.address_spaces[as_idx].root_page_frame {
                 Some(r) => r,
                 None => {
                     logging::error("mem_demo: user root_page_frame is None (unexpected)");
@@ -1580,94 +1712,15 @@ impl KernelState {
             let stage = self.mem_demo_stage[task_idx];
 
             match stage {
-                // --- stage0: Map ---
+                // --- stage0: Map（syscall）---
                 0 => {
-                    logging::info("mem_demo[user]: stage0 Map");
+                    logging::info("mem_demo[user]: stage0 Map (via syscall)");
 
-                    let frame = match self.get_or_alloc_demo_frame(task_idx) {
-                        Some(f) => f,
-                        None => {
-                            logging::error("mem_demo: no more usable frames");
-                            self.should_halt = true;
-                            return;
-                        }
-                    };
+                    // syscall を積むだけ（この tick の後半で handle_pending_syscall が実行する）
+                    self.tasks[task_idx].pending_syscall = Some(Syscall::PageMap { page, flags });
 
-                    let mem_action = MemAction::Map { page, frame, flags };
-
-                    // 論理状態（AddressSpace）に反映
-                    let apply_res = {
-                        let aspace = &mut self.address_spaces[as_idx];
-                        aspace.apply(mem_action)
-                    };
-
-                    match apply_res {
-                        Ok(()) => {
-                            logging::info("address_space.apply: OK");
-                        }
-                        Err(AddressSpaceError::AlreadyMapped) => {
-                            logging::error("address_space.apply: ERROR");
-                            logging::info("reason = AlreadyMapped");
-                            self.mem_demo_stage[task_idx] = 1;
-                            return;
-                        }
-                        Err(e) => {
-                            logging::error("address_space.apply: ERROR");
-                            match e {
-                                AddressSpaceError::NotMapped => logging::info("reason = NotMapped"),
-                                AddressSpaceError::CapacityExceeded => logging::info("reason = CapacityExceeded"),
-                                AddressSpaceError::AlreadyMapped => {}
-                            }
-                            panic!("address_space.apply failed in stage0 Map");
-                        }
-                    }
-
-                    // 物理状態（ページテーブル）に反映：User root を直接使って map
-                    logging::info("mem_demo: applying arch paging (User root / no CR3 switch)");
-                    match unsafe { arch::paging::apply_mem_action_in_root(mem_action, root, &mut self.phys_mem) } {
-                        Ok(()) => {}
-                        Err(_e) => {
-                            logging::error("arch::paging::apply_mem_action_in_root failed; abort (fail-stop)");
-                            panic!("arch apply_mem_action_in_root failed");
-                        }
-                    }
-
-                    // 参考：translate を出しておく
-                    arch::paging::debug_translate_in_root(root, virt_addr_u64);
-
-                    // stage 遷移
+                    // 期待: 同 tick 内で map が完了し、次の MemDemo で stage1 へ
                     self.mem_demo_stage[task_idx] = 1;
-
-                    self.push_event(LogEvent::MemActionApplied {
-                        task: task_id,
-                        address_space: task.address_space_id,
-                        action: mem_action,
-                    });
-
-                    // -----------------------------------------------------------------
-                    // kill_cleanup_test:
-                    //   Map 直後（USER mapping が確実に残っている状態）で kill を発火し、
-                    //   cleanup_user_mappings_of_address_space() が「実PTも掃除できる」か検証する。
-                    //   うるさくならないように “1回だけ” 発火させる。
-                    // -----------------------------------------------------------------
-                    #[cfg(feature = "kill_cleanup_test")]
-                    {
-                        // Task1（task_id=2）だけ、stage0 Map直後に1回だけ kill して cleanup を検証する
-                        if task_id == TASK1_ID && !self.kill_cleanup_test_fired {
-                            self.kill_cleanup_test_fired = true;
-
-                            logging::error("kill_cleanup_test: force kill right after Task1 user stage0 Map");
-                            self.kill_task(
-                                task_idx,
-                                TaskKillReason::UserPageFault {
-                                    addr: virt_addr_u64,
-                                    err: 0,
-                                    rip: 0,
-                                },
-                            );
-                            return;
-                        }
-                    }
                     return;
                 }
 
@@ -1711,58 +1764,21 @@ impl KernelState {
                         }
                     }
 
+                    // 参考：translate（任意）
+                    arch::paging::debug_translate_in_root(root, virt_addr_u64);
+
                     self.mem_demo_stage[task_idx] = 2;
                     return;
                 }
 
-                // --- stage2: Unmap ---
+                // --- stage2: Unmap（syscall）---
                 2 => {
-                    logging::info("mem_demo[user]: stage2 Unmap");
+                    logging::info("mem_demo[user]: stage2 Unmap (via syscall)");
 
-                    let mem_action = MemAction::Unmap { page };
+                    self.tasks[task_idx].pending_syscall = Some(Syscall::PageUnmap { page });
 
-                    // 論理状態（AddressSpace）から削除
-                    match aspace.apply(mem_action) {
-                        Ok(()) => {
-                            logging::info("address_space.apply: OK");
-                        }
-                        Err(AddressSpaceError::NotMapped) => {
-                            logging::error("address_space.apply: ERROR");
-                            logging::info("reason = NotMapped");
-                            self.mem_demo_stage[task_idx] = 3;
-                            return;
-                        }
-                        Err(e) => {
-                            logging::error("address_space.apply: ERROR");
-                            match e {
-                                AddressSpaceError::AlreadyMapped => logging::info("reason = AlreadyMapped"),
-                                AddressSpaceError::CapacityExceeded => logging::info("reason = CapacityExceeded"),
-                                AddressSpaceError::NotMapped => {}
-                            }
-                            panic!("address_space.apply failed in stage2 Unmap");
-                        }
-                    }
-
-                    // 物理状態（ページテーブル）も unmap
-                    logging::info("mem_demo: applying arch paging (User root / no CR3 switch)");
-                    match unsafe { arch::paging::apply_mem_action_in_root(mem_action, root, &mut self.phys_mem) } {
-                        Ok(()) => {}
-                        Err(_e) => {
-                            logging::error("arch::paging::apply_mem_action_in_root failed; abort (fail-stop)");
-                            panic!("arch apply_mem_action_in_root failed");
-                        }
-                    }
-
-                    arch::paging::debug_translate_in_root(root, virt_addr_u64);
-
+                    // 期待: 同 tick 内で unmap が完了し、次の MemDemo で stage3 へ
                     self.mem_demo_stage[task_idx] = 3;
-
-                    self.push_event(LogEvent::MemActionApplied {
-                        task: task_id,
-                        address_space: task.address_space_id,
-                        action: mem_action,
-                    });
-
                     return;
                 }
 
@@ -1793,7 +1809,7 @@ impl KernelState {
                             return;
                         }
                         Err(pf) => {
-                            // 期待通り：ユーザ領域アクセスで #PF → タスク kill
+                            // 期待通り：ユーザ領域アクセスで #PF → （pf_demo なら kill）
                             self.kill_current_task_due_to_user_pf(pf);
                             self.mem_demo_stage[task_idx] = 0;
                             return;
@@ -1804,7 +1820,7 @@ impl KernelState {
         }
 
         // -------------------------------------------------------------------------
-        // Kernel task mem demo: Map <-> Unmap を繰り返すだけ
+        // Kernel task mem demo: Map <-> Unmap を繰り返すだけ（従来通り）
         // -------------------------------------------------------------------------
         let mem_action = if !self.mem_demo_mapped[task_idx] {
             logging::info("mem_demo: issuing Map (for current task)");
@@ -1872,6 +1888,11 @@ impl KernelState {
         logging::info("KernelState::tick()");
         logging::info_u64("tick_count", self.tick_count);
 
+        if (self.tick_count % 50) == 0 {
+            logging::info("heartbeat");
+            logging::info_u64("tick", self.tick_count);
+        }
+
         self.push_event(LogEvent::TickStarted(self.tick_count));
 
         let running = self.tasks[self.current_task].id;
@@ -1915,6 +1936,9 @@ impl KernelState {
             return;
         }
 
+        // 1 tick あたり syscall 実行は最大 1 回
+        // - do_mem_demo() が pending_syscall を積む
+        // - user_step_issue_syscall() も積みうる（ただし「すでに積まれてたら return」）
         self.user_step_issue_syscall(ran_idx);
 
         if ran_idx == self.current_task {
@@ -1923,7 +1947,8 @@ impl KernelState {
 
         self.update_runtime_for(ran_idx);
 
-        let still_running = ran_idx == self.current_task && self.tasks[ran_idx].state == TaskState::Running;
+        let still_running = ran_idx == self.current_task
+            && self.tasks[ran_idx].state == TaskState::Running;
 
         let blocked_by_sleep = if still_running {
             self.maybe_block_task(ran_idx)
@@ -2020,6 +2045,16 @@ impl KernelState {
                     logging::info_u64("last_reply_value", v);
                 } else {
                     logging::info("last_reply = None");
+                }
+            }
+
+            // --- 追加: syscall（mem系など）の戻り値 ---
+            {
+                if let Some(v) = task.last_syscall_ret {
+                    logging::info("last_syscall_ret = Some");
+                    logging::info_u64("last_syscall_ret_value", v);
+                } else {
+                    logging::info("last_syscall_ret = None");
                 }
             }
         }

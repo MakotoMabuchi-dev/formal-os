@@ -61,7 +61,7 @@ fn panic(info: &PanicInfo) -> ! {
     // 二重 panic は即停止（再入すると #DF になりやすい）
     if PANIC_IN_PROGRESS.swap(true, Ordering::AcqRel) {
         emergency_write_str("[PANIC] re-entered => halt\n");
-        return arch::halt_loop();
+        arch::halt_loop();
     }
 
     emergency_write_str("[PANIC] kernel panic\n");
