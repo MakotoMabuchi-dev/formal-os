@@ -56,15 +56,12 @@ impl KernelState {
 
         // ------------------------------------------------------------
         // Step3: syscall 戻り値（mem系）を観測してクリア（unread のときだけ）
+        // - “消費してクリア” はこの1箇所に固定する
         // ------------------------------------------------------------
-        if self.tasks[task_idx].last_syscall_ret_unread {
-            if let Some(v) = self.tasks[task_idx].last_syscall_ret {
-                crate::logging::info("syscall_ret_received");
-                crate::logging::info_u64("task_id", self.tasks[task_idx].id.0);
-                crate::logging::info_u64("ret", v);
-            }
-            self.tasks[task_idx].last_syscall_ret = None;
-            self.tasks[task_idx].last_syscall_ret_unread = false;
+        if let Some(v) = self.take_unread_last_syscall_ret(task_idx) {
+            crate::logging::info("syscall_ret_received");
+            crate::logging::info_u64("task_id", self.tasks[task_idx].id.0);
+            crate::logging::info_u64("ret", v);
         }
 
         // ------------------------------------------------------------

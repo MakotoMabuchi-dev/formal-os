@@ -444,6 +444,43 @@ impl KernelState {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // syscall return value (観測安定化)
+    // 方針:
+    // - syscall 境界だけが set する
+    // - user_program 側だけが unread を消費して clear する
+    // -------------------------------------------------------------------------
+
+    /// syscall 境界のみが呼ぶ: 「現在タスク」に last_syscall_ret をセットして unread にする
+    pub(super) fn set_last_syscall_ret_for_current(&mut self, ret: u64) {
+        let idx = self.current_task;
+        if idx >= self.num_tasks {
+            return;
+        }
+        if self.tasks[idx].state == TaskState::Dead {
+            return;
+        }
+
+        self.tasks[idx].last_syscall_ret = Some(ret);
+        self.tasks[idx].last_syscall_ret_unread = true;
+    }
+
+    /// user_program 側のみが呼ぶ: unread のときだけ取り出して clear する
+    pub(super) fn take_unread_last_syscall_ret(&mut self, idx: usize) -> Option<u64> {
+        if idx >= self.num_tasks {
+            return None;
+        }
+        if self.tasks[idx].state == TaskState::Dead {
+            return None;
+        }
+        if !self.tasks[idx].last_syscall_ret_unread {
+            return None;
+        }
+
+        self.tasks[idx].last_syscall_ret_unread = false;
+        self.tasks[idx].last_syscall_ret.take()
+    }
+
     fn debug_check_invariants(&self) {
         // -------------------------------------------------------------------------
         // AddressSpace の基本整合
@@ -1732,17 +1769,19 @@ impl KernelState {
                         ^ ((task_id.0 & 0xFFFF) << 16)
                         ^ (self.tick_count & 0xFFFF);
 
-                    // ここは「カーネルの CR3 のまま」ガード付きで user ptr を触る
-                    let rw_result = arch::paging::guarded_user_rw_u64(user_virt, test_value);
-
-                    // guarded_user_rw_u64 が user root に切り替えている可能性があるので、
-                    // 絶対に kernel CR3 に戻してからログを出す（観測の安定化）
+                    // ★arch 側で user_root -> kernel_root まで責務を完結させる
                     let kernel_root = self.address_spaces[KERNEL_ASID_INDEX]
                         .root_page_frame
                         .expect("kernel root_page_frame must exist");
-                    arch::paging::switch_address_space_quiet(kernel_root);
 
-                    logging::info("mem_demo[user]: stage1 RW (back to kernel CR3)");
+                    let rw_result = arch::paging::guarded_user_rw_u64_in_root(
+                        root,
+                        kernel_root,
+                        user_virt,
+                        test_value,
+                    );
+
+                    logging::info("mem_demo[user]: stage1 RW (guarded; returned to kernel CR3)");
 
                     match rw_result {
                         Ok(read_back) => {
@@ -1790,14 +1829,19 @@ impl KernelState {
                         ^ ((task_id.0 & 0xFFFF) << 16)
                         ^ (self.tick_count & 0xFFFF);
 
-                    let rw_result = arch::paging::guarded_user_rw_u64(user_virt, test_value);
-
+                    // ★arch 側で user_root -> kernel_root まで責務を完結させる
                     let kernel_root = self.address_spaces[KERNEL_ASID_INDEX]
                         .root_page_frame
                         .expect("kernel root_page_frame must exist");
-                    arch::paging::switch_address_space_quiet(kernel_root);
 
-                    logging::info("mem_demo[user]: stage3 RW-after-unmap (back to kernel CR3)");
+                    let rw_result = arch::paging::guarded_user_rw_u64_in_root(
+                        root,
+                        kernel_root,
+                        user_virt,
+                        test_value,
+                    );
+
+                    logging::info("mem_demo[user]: stage3 RW-after-unmap (guarded; returned to kernel CR3)");
 
                     match rw_result {
                         Ok(read_back) => {

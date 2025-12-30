@@ -32,6 +32,11 @@
 // ★追加（今回の修正）:
 // - user CR3 中は logging が落ちやすいので、logging なしで CR3 を戻す API
 //   switch_address_space_quiet(frame) を用意する。
+// - CR3 preflight の user root 判定を「low guard が target で引けない」ベースにする
+//   （USER slot は Map 後に埋まるため判定に使えない）。
+// - guarded_user_rw_u64_in_root() を追加し、「必ず kernel CR3 に戻す」責務を arch 側に寄せられるようにする。
+// - ring3 demo 用に (user_root, kernel_root) を記録し、interrupts 側で参照できるようにする。
+// - guarded_user_read_u64_in_root() を追加（read-only 版）。
 
 use bootloader::BootInfo;
 use bootloader::bootinfo::MemoryRegionType;
@@ -61,7 +66,10 @@ use crate::arch::virt_layout;
 use crate::logging;
 use crate::mm::PhysicalMemoryManager;
 use crate::mem::paging::{MemAction, PageFlags};
-use crate::mem::addr::PhysFrame as MyPhysFrame;
+
+// interrupts.rs など他モジュールからも使うので公開 re-export しておく
+pub use crate::mem::addr::{PhysFrame as MyPhysFrame, PAGE_SIZE};
+
 
 pub use crate::arch::virt_layout::{USER_PML4_INDEX, USER_SPACE_BASE, USER_SPACE_SIZE};
 
@@ -89,6 +97,34 @@ static GUARD_STACK_HIGH_VIRT: AtomicU64 = AtomicU64::new(0);
 
 // alias copy count（install 時に確定）
 static ALIAS_COPY_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+// -----------------------------------------------------------------------------
+// ring3 demo roots (観測用)
+// -----------------------------------------------------------------------------
+
+static RING3_DEMO_USER_ROOT_PHYS: AtomicU64 = AtomicU64::new(0);
+static RING3_DEMO_KERNEL_ROOT_PHYS: AtomicU64 = AtomicU64::new(0);
+
+/// ring3 demo 用に user_root / kernel_root を登録する（entry.rs から呼ぶ）
+pub fn set_ring3_demo_roots(user_root: MyPhysFrame, kernel_root: MyPhysFrame) {
+    RING3_DEMO_USER_ROOT_PHYS.store(user_root.start_address().0, Ordering::Relaxed);
+    RING3_DEMO_KERNEL_ROOT_PHYS.store(kernel_root.start_address().0, Ordering::Relaxed);
+}
+
+/// interrupts 側から参照するための取得（消費しない）
+pub fn peek_ring3_demo_roots() -> Option<(MyPhysFrame, MyPhysFrame)> {
+    let u_phys = RING3_DEMO_USER_ROOT_PHYS.load(Ordering::Relaxed);
+    let k_phys = RING3_DEMO_KERNEL_ROOT_PHYS.load(Ordering::Relaxed);
+
+    if u_phys == 0 || k_phys == 0 {
+        return None;
+    }
+
+    Some((
+        MyPhysFrame::from_index(u_phys / PAGE_SIZE),
+        MyPhysFrame::from_index(k_phys / PAGE_SIZE),
+    ))
+}
 
 // -----------------------------------------------------------------------------
 // #PF guard/fixup
@@ -130,7 +166,6 @@ unsafe fn guard_u64_ptr(addr_u64: u64) -> *mut u64 {
     addr_u64 as *mut u64
 }
 
-
 pub fn record_page_fault(info: PageFaultInfo) {
     unsafe {
         let addr = guard_u64_ptr(&LAST_PF_ADDR as *const AtomicU64 as u64);
@@ -159,11 +194,11 @@ pub fn take_last_page_fault() -> Option<PageFaultInfo> {
         }
         core::ptr::write_volatile(val, 0);
 
-        let addr = core::ptr::read_volatile( guard_u64_ptr(&LAST_PF_ADDR as *const AtomicU64 as u64));
-        let err  = core::ptr::read_volatile( guard_u64_ptr(&LAST_PF_ERR  as *const AtomicU64 as u64));
-        let rip  = core::ptr::read_volatile( guard_u64_ptr(&LAST_PF_RIP  as *const AtomicU64 as u64));
-        let rsp  = core::ptr::read_volatile( guard_u64_ptr(&LAST_PF_RSP  as *const AtomicU64 as u64));
-        let isu  = core::ptr::read_volatile( guard_u64_ptr(&LAST_PF_IS_USER as *const AtomicU64 as u64)) != 0;
+        let addr = core::ptr::read_volatile(guard_u64_ptr(&LAST_PF_ADDR as *const AtomicU64 as u64));
+        let err  = core::ptr::read_volatile(guard_u64_ptr(&LAST_PF_ERR  as *const AtomicU64 as u64));
+        let rip  = core::ptr::read_volatile(guard_u64_ptr(&LAST_PF_RIP  as *const AtomicU64 as u64));
+        let rsp  = core::ptr::read_volatile(guard_u64_ptr(&LAST_PF_RSP  as *const AtomicU64 as u64));
+        let isu  = core::ptr::read_volatile(guard_u64_ptr(&LAST_PF_IS_USER as *const AtomicU64 as u64)) != 0;
 
         Some(PageFaultInfo { addr, err, rip, rsp, is_user_fault: isu })
     }
@@ -195,8 +230,8 @@ pub fn pf_guard_try_fixup() -> Option<u64> {
 
 pub fn guarded_user_rw_u64(ptr: *mut u64, value: u64) -> Result<u64, PageFaultInfo> {
     unsafe {
-        core::ptr::write_volatile( guard_u64_ptr(&LAST_PF_VALID as *const AtomicU64 as u64), 0);
-        core::ptr::write_volatile( guard_u64_ptr(&PF_GUARD_HIT as *const AtomicU64 as u64), 0);
+        core::ptr::write_volatile(guard_u64_ptr(&LAST_PF_VALID as *const AtomicU64 as u64), 0);
+        core::ptr::write_volatile(guard_u64_ptr(&PF_GUARD_HIT as *const AtomicU64 as u64), 0);
     }
 
     let recover_ptr: *mut u64 = unsafe { guard_u64_ptr(&PF_GUARD_RECOVER_RIP as *const AtomicU64 as u64) };
@@ -225,6 +260,115 @@ pub fn guarded_user_rw_u64(ptr: *mut u64, value: u64) -> Result<u64, PageFaultIn
         options(nostack, preserves_flags)
         );
     }
+
+    let hit = unsafe { core::ptr::read_volatile(hit_ptr) };
+    if hit != 0 {
+        if let Some(info) = take_last_page_fault() {
+            return Err(info);
+        }
+        return Err(PageFaultInfo { addr: 0, err: 0, rip: 0, rsp: 0, is_user_fault: true });
+    }
+
+    Ok(read_back)
+}
+
+/// user root に一時切替して user ptr を RW し、必ず kernel root に戻してから返す。
+pub fn guarded_user_rw_u64_in_root(
+    user_root: MyPhysFrame,
+    kernel_root: MyPhysFrame,
+    ptr: *mut u64,
+    value: u64,
+) -> Result<u64, PageFaultInfo> {
+    unsafe {
+        core::ptr::write_volatile(guard_u64_ptr(&LAST_PF_VALID as *const AtomicU64 as u64), 0);
+        core::ptr::write_volatile(guard_u64_ptr(&PF_GUARD_HIT as *const AtomicU64 as u64), 0);
+    }
+
+    // user root へ切替（ログ無し）
+    switch_address_space_quiet(user_root);
+
+    let recover_ptr: *mut u64 = unsafe { guard_u64_ptr(&PF_GUARD_RECOVER_RIP as *const AtomicU64 as u64) };
+    let active_ptr:  *mut u64 = unsafe { guard_u64_ptr(&PF_GUARD_ACTIVE     as *const AtomicU64 as u64) };
+    let hit_ptr:     *mut u64 = unsafe { guard_u64_ptr(&PF_GUARD_HIT        as *const AtomicU64 as u64) };
+
+    let mut read_back: u64;
+
+    unsafe {
+        core::arch::asm!(
+        "lea rax, [rip + 2f]",
+        "mov qword ptr [{recover}], rax",
+        "mov qword ptr [{active}], 1",
+
+        "mov qword ptr [{p}], {v}",
+        "mov {out}, qword ptr [{p}]",
+
+        "mov qword ptr [{active}], 0",
+        "2:",
+        recover = in(reg) recover_ptr,
+        active  = in(reg) active_ptr,
+        p = in(reg) ptr,
+        v = in(reg) value,
+        out = out(reg) read_back,
+        out("rax") _,
+        options(nostack, preserves_flags)
+        );
+    }
+
+    // どの経路でも kernel root に戻す（ログ無し）
+    switch_address_space_quiet(kernel_root);
+
+    let hit = unsafe { core::ptr::read_volatile(hit_ptr) };
+    if hit != 0 {
+        if let Some(info) = take_last_page_fault() {
+            return Err(info);
+        }
+        return Err(PageFaultInfo { addr: 0, err: 0, rip: 0, rsp: 0, is_user_fault: true });
+    }
+
+    Ok(read_back)
+}
+
+/// user root に一時切替して user ptr を「read-only」で読み、必ず kernel root に戻してから返す。
+pub fn guarded_user_read_u64_in_root(
+    user_root: MyPhysFrame,
+    kernel_root: MyPhysFrame,
+    ptr: *const u64,
+) -> Result<u64, PageFaultInfo> {
+    unsafe {
+        core::ptr::write_volatile(guard_u64_ptr(&LAST_PF_VALID as *const AtomicU64 as u64), 0);
+        core::ptr::write_volatile(guard_u64_ptr(&PF_GUARD_HIT as *const AtomicU64 as u64), 0);
+    }
+
+    // user root へ切替（ログ無し）
+    switch_address_space_quiet(user_root);
+
+    let recover_ptr: *mut u64 = unsafe { guard_u64_ptr(&PF_GUARD_RECOVER_RIP as *const AtomicU64 as u64) };
+    let active_ptr:  *mut u64 = unsafe { guard_u64_ptr(&PF_GUARD_ACTIVE     as *const AtomicU64 as u64) };
+    let hit_ptr:     *mut u64 = unsafe { guard_u64_ptr(&PF_GUARD_HIT        as *const AtomicU64 as u64) };
+
+    let mut read_back: u64;
+
+    unsafe {
+        core::arch::asm!(
+        "lea rax, [rip + 2f]",
+        "mov qword ptr [{recover}], rax",
+        "mov qword ptr [{active}], 1",
+
+        "mov {out}, qword ptr [{p}]",
+
+        "mov qword ptr [{active}], 0",
+        "2:",
+        recover = in(reg) recover_ptr,
+        active  = in(reg) active_ptr,
+        p = in(reg) ptr,
+        out = out(reg) read_back,
+        out("rax") _,
+        options(nostack, preserves_flags)
+        );
+    }
+
+    // どの経路でも kernel root に戻す（ログ無し）
+    switch_address_space_quiet(kernel_root);
 
     let hit = unsafe { core::ptr::read_volatile(hit_ptr) };
     if hit != 0 {
@@ -340,6 +484,11 @@ pub fn init(boot_info: &'static BootInfo) {
     }
     logging::info("arch::paging::init: memory map dump end");
     logging::info("arch::paging::init: done");
+}
+
+/// physmap（physical_memory_offset）の getter
+pub fn physical_memory_offset() -> u64 {
+    PHYSICAL_MEMORY_OFFSET.load(Ordering::Relaxed)
 }
 
 fn to_x86_flags(flags: PageFlags) -> PageTableFlags {
@@ -460,12 +609,8 @@ fn preflight_check_before_cr3_write(target: MyPhysFrame) {
             panic!("CR3 preflight failed (target missing RIP/RSP mapping)");
         }
 
-        // 参考: RBP は必須にしない
-        if rbp != 0 && rbp_phys_tgt == 0 {
-            logging::info("CR3 preflight: note: target RBP translate failed (non-fatal in this phase)");
-            logging::info_u64("rbp", rbp);
-            logging::info_u64("rbp_phys_tgt", rbp_phys_tgt);
-        }
+        // NOTE: RBP の失敗ログはノイズになりやすいので、いったん出さない。
+        let _ = rbp_phys_tgt;
 
         // physmap が target に存在すること
         let pml4_phys = PhysAddr::new(target_phys_u64);
@@ -480,9 +625,12 @@ fn preflight_check_before_cr3_write(target: MyPhysFrame) {
         }
 
         // guard(low) は user root では存在しない（仕様）
-        let is_user_root = {
-            let user_slot_phys = translate_u64(&tgt_mapper, virt_layout::pml4_index_base_addr(USER_PML4_INDEX));
-            user_slot_phys == 0
+        let is_user_root = if code_low != 0 && stack_low != 0 {
+            let code_phys_tgt = translate_u64(&tgt_mapper, code_low);
+            let stack_phys_tgt = translate_u64(&tgt_mapper, stack_low);
+            code_phys_tgt == 0 && stack_phys_tgt == 0
+        } else {
+            false
         };
 
         if !is_user_root {
@@ -491,6 +639,10 @@ fn preflight_check_before_cr3_write(target: MyPhysFrame) {
                 let stack_phys_tgt = translate_u64(&tgt_mapper, stack_low);
                 if code_phys_tgt != exp_code_phys || stack_phys_tgt != exp_stack_phys {
                     logging::error("CR3 preflight: guard(low) phys mismatch in kernel root");
+                    logging::info_u64("expected_code_phys", exp_code_phys);
+                    logging::info_u64("got_code_phys", code_phys_tgt);
+                    logging::info_u64("expected_stack_phys", exp_stack_phys);
+                    logging::info_u64("got_stack_phys", stack_phys_tgt);
                     panic!("CR3 preflight failed (guard low mismatch)");
                 }
             }
@@ -498,7 +650,7 @@ fn preflight_check_before_cr3_write(target: MyPhysFrame) {
             logging::info("CR3 preflight: skipping guard(low) check for user root (by design)");
         }
 
-        // guard(high) は user root でも必須（IDT/TSS/stack がここに依存）
+        // guard(high) は user root でも必須
         if code_high != 0 && stack_high != 0 && exp_code_phys != 0 && exp_stack_phys != 0 {
             let code_phys_tgt = translate_u64(&tgt_mapper, code_high);
             let stack_phys_tgt = translate_u64(&tgt_mapper, stack_high);
@@ -584,8 +736,6 @@ pub fn switch_address_space(root: Option<MyPhysFrame>) {
             }
 
             preflight_check_before_cr3_write(frame);
-
-            // ★ここに寄せる
             switch_address_space_quiet(frame);
         }
         None => {
@@ -826,7 +976,10 @@ unsafe fn apply_mem_action_with_mapper(
             logging::info("arch::paging::apply_mem_action: Unmap");
 
             let mut virt_u64 = page.start_address().0;
-            if root.is_some() {
+
+            // ★Unmap は “USER slot のページかどうか” で USER_SPACE_BASE を足す（root 有無で決めない）
+            let virt_candidate = VirtAddr::new(USER_SPACE_BASE + virt_u64);
+            if is_user_space_addr(virt_candidate) {
                 virt_u64 = USER_SPACE_BASE + virt_u64;
             }
 
@@ -914,7 +1067,7 @@ pub fn init_user_pml4_from_current(new_root: MyPhysFrame) {
             user_p4[i].set_unused();
         }
 
-        // 1) physmap（OffsetPageTable が page table walk できるために必要）
+        // 1) physmap
         for i in physmap_pml4..min(physmap_pml4 + PHYSMAP_PML4_COPY_COUNT, 256) {
             if cur_p4[i].is_unused() { continue; }
             if cur_p4[i].flags().contains(PageTableFlags::USER_ACCESSIBLE) {
@@ -925,7 +1078,7 @@ pub fn init_user_pml4_from_current(new_root: MyPhysFrame) {
             user_p4[i] = cur_p4[i].clone();
         }
 
-        // 2) kernel high-half（通常の kernel 領域）
+        // 2) kernel high-half
         for i in 256..512 {
             if cur_p4[i].is_unused() { continue; }
             if cur_p4[i].flags().contains(PageTableFlags::USER_ACCESSIBLE) {
@@ -936,7 +1089,7 @@ pub fn init_user_pml4_from_current(new_root: MyPhysFrame) {
             user_p4[i] = cur_p4[i].clone();
         }
 
-        // 2.5) high-alias window（IDT/IST/TSS/handler が依存）
+        // 2.5) high-alias window
         for i in 0..alias_cnt {
             let idx = alias_base + i;
             if idx >= 512 { break; }
@@ -961,9 +1114,7 @@ pub fn init_user_pml4_from_current(new_root: MyPhysFrame) {
         logging::info_u64("alias_copy_count", alias_cnt as u64);
     }
 
-    if ENABLE_REAL_PAGING && ENABLE_CR3_PREFLIGHT {
-        preflight_check_before_cr3_write(new_root);
-    }
+    // NOTE: user root 初期化直後の preflight は二重ログになりやすいので、いったん実施しない。
 }
 
 // -----------------------------------------------------------------------------

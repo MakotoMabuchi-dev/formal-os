@@ -166,14 +166,12 @@ impl KernelState {
             // ------------------------------------------------------------
             Syscall::PageMap { page, flags } => {
                 let ret = self.syscall_page_map(task_index, tid, page, flags);
-                self.tasks[task_index].last_syscall_ret = Some(ret);
-                self.tasks[task_index].last_syscall_ret_unread = true;
+                self.set_last_syscall_ret_for_current(ret);
             }
 
             Syscall::PageUnmap { page } => {
                 let ret = self.syscall_page_unmap(task_index, tid, page);
-                self.tasks[task_index].last_syscall_ret = Some(ret);
-                self.tasks[task_index].last_syscall_ret_unread = true;
+                self.set_last_syscall_ret_for_current(ret);
             }
         }
     }

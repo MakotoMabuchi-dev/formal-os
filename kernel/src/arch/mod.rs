@@ -5,6 +5,8 @@
 // - paging: CR3 / ページテーブル操作
 // - virt_layout: 仮想アドレスレイアウト（low/high, alias, user slot）
 // - interrupts: IDT, page fault など例外処理
+// - gdt: GDT/TSS/IST
+// - ring3: ring3 へ入るための最小 glue（iretq）
 //
 // 方針:
 // - 例外が起きてもログが残るよう、割り込み初期化は早め。
@@ -15,7 +17,7 @@ pub mod interrupts;
 pub mod paging;
 pub mod virt_layout;
 pub mod gdt;
-
+pub mod ring3;
 
 use bootloader::BootInfo;
 

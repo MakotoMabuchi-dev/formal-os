@@ -3,6 +3,7 @@
 // 役割:
 // - IDT(Interrupt Descriptor Table) を初期化・再ロードする。
 // - high-alias 移行後も例外が確実に handler に届く状態を作る。
+// - ring3 MVP: int 0x80 を追加して user -> kernel の入口にする。
 //
 // 設計方針:
 // - 例外ハンドラは lock を取らない
@@ -11,12 +12,20 @@
 //
 // 重要:
 // - x86_64 crate(0.15.x) の IDT は handler シグネチャが固定。
-//   extern "x86-interrupt" fn(InterruptStackFrame, ..) の形に揃える必要がある。
 // - RIP fixup は InterruptStackFrame を raw pointer で InterruptStackFrameValue に見立てて更新する。
+//
+// ★ring3 MVP（安定版）:
+// - “RAX を ring3 に返す” は x86-interrupt だと保証しづらい（レジスタを触れない）のでやらない。
+// - 代わりに kernel が user stack ([rsp-8]) に直接書き、次の int80 でそれを読み出して確認する。
+// - iretq 前は必ず user_root に戻す（CR3 が kernel のままだと命令フェッチで #PF する）。
+//
+// 実装メモ:
+// - paging 側の take_* が “消費” API の場合があるので、ここで roots をキャッシュして使う。
 
 #![allow(dead_code)]
 
 use core::mem;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use spin::Mutex;
 use x86_64::VirtAddr;
@@ -30,6 +39,7 @@ use x86_64::structures::idt::{
     InterruptStackFrameValue,
     PageFaultErrorCode,
 };
+use x86_64::PrivilegeLevel;
 
 use crate::{
     arch::{gdt, paging, virt_layout},
@@ -39,9 +49,38 @@ use crate::{
 type PageFaultHandler = extern "x86-interrupt" fn(InterruptStackFrame, PageFaultErrorCode);
 type GpfHandler = extern "x86-interrupt" fn(InterruptStackFrame, u64);
 type DoubleFaultHandler = extern "x86-interrupt" fn(InterruptStackFrame, u64) -> !;
+type Int80Handler = extern "x86-interrupt" fn(InterruptStackFrame);
 
 static IDT_LOW: Mutex<Option<InterruptDescriptorTable>> = Mutex::new(None);
 static IDT_HIGH: Mutex<Option<InterruptDescriptorTable>> = Mutex::new(None);
+
+static INT80_COUNT: AtomicU64 = AtomicU64::new(0);
+
+// ---- ring3 demo roots cache ----
+// paging 側が “消費 API” の場合に備え、ここで保持して毎回使えるようにする
+static DEMO_USER_ROOT_PHYS: AtomicU64 = AtomicU64::new(0);
+static DEMO_KERNEL_ROOT_PHYS: AtomicU64 = AtomicU64::new(0);
+
+fn cache_demo_roots_if_needed() -> Option<(crate::mem::addr::PhysFrame, crate::mem::addr::PhysFrame)> {
+    use crate::mem::addr::{PhysFrame, PAGE_SIZE};
+
+    let u = DEMO_USER_ROOT_PHYS.load(Ordering::Relaxed);
+    let k = DEMO_KERNEL_ROOT_PHYS.load(Ordering::Relaxed);
+    if u != 0 && k != 0 {
+        return Some((PhysFrame::from_index(u / PAGE_SIZE), PhysFrame::from_index(k / PAGE_SIZE)));
+    }
+
+    // paging 側の “消費しない” 取得を優先（あなたの paging.rs に合わせる）
+    let (user_root, kernel_root) = paging::peek_ring3_demo_roots()?;
+
+    DEMO_USER_ROOT_PHYS.store(user_root.start_address().0, Ordering::Relaxed);
+    DEMO_KERNEL_ROOT_PHYS.store(kernel_root.start_address().0, Ordering::Relaxed);
+
+    Some((user_root, kernel_root))
+}
+
+// kernel が user stack に書く固定値（観測用）
+const INT80_WRITE_VAL: u64 = 0x1122_3344_5566_7788u64;
 
 pub fn init() {
     interrupts::without_interrupts(|| {
@@ -54,6 +93,15 @@ pub fn init() {
         idt.general_protection_fault
             .set_handler_fn(general_protection_fault_handler);
         idt.double_fault.set_handler_fn(double_fault_handler);
+
+        // ring3 MVP: int 0x80
+        unsafe {
+            idt[0x80]
+                .set_handler_fn(int80_handler)
+                .set_privilege_level(PrivilegeLevel::Ring3)
+                // ★重要: IST で受ける（RSP0 依存を避ける）
+                .set_stack_index(gdt::PAGE_FAULT_IST_INDEX);
+        }
 
         *IDT_LOW.lock() = Some(idt);
 
@@ -84,6 +132,11 @@ pub fn reload_idt_high_alias() {
             idt.double_fault
                 .set_handler_fn(transmute_df(high_alias_addr(double_fault_handler as u64)))
                 .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
+
+            idt[0x80]
+                .set_handler_fn(transmute_int80(high_alias_addr(int80_handler as u64)))
+                .set_privilege_level(PrivilegeLevel::Ring3)
+                .set_stack_index(gdt::PAGE_FAULT_IST_INDEX);
         }
 
         *IDT_HIGH.lock() = Some(idt);
@@ -123,6 +176,9 @@ unsafe fn transmute_gpf(addr: u64) -> GpfHandler {
 unsafe fn transmute_df(addr: u64) -> DoubleFaultHandler {
     mem::transmute::<u64, DoubleFaultHandler>(addr)
 }
+unsafe fn transmute_int80(addr: u64) -> Int80Handler {
+    mem::transmute::<u64, Int80Handler>(addr)
+}
 
 // ---- emergency output ----
 
@@ -140,13 +196,13 @@ fn emergency_write_byte(b: u8) {
     }
 }
 
-fn emergency_write_str(s: &str) {
+pub(crate) fn emergency_write_str(s: &str) {
     for b in s.bytes() {
         emergency_write_byte(b);
     }
 }
 
-fn emergency_write_hex_u64(v: u64) {
+pub(crate) fn emergency_write_hex_u64(v: u64) {
     emergency_write_str("0x");
     for i in (0..16).rev() {
         let n = ((v >> (i * 4)) & 0xF) as u8;
@@ -156,13 +212,10 @@ fn emergency_write_hex_u64(v: u64) {
 }
 
 // ---- RIP fixup ----
-// InterruptStackFrame の内部表現は安定保証されないが、0.15.x では Value と同等の内容を保持する前提で
-// raw pointer で見立てて instruction_pointer のみを書き換える（guarded fixup 用途に限定）
 
 #[inline(always)]
 fn set_exception_rip(stack_frame: &mut InterruptStackFrame, new_rip: u64) {
     unsafe {
-        // 直キャストは E0606 で弾かれることがあるので、u8* を挟んで行う
         let p_isf: *mut InterruptStackFrame = stack_frame as *mut InterruptStackFrame;
         let p_u8: *mut u8 = p_isf as *mut u8;
         let p_val: *mut InterruptStackFrameValue = p_u8 as *mut InterruptStackFrameValue;
@@ -172,6 +225,84 @@ fn set_exception_rip(stack_frame: &mut InterruptStackFrame, new_rip: u64) {
 }
 
 // ---- handlers ----
+
+extern "x86-interrupt" fn int80_handler(stack_frame: InterruptStackFrame) {
+    let n = INT80_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+
+    let user_rip = stack_frame.instruction_pointer.as_u64();
+    let user_rsp = stack_frame.stack_pointer.as_u64();
+
+    // mailbox ABI（user stack 上）
+    // [rsp-16]=sysno, [rsp-24]=a0, [rsp-32]=a1, [rsp-40]=a2, [rsp-48]=ret_slot
+    let p_sysno   = (user_rsp.wrapping_sub(16)) as *const u64;
+    let p_a0      = (user_rsp.wrapping_sub(24)) as *const u64;
+    let p_a1      = (user_rsp.wrapping_sub(32)) as *const u64;
+    let p_a2      = (user_rsp.wrapping_sub(40)) as *const u64;
+    let p_retslot = (user_rsp.wrapping_sub(48)) as *mut u64;
+
+    // user が ret_slot を読んで [rsp-8] にコピーした想定の観測スロット
+    let p_user_echo = (user_rsp.wrapping_sub(8)) as *const u64;
+
+    let (user_root, kernel_root) = match paging::peek_ring3_demo_roots() {
+        Some(v) => v,
+        None => {
+            emergency_write_str("[INT80] demo_roots: NONE\n");
+            crate::arch::halt_loop();
+        }
+    };
+
+    // 1回目：sysno/args を読んで ret_slot に書く → ring3 へ戻す
+    if n == 1 {
+        let sysno = paging::guarded_user_read_u64_in_root(user_root, kernel_root, p_sysno).unwrap_or(0);
+        let a0    = paging::guarded_user_read_u64_in_root(user_root, kernel_root, p_a0).unwrap_or(0);
+        let a1    = paging::guarded_user_read_u64_in_root(user_root, kernel_root, p_a1).unwrap_or(0);
+        let a2    = paging::guarded_user_read_u64_in_root(user_root, kernel_root, p_a2).unwrap_or(0);
+
+        emergency_write_str("[INT80] syscall enter\n");
+        emergency_write_str(" rip="); emergency_write_hex_u64(user_rip);
+        emergency_write_str(" rsp="); emergency_write_hex_u64(user_rsp);
+        emergency_write_str("\n");
+        emergency_write_str(" sysno="); emergency_write_hex_u64(sysno);
+        emergency_write_str(" a0="); emergency_write_hex_u64(a0);
+        emergency_write_str(" a1="); emergency_write_hex_u64(a1);
+        emergency_write_str(" a2="); emergency_write_hex_u64(a2);
+        emergency_write_str("\n");
+
+        // MVP: sysno==1 は add3、それ以外は 0
+        let ret = if sysno == 1 { a0.wrapping_add(a1).wrapping_add(a2) } else { 0 };
+
+        // ret_slot に書く（戻り値はレジスタで返さない：mailbox で返す）
+        let _ = paging::guarded_user_rw_u64_in_root(user_root, kernel_root, p_retslot, ret);
+
+        // iretq 前に user_root へ戻す（命令フェッチ事故を避ける）
+        paging::switch_address_space_quiet(user_root);
+        return;
+    }
+
+    // 2回目：ring3 が ret_slot を読んで [rsp-8] に書いた値を kernel が読む → ring3 に戻す
+    if n == 2 {
+        emergency_write_str("[INT80] verify user_echo\n");
+        emergency_write_str(" rip="); emergency_write_hex_u64(user_rip);
+        emergency_write_str(" rsp="); emergency_write_hex_u64(user_rsp);
+        emergency_write_str("\n");
+
+        let echo = paging::guarded_user_read_u64_in_root(user_root, kernel_root, p_user_echo).unwrap_or(0);
+
+        emergency_write_str(" echo="); emergency_write_hex_u64(echo);
+        emergency_write_str("\n");
+
+        paging::switch_address_space_quiet(user_root);
+        return;
+    }
+
+    // 3回目：最後にもう一回読んで表示して停止（停止点）
+    emergency_write_str("[INT80] final\n");
+    let echo = paging::guarded_user_read_u64_in_root(user_root, kernel_root, p_user_echo).unwrap_or(0);
+    emergency_write_str(" echo="); emergency_write_hex_u64(echo);
+    emergency_write_str("\n");
+    emergency_write_str("[INT80] done -> halt\n");
+    crate::arch::halt_loop();
+}
 
 extern "x86-interrupt" fn page_fault_handler(
     mut stack_frame: InterruptStackFrame,

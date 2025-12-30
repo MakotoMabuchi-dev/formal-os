@@ -43,3 +43,5 @@ kill_cleanup_test = []
 dead_partner_test = []
 
 endpoint_close_test = []
+
+ring3_demo = []
