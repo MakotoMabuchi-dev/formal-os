@@ -7,16 +7,15 @@
 // やること:
 // - init_high_alias(): high-alias で参照できる GDT/TSS を作成し GDTR/TR を更新
 // - #PF / #DF を IST で受けられるように TSS.ist を設定
+// - ring3 MVP 用に user code/data セグメントを追加する
 //
 // やらないこと:
-// - ring3 本格移行のためのユーザセグメント設計（今は例外の安定化が優先）
 // - per-cpu 構造（単一CPU前提）
 //
 // 設計方針:
 // - GDT/TSS は “ロード後に動かない” 静的領域へ固定配置
 // - TSS 内の RSP0/IST は high-alias 仮想アドレスを格納（low-half 依存を断つ）
 // - IST index は x86_64 crate の set_stack_index と同じ 0-based を使う
-//   （set_stack_index は内部で +1 して IST1..IST7 を選ぶ）
 
 #![allow(dead_code)]
 
@@ -32,8 +31,6 @@ use x86_64::VirtAddr;
 
 use crate::{arch::virt_layout, logging};
 
-/// x86_64 crate の set_stack_index は “0-based” を受け取り内部で +1 して IST1.. を選ぶ。
-/// したがって、TSS.interrupt_stack_table の index も 0-based で揃える。
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0; // IST1
 pub const PAGE_FAULT_IST_INDEX: u16 = 1;   // IST2
 
@@ -52,19 +49,17 @@ struct Selectors {
     code: SegmentSelector,
     data: SegmentSelector,
     tss: SegmentSelector,
+    user_code: SegmentSelector,
+    user_data: SegmentSelector,
 }
 
-/// `#[repr(align(N))]` は static ではなく “型” に付ける必要があるため、
-/// アライン済みのスタック領域はラッパ型で表現する。
 #[repr(align(16))]
 struct AlignedStack<const N: usize> {
     buf: [u8; N],
 }
-
 impl<const N: usize> AlignedStack<N> {
     #[inline(always)]
     fn top_ptr(&self) -> *const u8 {
-        // スタックは上位へ向かって伸びるので、top = base + size
         unsafe { self.buf.as_ptr().add(N) }
     }
 }
@@ -77,7 +72,6 @@ static mut PF_IST_STACK: AlignedStack<IST_STACK_SIZE> = AlignedStack { buf: [0; 
 fn high_alias_u64(low: u64) -> u64 {
     virt_layout::kernel_high_alias_of_low(low)
 }
-
 #[inline(always)]
 fn align_down_16(x: u64) -> u64 {
     x & !0xFu64
@@ -90,36 +84,26 @@ pub fn init_high_alias() {
         }
 
         unsafe {
-            // ----------------------------
-            // 1) TSS を静的領域へ構築
-            // ----------------------------
+            // 1) TSS
             let mut tss = TaskStateSegment::new();
 
             let rsp0_low = VirtAddr::from_ptr(RSP0_STACK.top_ptr()).as_u64();
             let df_ist_low = VirtAddr::from_ptr(DF_IST_STACK.top_ptr()).as_u64();
             let pf_ist_low = VirtAddr::from_ptr(PF_IST_STACK.top_ptr()).as_u64();
 
-            // TSS に入れる stack pointer は 16-byte aligned に揃える
             let rsp0_high = VirtAddr::new(align_down_16(high_alias_u64(rsp0_low)));
             let df_ist_high = VirtAddr::new(align_down_16(high_alias_u64(df_ist_low)));
             let pf_ist_high = VirtAddr::new(align_down_16(high_alias_u64(pf_ist_low)));
 
-            // ring3→ring0 のスタック（将来用）
             tss.privilege_stack_table[0] = rsp0_high;
-
-            // 例外用 IST（#DF/#PF）
             tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = df_ist_high;
             tss.interrupt_stack_table[PAGE_FAULT_IST_INDEX as usize] = pf_ist_high;
 
             TSS.write(tss);
 
-            // ----------------------------
-            // 2) GDT を静的領域へ構築
-            //   ★TSS descriptor base を high-alias にする
-            // ----------------------------
+            // 2) GDT
             let mut gdt = GlobalDescriptorTable::new();
 
-            // TSS の low アドレス → high-alias アドレスへ変換して descriptor に埋める
             let tss_low_ptr_u64 = TSS.as_ptr() as u64;
             let tss_high_ptr_u64 = high_alias_u64(tss_low_ptr_u64);
             let tss_high_ptr = tss_high_ptr_u64 as *const TaskStateSegment;
@@ -127,6 +111,11 @@ pub fn init_high_alias() {
 
             let code_sel = gdt.append(Descriptor::kernel_code_segment());
             let data_sel = gdt.append(Descriptor::kernel_data_segment());
+
+            // ★ring3 MVP: user segments
+            let user_code_sel = gdt.append(Descriptor::user_code_segment());
+            let user_data_sel = gdt.append(Descriptor::user_data_segment());
+
             let tss_sel = gdt.append(Descriptor::tss_segment(tss_high_ref));
 
             GDT.write(gdt);
@@ -134,21 +123,18 @@ pub fn init_high_alias() {
                 code: code_sel,
                 data: data_sel,
                 tss: tss_sel,
+                user_code: user_code_sel,
+                user_data: user_data_sel,
             });
 
-            // ----------------------------
-            // 3) GDTR を “high-alias base” でロード
-            // ----------------------------
+            // 3) load GDTR (high-alias base)
             let gdt_low_ptr_u64 = GDT.as_ptr() as u64;
             let gdt_high_ptr_u64 = high_alias_u64(gdt_low_ptr_u64);
             let gdt_high_ptr = gdt_high_ptr_u64 as *const GlobalDescriptorTable;
             let gdt_high_ref: &'static GlobalDescriptorTable = &*gdt_high_ptr;
-
             gdt_high_ref.load();
 
-            // ----------------------------
-            // 4) セグメント / TR を更新
-            // ----------------------------
+            // 4) reload seg / TR
             let sel = SELECTORS.assume_init_ref();
             CS::set_reg(sel.code);
             DS::set_reg(sel.data);
@@ -156,11 +142,8 @@ pub fn init_high_alias() {
             SS::set_reg(sel.data);
             load_tss(sel.tss);
 
-            // ----------------------------
-            // 5) ログ（確認ポイント）
-            // ----------------------------
+            // 5) log
             logging::info("arch::gdt::init_high_alias: GDT/TSS loaded");
-
             logging::info_u64("tss_low", tss_low_ptr_u64);
             logging::info_u64("tss_high", tss_high_ptr_u64);
             logging::info_u64("tss_high_pml4", virt_layout::pml4_index(tss_high_ptr_u64) as u64);
@@ -180,4 +163,14 @@ pub fn init_high_alias() {
             logging::info_u64("pf_ist_high_pml4", virt_layout::pml4_index(pf_ist_high.as_u64()) as u64);
         }
     });
+}
+
+#[inline(always)]
+pub fn user_code_selector() -> SegmentSelector {
+    unsafe { SELECTORS.assume_init_ref().user_code }
+}
+
+#[inline(always)]
+pub fn user_data_selector() -> SegmentSelector {
+    unsafe { SELECTORS.assume_init_ref().user_data }
 }

@@ -32,7 +32,6 @@ pub const IPC_ERR_DEAD_PARTNER: u64 = 0xDEAD_DEAD_DEAD_DEAD;
 /// endpoint close エラーコード（owner dead 等）
 pub const IPC_ERR_ENDPOINT_CLOSED: u64 = 0xC105_ED00_C105_ED00;
 
-
 /// Endpoint（reply_queue 版）
 #[derive(Clone, Copy)]
 pub struct Endpoint {
@@ -164,7 +163,7 @@ impl KernelState {
             crate::logging::info_u64("task_id", tid.0);
             crate::logging::info_u64("ep_id", ep.0 as u64);
 
-            // 最小のエラー返し（pending_send_msg 等は触らない）
+            // 最小のエラー返し
             self.tasks[idx].last_reply = Some(IPC_ERR_DEAD_PARTNER);
             return true;
         }
@@ -210,7 +209,6 @@ impl KernelState {
         // 1) recv_waiter rescue
         if let Some(recv_idx) = self.endpoints[ep.0].recv_waiter.take() {
             if recv_idx < self.num_tasks && self.tasks[recv_idx].state != TaskState::Dead {
-                // blocked_reason を外し、エラーを返して READY に戻す
                 self.tasks[recv_idx].blocked_reason = None;
                 self.tasks[recv_idx].last_reply = Some(IPC_ERR_ENDPOINT_CLOSED);
                 self.wake_task_to_ready(recv_idx);
@@ -218,12 +216,9 @@ impl KernelState {
         }
 
         // 2) send_queue rescue（全員）
-        let pos = 0;
-        while pos < self.endpoints[ep.0].sq_len {
-            let send_idx = self.endpoints[ep.0].send_queue[pos];
-            // swap-remove 的に詰めるため、pos は進めない
+        while self.endpoints[ep.0].sq_len > 0 {
             let last = self.endpoints[ep.0].sq_len - 1;
-            self.endpoints[ep.0].send_queue[pos] = self.endpoints[ep.0].send_queue[last];
+            let send_idx = self.endpoints[ep.0].send_queue[last];
             self.endpoints[ep.0].sq_len -= 1;
 
             if send_idx < self.num_tasks && self.tasks[send_idx].state != TaskState::Dead {
@@ -235,11 +230,9 @@ impl KernelState {
         }
 
         // 3) reply_queue rescue（全員）
-        let pos = 0;
-        while pos < self.endpoints[ep.0].rq_len {
-            let widx = self.endpoints[ep.0].reply_queue[pos];
+        while self.endpoints[ep.0].rq_len > 0 {
             let last = self.endpoints[ep.0].rq_len - 1;
-            self.endpoints[ep.0].reply_queue[pos] = self.endpoints[ep.0].reply_queue[last];
+            let widx = self.endpoints[ep.0].reply_queue[last];
             self.endpoints[ep.0].rq_len -= 1;
 
             if widx < self.num_tasks && self.tasks[widx].state != TaskState::Dead {
