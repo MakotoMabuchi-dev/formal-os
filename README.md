@@ -180,21 +180,9 @@ cargo install bootimage
 
 ### Build
 
-- default (no features)
-  - `./scripts/build-kernel.sh`
-
-- IPC trace
-  - `FEATURES="ipc_trace_paths" ./scripts/build-kernel.sh`
-
-- IPC demo (reproducible) + trace
-  - `FEATURES="ipc_demo_single_slow ipc_trace_paths" ./scripts/build-kernel.sh`
-
-- PF demo
-  - `FEATURES="pf_demo" ./scripts/build-kernel.sh`
-
-- quick local checks
-  - `./scripts/ci-check.sh`
-
+```
+cargo bootimage -p kernel --target x86_64-formal-os-local.json
+```
 
 ### Run (QEMU)
 
