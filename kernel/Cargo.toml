@@ -48,3 +48,6 @@ ring3_demo = []
 ring3_mailbox = []
 ring3_mailbox_loop = []
 ring3_mailbox_loop_skip_rx = []
+
+alias_copycount_auto = []
+ignore_user_pf_demo = []

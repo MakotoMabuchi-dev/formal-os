@@ -18,6 +18,7 @@
 // - IST index は x86_64 crate の set_stack_index と同じ 0-based を使う
 
 #![allow(dead_code)]
+#![allow(static_mut_refs)] // 単一CPU・初期化時のみ・以後不変の前提で lint を抑制
 
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, Ordering};

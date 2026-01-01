@@ -37,6 +37,10 @@
 // - guarded_user_rw_u64_in_root() を追加し、「必ず kernel CR3 に戻す」責務を arch 側に寄せられるようにする。
 // - ring3 demo 用に (user_root, kernel_root) を記録し、interrupts 側で参照できるようにする。
 // - guarded_user_read_u64_in_root() を追加（read-only 版）。
+//
+// ★追加（今回の安定化修正）:
+// - MemAction::Unmap の VA 計算は「root の有無」で決める（kernel unmap が user を触らない）
+// - high-alias のコピー数は MVP では MAX 固定（“存在しない alias を参照して #PF” を避ける）
 
 use bootloader::BootInfo;
 use bootloader::bootinfo::MemoryRegionType;
@@ -69,7 +73,6 @@ use crate::mem::paging::{MemAction, PageFlags};
 
 // interrupts.rs など他モジュールからも使うので公開 re-export しておく
 pub use crate::mem::addr::{PhysFrame as MyPhysFrame, PAGE_SIZE};
-
 
 pub use crate::arch::virt_layout::{USER_PML4_INDEX, USER_SPACE_BASE, USER_SPACE_SIZE};
 
@@ -157,7 +160,7 @@ unsafe fn guard_u64_ptr(addr_u64: u64) -> *mut u64 {
     let idx = virt_layout::pml4_index(addr_u64);
 
     // alias window は src=0..KERNEL_ALIAS_MAX_COPY_COUNT-1 を dst=508.. へコピーする設計。
-    // したがって low PML4 idx が 0..=3 の場合は high-alias が存在する。
+    // MVP では install 側で MAX 固定コピーするため、この前提でよい。
     if idx < virt_layout::KERNEL_ALIAS_MAX_COPY_COUNT {
         let high = virt_layout::kernel_high_alias_of_low(addr_u64);
         return high as *mut u64;
@@ -628,8 +631,6 @@ fn preflight_check_before_cr3_write(target: MyPhysFrame) {
 
         // -----------------------------------------------------------------
         // physmap: “PML4 entry の存在” を current と target の両方で検証する
-        // - current が missing なら physmap_pml4_index 計算が間違っている可能性が高い
-        // - target が missing なら init_user_pml4_from_current のコピーが壊れている
         // -----------------------------------------------------------------
         let physmap_off = PHYSICAL_MEMORY_OFFSET.load(Ordering::Relaxed);
         let physmap_pml4 = virt_layout::pml4_index(physmap_off);
@@ -780,8 +781,8 @@ pub fn switch_address_space_quiet(frame: MyPhysFrame) {
 /// logging を一切行わずに CR3 を書き換える（user CR3 中からの復帰用 / 一時切替用）
 ///
 /// 重要:
-/// - ここでは readback 検証をしない（panic させない）
-/// - 安全性チェックは switch_address_space(Some(...)) 側（preflight）で行う
+// - ここでは readback 検証をしない（panic させない）
+// - 安全性チェックは switch_address_space(Some(...)) 側（preflight）で行う
 pub fn switch_address_space_quiet_nocheck(frame: MyPhysFrame) {
     use x86_64::structures::paging::{PhysFrame, Size4KiB};
 
@@ -868,9 +869,10 @@ pub fn install_kernel_high_alias_from_current() {
         (rip, rsp, rbp)
     };
 
-    let copy_count = virt_layout::recommend_alias_copy_count_from_addrs(&[
-        code_low, stack_low, rip, rsp, rbp,
-    ]);
+    let _ = (code_low, stack_low, rip, rsp, rbp);
+
+    // ★MVP: high-alias の存在を固定する（copy_count を MAX にする）
+    let copy_count = virt_layout::KERNEL_ALIAS_MAX_COPY_COUNT;
     ALIAS_COPY_COUNT.store(copy_count, Ordering::Relaxed);
 
     let dst_base = virt_layout::KERNEL_ALIAS_DST_PML4_BASE_INDEX;
@@ -1055,11 +1057,11 @@ unsafe fn apply_mem_action_with_mapper(
                 logging::info("arch::paging::apply_mem_action: Unmap");
             }
 
+            // VirtPage は「オフセット表現」。
+            // - User address space（root 指定あり）では USER_SPACE_BASE を足した仮想アドレスに unmap する。
+            // - Kernel address space（root 指定なし）ではオフセットをそのまま低位VAとして扱う。
             let mut virt_u64 = page.start_address().0;
-
-            // ★Unmap は “USER slot のページかどうか” で USER_SPACE_BASE を足す（root 有無で決めない）
-            let virt_candidate = VirtAddr::new(USER_SPACE_BASE + virt_u64);
-            if is_user_space_addr(virt_candidate) {
+            if root.is_some() {
                 virt_u64 = USER_SPACE_BASE + virt_u64;
             }
 

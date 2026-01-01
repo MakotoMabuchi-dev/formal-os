@@ -17,6 +17,9 @@ pub mod interrupts;
 pub mod paging;
 pub mod virt_layout;
 pub mod gdt;
+
+// ring3 は ring3 系 feature のときだけビルド（unused warning 対策）
+#[cfg(any(feature = "ring3_demo", feature = "ring3_mailbox", feature = "ring3_mailbox_loop"))]
 pub mod ring3;
 
 use bootloader::BootInfo;
