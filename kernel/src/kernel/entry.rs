@@ -18,10 +18,15 @@
 use bootloader::BootInfo;
 
 use crate::{arch, logging};
-use crate::mem::addr::{PhysFrame, VirtPage, PAGE_SIZE};
-use crate::mem::paging::{MemAction, PageFlags};
 
 use super::KernelState;
+
+// ring3 系デモでのみ使う import（no-features ビルドで unused warning を出さない）
+#[cfg(any(feature = "ring3_demo", feature = "ring3_mailbox", feature = "ring3_mailbox_loop"))]
+use crate::mem::addr::{PhysFrame, VirtPage, PAGE_SIZE};
+
+#[cfg(any(feature = "ring3_demo", feature = "ring3_mailbox", feature = "ring3_mailbox_loop"))]
+use crate::mem::paging::{MemAction, PageFlags};
 
 // ring3_demo / ring3_mailbox だけが使う（未使用 warning を避ける）
 #[cfg(any(feature = "ring3_demo", feature = "ring3_mailbox"))]
@@ -31,12 +36,14 @@ use crate::mm::PhysicalMemoryManager;
 use super::pagetable_init;
 
 /// emergency 出力（panic 直前でも見える）
+#[cfg(any(feature = "ring3_demo", feature = "ring3_mailbox", feature = "ring3_mailbox_loop"))]
 #[inline(always)]
 fn eprint(s: &str) {
     crate::arch::interrupts::emergency_write_str(s);
 }
 
 /// emergency で u64 を出す
+#[cfg(any(feature = "ring3_demo", feature = "ring3_mailbox", feature = "ring3_mailbox_loop"))]
 #[inline(always)]
 fn eprint_hex(label: &str, v: u64) {
     crate::arch::interrupts::emergency_write_str(label);
@@ -48,6 +55,7 @@ fn eprint_hex(label: &str, v: u64) {
 ///
 /// 前提:
 /// - kernel CR3 では physmap が有効（physical_memory_offset が正しい）
+#[cfg(any(feature = "ring3_demo", feature = "ring3_mailbox", feature = "ring3_mailbox_loop"))]
 #[inline(never)]
 unsafe fn write_bytes_to_phys(phys_u64: u64, bytes: &[u8]) {
     eprint("[E] write_bytes_to_phys: begin\n");
@@ -277,8 +285,6 @@ fn run_ring3_mailbox_demo(boot_info: &'static BootInfo) -> ! {
 fn run_ring3_mailbox_loop_demo(_boot_info: &'static BootInfo, kstate: &mut KernelState) -> ! {
     logging::info("ring3_mailbox_loop: start");
 
-    // ★重要: ring3 ループは「Task1(User) が走っている」前提で整合を取る
-    // - current_task/state/ready_queue を最小限で整える
     kstate.prepare_ring3_loop_current_task();
 
     let kernel_root: PhysFrame = {
@@ -335,11 +341,9 @@ fn run_ring3_mailbox_loop_demo(_boot_info: &'static BootInfo, kstate: &mut Kerne
 
     arch::paging::set_ring3_demo_roots(user_root, kernel_root);
 
-    // panic 位置特定用
     eprint("[E] after roots registered\n");
 
     unsafe {
-        // ★繰り返しを入れるので 1024 だと溢れやすい。余裕を持って 4096 にする。
         let mut bytes_vec: [u8; 4096] = [0; 4096];
         let mut n: usize = 0;
 
@@ -379,20 +383,13 @@ fn run_ring3_mailbox_loop_demo(_boot_info: &'static BootInfo, kstate: &mut Kerne
             }};
         }
 
-        // ------------------------------------------------------------
-        // 目標:
-        // - send → tick → take_reply を複数回回して “往復” を確認する
-        // - 取得した ret_slot は echo([rsp-8]) に都度上書き（観測は最後でOK）
-        // ------------------------------------------------------------
         for round in 0..4u32 {
-            // sys11: ipc_send(ep=0, msg=0x1234 + round)
             mov_rsp_off_imm32(&mut bytes_vec, &mut n, -16, 11);
             mov_rsp_off_imm32(&mut bytes_vec, &mut n, -24, 0);
             mov_rsp_off_imm32(&mut bytes_vec, &mut n, -32, 0x1234 + round);
             mov_rsp_off_imm32(&mut bytes_vec, &mut n, -40, 0);
             push!("int80_send"; 0xCD, 0x80);
 
-            // tick を少し回して receiver を動かす（重いなら 8→4 に落としてOK）
             for _ in 0..8 {
                 mov_rsp_off_imm32(&mut bytes_vec, &mut n, -16, 30);
                 mov_rsp_off_imm32(&mut bytes_vec, &mut n, -24, 0);
@@ -401,21 +398,18 @@ fn run_ring3_mailbox_loop_demo(_boot_info: &'static BootInfo, kstate: &mut Kerne
                 push!("int80_tick"; 0xCD, 0x80);
             }
 
-            // sys31: take_last_reply
             mov_rsp_off_imm32(&mut bytes_vec, &mut n, -16, 31);
             mov_rsp_off_imm32(&mut bytes_vec, &mut n, -24, 0);
             mov_rsp_off_imm32(&mut bytes_vec, &mut n, -32, 0);
             mov_rsp_off_imm32(&mut bytes_vec, &mut n, -40, 0);
             push!("int80_take_reply"; 0xCD, 0x80);
 
-            // ret_slot([rsp-48]) -> echo([rsp-8])（観測用）
             push!("copy_ret_to_echo";
-                0x48, 0x8B, 0x44, 0x24, 0xD0, // mov rax, [rsp-48]
-                0x48, 0x89, 0x44, 0x24, 0xF8, // mov [rsp-8], rax
+                0x48, 0x8B, 0x44, 0x24, 0xD0,
+                0x48, 0x89, 0x44, 0x24, 0xF8,
             );
         }
 
-        // jmp $
         push!("jmp"; 0xEB, 0xFE);
 
         eprint("[E] about to write bytes to phys\n");
@@ -425,10 +419,6 @@ fn run_ring3_mailbox_loop_demo(_boot_info: &'static BootInfo, kstate: &mut Kerne
         eprint("[E] bytes written OK\n");
     }
 
-    // ------------------------------------------------------------
-    // code を「書き込み後に RX」に落とす
-    // - ring3_mailbox_loop_skip_rx が有効なら skip（debug）
-    // ------------------------------------------------------------
     #[cfg(not(feature = "ring3_mailbox_loop_skip_rx"))]
     {
         logging::info("ring3_mailbox_loop: remap code to RX (drop WRITABLE)");
@@ -503,11 +493,7 @@ extern "C" fn kernel_high_entry(boot_info: &'static BootInfo) -> ! {
         run_ring3_mailbox_demo(boot_info);
     }
 
-    #[cfg(all(
-        not(feature = "ring3_demo"),
-        not(feature = "ring3_mailbox"),
-        feature = "ring3_mailbox_loop"
-    ))]
+    #[cfg(all(not(feature = "ring3_demo"), not(feature = "ring3_mailbox"), feature = "ring3_mailbox_loop"))]
     {
         logging::info("ring3_mailbox_loop: preparing KernelState and entering ring3");
 

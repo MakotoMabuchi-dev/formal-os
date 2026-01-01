@@ -10,13 +10,13 @@
 //
 // 重要（現行実装との整合）:
 // - 現時点の実装は「low-half 全域を user として許可」ではなく、
-//   1つの PML4 スロット（index=4、512GiB）を user slot として予約している。
+//   1つの PML4 スロットを user slot として予約している。
 // - USER_SPACE_* は「予約した user slot 範囲」を表す（= 実装のポリシーと一致）
 //
 // 想定レイアウト（現行の reserved slot 版）:
 //
-//   0x0000_0200_0000_0000 ..= 0x0000_027f_ffff_ffff
-//     - user slot (PML4 index 4, 512GiB)
+//   0x0000_1000_0000_0000 ..= 0x0000_107f_ffff_ffff
+//     - user slot (PML4 index 32, 512GiB)
 //     - プロセスごとに異なるマッピングを持つ領域（当面はこの範囲のみ許可）
 //
 //   0xffff_8000_0000_0000 ..= 0xffff_ffff_ffff_ffff
@@ -30,7 +30,7 @@ pub const PML4_SLOT_SIZE: u64 = 1u64 << 39;
 
 /// 現行実装で user slot に予約する PML4 index
 /// （arch::virt_layout と合わせる前提）
-pub const USER_PML4_INDEX: u64 = 4;
+pub const USER_PML4_INDEX: u64 = 32;
 
 /// ユーザ空間（reserved user slot）の開始アドレス。
 pub const USER_SPACE_START: u64 = USER_PML4_INDEX * PML4_SLOT_SIZE;

@@ -16,21 +16,15 @@
 // - syscall の戻り値（mem 操作結果）と IPC reply を混線させない
 //   * mem 系: last_syscall_ret
 //   * IPC   : last_reply
+//
+// ★整理（テスト分離）:
+// - dead_partner_test 等の “テスト注入” は demo/ 側に集約し、syscall 境界から排除する。
 
 use super::{EndpointId, KernelState, LogEvent};
 
 use crate::mem::address_space::AddressSpaceKind;
 use crate::mem::addr::VirtPage;
 use crate::mem::paging::{MemAction, PageFlags};
-
-#[cfg(feature = "dead_partner_test")]
-use super::TaskKillReason;
-
-#[cfg(feature = "dead_partner_test")]
-use core::sync::atomic::{AtomicBool, Ordering};
-
-#[cfg(feature = "dead_partner_test")]
-static DEAD_PARTNER_TEST_FIRED: AtomicBool = AtomicBool::new(false);
 
 const SYSCALL_OK: u64 = 0;
 const SYSCALL_ERR_ALREADY_MAPPED: u64 = 1;
@@ -104,20 +98,8 @@ impl KernelState {
 
                 self.ipc_recv(ep);
 
-                #[cfg(feature = "dead_partner_test")]
-                {
-                    if tid.0 == 3 && !DEAD_PARTNER_TEST_FIRED.swap(true, Ordering::SeqCst) {
-                        crate::logging::error("dead_partner_test: kill receiver right after IpcRecv");
-                        crate::logging::info_u64("killed_task_id", tid.0);
-                        crate::logging::info_u64("ep_id", ep.0 as u64);
-
-                        self.kill_task(
-                            task_index,
-                            TaskKillReason::UserPageFault { addr: 0, err: 0, rip: 0 },
-                        );
-                        return;
-                    }
-                }
+                // テスト注入（dead_partner_test 等）は demo 側に集約
+                crate::kernel::demo::on_after_ipc_recv(self, task_index, tid, ep);
             }
 
             Syscall::IpcSend { ep, msg } => {
@@ -283,29 +265,16 @@ fn mailbox_decode(sysno: u64, a0: u64, a1: u64, _a2: u64) -> Option<Syscall> {
 }
 
 /// ring3 mailbox dispatcher
-///
-/// 重要（ring3_mailbox_loop）:
-/// - ring3 は “Task1(User)” として扱い、tick()/IPC の invariant を壊さない。
-/// - IPC(10/11/12) だけ Task1 偽装を行い、tick_once(30) は偽装しない。
 pub fn mailbox_dispatch(ks: &mut KernelState, sysno: u64, a0: u64, a1: u64, a2: u64) -> u64 {
-    // ------------------------------------------------------------
-    // 方針:
-    // - sysno=30/31 は current_task を一切触らない（ring3_mailbox_loop の駆動用）
-    // - IPC(10/11/12) だけ「Task1(User) として処理」
-    // - IPC が block/schedule を起こし得るので、IPC の後に prev_task へ戻さない
-    // ------------------------------------------------------------
     let ring3_task_index: usize = 1;
 
-    // --- “純粋 mailbox” ---
     match sysno {
         1 => return a0.wrapping_add(a1).wrapping_add(a2),
         2 => return ks.tick_count,
-
         30 => {
             ks.tick();
             return ks.tick_count;
         }
-
         31 => {
             if ring3_task_index < ks.num_tasks {
                 let v = ks.tasks[ring3_task_index].last_reply.unwrap_or(0);
@@ -314,14 +283,12 @@ pub fn mailbox_dispatch(ks: &mut KernelState, sysno: u64, a0: u64, a1: u64, a2: 
             }
             return 0;
         }
-
         _ => {}
     }
 
     let is_ipc_sysno = matches!(sysno, 10 | 11 | 12);
 
     if is_ipc_sysno {
-        // IPC: Task1(User) として処理（保険A: state/blocked_reason は触らない）
         if ring3_task_index < ks.num_tasks && ks.tasks[ring3_task_index].state != super::TaskState::Dead {
             ks.current_task = ring3_task_index;
         }
@@ -334,7 +301,6 @@ pub fn mailbox_dispatch(ks: &mut KernelState, sysno: u64, a0: u64, a1: u64, a2: 
         return 0;
     }
 
-    // 非IPC: 互換維持のため一時的に current_task を触る可能性があるので戻す
     let prev_task = ks.current_task;
 
     let ret = if let Some(sc) = mailbox_decode(sysno, a0, a1, a2) {

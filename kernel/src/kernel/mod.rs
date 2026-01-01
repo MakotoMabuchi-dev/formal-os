@@ -33,6 +33,8 @@ mod syscall;
 mod user_program;
 mod trace;
 mod state_ref;
+mod demo;
+
 
 pub use entry::start;
 pub use syscall::Syscall;
@@ -47,13 +49,13 @@ use crate::mm::PhysicalMemoryManager;
 use crate::mem::addr::{PhysFrame, VirtPage, PAGE_SIZE};
 use crate::mem::paging::{MemAction, PageFlags};
 use crate::mem::address_space::{AddressSpace, AddressSpaceError, AddressSpaceKind};
-use crate::mem::layout::KERNEL_SPACE_START;
+use crate::mem::layout::{KERNEL_SPACE_START, PML4_SLOT_SIZE, USER_SPACE_START};
 use crate::kernel::ipc::IPC_ERR_DEAD_PARTNER;
 
 use ipc::Endpoint;
 
 const MAX_TASKS: usize = 3;
-const EVENT_LOG_CAP: usize = 256;
+const EVENT_LOG_CAP: usize = 1024;
 
 const MAX_ENDPOINTS: usize = 2;
 
@@ -129,9 +131,15 @@ pub struct Task {
 
 
 // ★Top3: kill reason（最小）
+// - UserPageFault: 本物の #PF のみ
+// - DemoInjected: テスト注入（dead_partner_test 等）
 #[derive(Clone, Copy)]
 pub enum TaskKillReason {
     UserPageFault { addr: u64, err: u64, rip: u64 },
+
+    // reason_code は「どのテストが殺したか」を区別するための小さな識別子
+    // 例: 1=dead_partner_test, 2=kill_cleanup_test, 3=endpoint_close_test...
+    DemoInjected { code: u64 },
 }
 
 #[derive(Clone, Copy)]
@@ -203,6 +211,8 @@ pub struct KernelCounters {
 
     // faults / kill
     pub task_killed_user_pf: u64,
+    // ★追加: テスト注入 kill（dead_partner_test 等）
+    pub task_killed_demo_injected: u64,
 }
 
 impl KernelCounters {
@@ -215,6 +225,7 @@ impl KernelCounters {
             ipc_recv_slow: 0,
             ipc_reply_delivered: 0,
             task_killed_user_pf: 0,
+            task_killed_demo_injected: 0,
         }
     }
 }
@@ -269,8 +280,12 @@ pub struct KernelState {
     #[cfg(feature = "pf_demo")]
     pf_demo_done: bool,
 
-    // ★追加: counters
+    // counters
     pub counters: KernelCounters,
+
+    //（観測性）:
+    // ユーザタスクが全滅したら 1 回だけ dump_events() して halt する
+    halt_dumped_no_user_tasks: bool,
 }
 
 
@@ -412,6 +427,8 @@ impl KernelState {
             pf_demo_done: false,
 
             counters: KernelCounters::new(),
+
+            halt_dumped_no_user_tasks: false,
         };
 
         // ---------------------------------------------------------------------
@@ -419,16 +436,8 @@ impl KernelState {
         // - endpoint_close_test のときだけ ep0 の owner を Task3（TASK2_ID）にする
         // - 通常ビルドでは owner=None のまま（close の発火源を排除）
         // ---------------------------------------------------------------------
-        #[cfg(feature = "endpoint_close_test")]
-        {
-            ks.endpoints[IPC_DEMO_EP0.0].owner = Some(TASK2_ID);
-        }
 
-        #[cfg(not(feature = "endpoint_close_test"))]
-        {
-            ks.endpoints[IPC_DEMO_EP0.0].owner = None;
-        }
-
+        crate::kernel::demo::on_kernel_state_init(&mut ks);
         ks
     }
 
@@ -514,6 +523,26 @@ impl KernelState {
                 logging::error("INVARIANT VIOLATION: user address space has no root_page_frame");
                 logging::info_u64("as_idx", as_idx as u64);
             }
+        }
+
+        // -------------------------------------------------------------------------
+        // mem::layout と arch::paging のユーザ空間定数の整合（ズレ検知）
+        // - 将来どちらかだけ更新して事故るのを防ぐ
+        // -------------------------------------------------------------------------
+        {
+            if arch::paging::USER_SPACE_BASE != USER_SPACE_START {
+                logging::error("INVARIANT VIOLATION: USER_SPACE_BASE mismatch (arch vs mem::layout)");
+                logging::info_u64("arch_USER_SPACE_BASE", arch::paging::USER_SPACE_BASE);
+                logging::info_u64("layout_USER_SPACE_START", USER_SPACE_START);
+            }
+
+            if arch::paging::USER_SPACE_SIZE != PML4_SLOT_SIZE {
+                logging::error("INVARIANT VIOLATION: USER_SPACE_SIZE mismatch (arch vs mem::layout)");
+                logging::info_u64("arch_USER_SPACE_SIZE", arch::paging::USER_SPACE_SIZE);
+                logging::info_u64("layout_PML4_SLOT_SIZE", PML4_SLOT_SIZE);
+            }
+
+            let _ = KERNEL_SPACE_START;
         }
 
         // -------------------------------------------------------------------------
@@ -1220,11 +1249,88 @@ impl KernelState {
         logging::info("cleanup_user_mappings: done");
     }
 
+    /// demo/ テスト注入から “正規の kill 経路” を使うための入口
+    pub(super) fn demo_kill_task(&mut self, idx: usize, reason: TaskKillReason) {
+        self.kill_task(idx, reason);
+    }
+
+    fn log_task_killed(&self, dead_id: TaskId, reason: TaskKillReason) {
+        logging::error("TASK KILLED");
+        logging::info_u64("task_id", dead_id.0);
+
+        match reason {
+            TaskKillReason::UserPageFault { addr, err, rip } => {
+                logging::info("reason = UserPageFault");
+                logging::info_u64("addr", addr);
+                logging::info_u64("err", err);
+                logging::info_u64("rip", rip);
+            }
+            TaskKillReason::DemoInjected { code } => {
+                logging::info("reason = DemoInjected");
+                logging::info_u64("demo_code", code);
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Demo stability: ユーザタスク全滅で dump + halt
+    // -------------------------------------------------------------------------
+
+    /// 「生存している User task」の数を返す（Kernel task は含めない）。
+    fn alive_user_task_count(&self) -> usize {
+        let mut n = 0usize;
+
+        for i in 0..self.num_tasks {
+            if self.tasks[i].state == TaskState::Dead {
+                continue;
+            }
+
+            let as_idx = self.tasks[i].address_space_id.0;
+            if as_idx >= self.num_tasks {
+                continue;
+            }
+
+            if self.address_spaces[as_idx].kind == AddressSpaceKind::User {
+                n += 1;
+            }
+        }
+
+        n
+    }
+
+    /// ユーザタスクが全滅したら、観測のために dump して halt する（1回だけ）。
+    fn maybe_halt_if_no_user_tasks(&mut self) {
+        if self.halt_dumped_no_user_tasks {
+            return;
+        }
+
+        if self.alive_user_task_count() != 0 {
+            return;
+        }
+
+        logging::info("all user tasks are DEAD => dump_events() and halt");
+
+        // 観測を確実に出す（CR3/VGA を kernel に寄せる）
+        let kernel_root = self.address_spaces[KERNEL_ASID_INDEX]
+            .root_page_frame
+            .expect("kernel root_page_frame must exist");
+        arch::paging::switch_address_space_quiet(kernel_root);
+        logging::set_vga_enabled(true);
+
+        self.dump_events();
+
+        self.halt_dumped_no_user_tasks = true;
+        self.should_halt = true;
+    }
+
     fn kill_task(&mut self, idx: usize, reason: TaskKillReason) {
         // counters を “reason” ベースで一元管理（経路差でズレないようにする）
         match reason {
             TaskKillReason::UserPageFault { .. } => {
                 self.counters.task_killed_user_pf += 1;
+            }
+            TaskKillReason::DemoInjected { .. } => {
+                self.counters.task_killed_demo_injected += 1;
             }
         }
 
@@ -1234,6 +1340,9 @@ impl KernelState {
 
         let dead_id = self.tasks[idx].id;
         let as_idx = self.tasks[idx].address_space_id.0;
+
+        // ★観測性: event_log が流れても必ず残す
+        self.log_task_killed(dead_id, reason);
 
         let _ = self.remove_from_ready_queue(idx);
         let _ = self.remove_from_wait_queue(idx);
@@ -1293,6 +1402,9 @@ impl KernelState {
         if idx == self.current_task {
             self.schedule_next_task();
         }
+
+        // ★観測性: ユーザタスク全滅なら dump + halt（1回だけ）
+        self.maybe_halt_if_no_user_tasks();
     }
 
     fn enqueue_ready(&mut self, idx: usize) {
@@ -1412,14 +1524,18 @@ impl KernelState {
         self.compact_ready_queue_to_ready_only();
 
         // -------------------------------------------------------------
-        // 1) prev が Running なら Ready に戻す（Idle は戻さない）
+        // 1) prev が Running なら Ready に戻す
+        // - Task0(idle) は ready_queue に入れないが、state は Ready に落とす（“二重Running”防止）
         // -------------------------------------------------------------
-        if prev_idx < self.num_tasks && self.tasks[prev_idx].state == TaskState::Running && prev_idx != TASK0_INDEX {
+        if prev_idx < self.num_tasks && self.tasks[prev_idx].state == TaskState::Running {
             self.tasks[prev_idx].state = TaskState::Ready;
             self.tasks[prev_idx].blocked_reason = None;
             self.tasks[prev_idx].time_slice_used = 0;
             self.push_event(LogEvent::TaskStateChanged(prev_id, TaskState::Ready));
-            self.enqueue_ready(prev_idx);
+
+            if prev_idx != TASK0_INDEX {
+                self.enqueue_ready(prev_idx);
+            }
         }
 
         // -------------------------------------------------------------
@@ -1782,18 +1898,12 @@ impl KernelState {
     }
 
     fn do_mem_demo(&mut self) {
-        #[cfg(feature = "evil_double_map")]
-        {
-            self.do_mem_demo_evil_double_map();
+        // デモ/テスト注入（evil_*）を先に試す
+        if crate::kernel::demo::on_mem_demo(self) {
             return;
         }
 
-        #[cfg(feature = "evil_unmap_not_mapped")]
-        {
-            self.do_mem_demo_evil_unmap_not_mapped();
-            return;
-        }
-
+        // 通常デモ
         self.do_mem_demo_normal();
     }
 
@@ -1804,12 +1914,24 @@ impl KernelState {
         let as_idx = self.tasks[idx].address_space_id.0;
         let kind = self.address_spaces[as_idx].kind;
 
+        // mem_demo stage3（Unmap後アクセス）は “期待通りの #PF”
+        let expected = self.mem_demo_stage[idx] == 3;
+
         match kind {
             AddressSpaceKind::User => {
-                logging::error("USER PAGE FAULT => kill current task");
+                if expected {
+                    logging::info("USER PAGE FAULT (expected in mem_demo stage3 after Unmap)");
+                } else {
+                    logging::error("USER PAGE FAULT (unexpected) => kill current task");
+                }
             }
             AddressSpaceKind::Kernel => {
-                logging::error("KERNEL CONTEXT PAGE FAULT (during guarded user access) => treat as user fault and kill");
+                // guarded user access 中に kernel で踏んだ #PF は “ユーザ起因” として扱う
+                if expected {
+                    logging::info("KERNEL CONTEXT PAGE FAULT (expected; treated as user fault)");
+                } else {
+                    logging::error("KERNEL CONTEXT PAGE FAULT (unexpected; treated as user fault) => kill");
+                }
             }
         }
 
@@ -1819,26 +1941,26 @@ impl KernelState {
         logging::info_u64("rip", pf.rip);
 
         // ------------------------------------------------------------
-        // デモ安定化:
-        // - mem_demo の stage3 は「Unmap 後アクセスで #PF が出る」確認用。
-        // - ただし通常デモでは sender が死んで IPC が止まるので、kill は feature 時のみ。
+        // 例外: デモ継続のために #PF を無視したい場合だけ “明示的に” 使う
         // ------------------------------------------------------------
-        #[cfg(feature = "pf_demo")]
+        #[cfg(feature = "ignore_user_pf_demo")]
         {
-            self.kill_task(
-                idx,
-                TaskKillReason::UserPageFault { addr: pf.addr, err: pf.err, rip: pf.rip },
-            );
-        }
-
-        #[cfg(not(feature = "pf_demo"))]
-        {
-            logging::error("USER PAGE FAULT (demo): ignored (pf_demo feature disables this)");
+            logging::info("USER PAGE FAULT: ignored (ignore_user_pf_demo)");
             logging::info_u64("task_id", task_id.0);
-            // 再実行ループを避けたい場合は stage を巻き戻す等もあるが、
-            // まずは “kill しない” だけで IPC の継続観測を優先する。
+            return;
         }
 
+        // ------------------------------------------------------------
+        // デフォルト仕様: ユーザ #PF は kill（仕様を閉じる）
+        // ------------------------------------------------------------
+        self.kill_task(
+            idx,
+            TaskKillReason::UserPageFault {
+                addr: pf.addr,
+                err: pf.err,
+                rip: pf.rip,
+            },
+        );
     }
 
     fn do_mem_demo_normal(&mut self) {
@@ -1957,49 +2079,79 @@ impl KernelState {
 
                     self.tasks[task_idx].pending_syscall = Some(Syscall::PageUnmap { page });
 
-                    // 期待: 同 tick 内で unmap が完了し、次の MemDemo で stage3 へ
-                    self.mem_demo_stage[task_idx] = 3;
+                    // ★対策1:
+                    // pf_demo が有効なときだけ stage3（Unmap後アクセスで #PF）へ進める。
+                    // pf_demo 無効では stage3 をそもそも踏ませない（ユーザタスクが全滅しない）。
+                    #[cfg(feature = "pf_demo")]
+                    {
+                        self.mem_demo_stage[task_idx] = 3;
+                    }
+                    #[cfg(not(feature = "pf_demo"))]
+                    {
+                        // ここで1サイクルを終わらせる（#PF を起こさない）
+                        self.mem_demo_stage[task_idx] = 0;
+                    }
+
                     return;
                 }
 
                 // --- stage3: RW after unmap (=> #PF expected) ---
-                _ => {
-                    let user_virt = virt_addr_u64 as *mut u64;
+                3 => {
+                    // pf_demo 無効なら到達しないはずだが、防衛的に reset
+                    #[cfg(not(feature = "pf_demo"))]
+                    {
+                        logging::info("mem_demo[user]: stage3 skipped (pf_demo disabled)");
+                        self.mem_demo_stage[task_idx] = 0;
+                        return;
+                    }
 
-                    let test_value: u64 = 0xDEAD_0000_0000_0000u64
-                        ^ ((task_id.0 & 0xFFFF) << 16)
-                        ^ (self.tick_count & 0xFFFF);
+                    #[cfg(feature = "pf_demo")]
+                    {
+                        let user_virt = virt_addr_u64 as *mut u64;
 
-                    // ★arch 側で user_root -> kernel_root まで責務を完結させる
-                    let kernel_root = self.address_spaces[KERNEL_ASID_INDEX]
-                        .root_page_frame
-                        .expect("kernel root_page_frame must exist");
+                        let test_value: u64 = 0xDEAD_0000_0000_0000u64
+                            ^ ((task_id.0 & 0xFFFF) << 16)
+                            ^ (self.tick_count & 0xFFFF);
 
-                    let rw_result = arch::paging::guarded_user_rw_u64_in_root(
-                        root,
-                        kernel_root,
-                        user_virt,
-                        test_value,
-                    );
+                        // ★arch 側で user_root -> kernel_root まで責務を完結させる
+                        let kernel_root = self.address_spaces[KERNEL_ASID_INDEX]
+                            .root_page_frame
+                            .expect("kernel root_page_frame must exist");
 
-                    logging::info("mem_demo[user]: stage3 RW-after-unmap (guarded; returned to kernel CR3)");
+                        let rw_result = arch::paging::guarded_user_rw_u64_in_root(
+                            root,
+                            kernel_root,
+                            user_virt,
+                            test_value,
+                        );
 
-                    match rw_result {
-                        Ok(read_back) => {
-                            // ここが成功したら PT/ガードが壊れてる
-                            logging::error("UNEXPECTED: RW succeeded after Unmap");
-                            logging::info_u64("read_back", read_back);
+                        logging::info("mem_demo[user]: stage3 RW-after-unmap (guarded; returned to kernel CR3)");
 
-                            self.mem_demo_stage[task_idx] = 0;
-                            return;
-                        }
-                        Err(pf) => {
-                            // 期待通り：ユーザ領域アクセスで #PF → （pf_demo なら kill）
-                            self.kill_current_task_due_to_user_pf(pf);
-                            self.mem_demo_stage[task_idx] = 0;
-                            return;
+                        match rw_result {
+                            Ok(read_back) => {
+                                // ここが成功したら PT/ガードが壊れてる
+                                logging::error("UNEXPECTED: RW succeeded after Unmap");
+                                logging::info_u64("read_back", read_back);
+
+                                self.mem_demo_stage[task_idx] = 0;
+                                return;
+                            }
+                            Err(pf) => {
+                                // 期待通り：ユーザ領域アクセスで #PF
+                                // デフォルト仕様: kill（ignore_user_pf_demo のときだけ return）
+                                self.kill_current_task_due_to_user_pf(pf);
+                                self.mem_demo_stage[task_idx] = 0;
+                                return;
+                            }
                         }
                     }
+                }
+
+                // --- 保険: stage が壊れていたら reset ---
+                _ => {
+                    logging::error("mem_demo[user]: invalid stage; reset");
+                    self.mem_demo_stage[task_idx] = 0;
+                    return;
                 }
             }
         }
@@ -2181,7 +2333,7 @@ impl KernelState {
         }
 
         self.activity = next_activity;
-
+        self.maybe_halt_if_no_user_tasks();
         self.debug_check_invariants();
     }
 
@@ -2361,6 +2513,7 @@ impl KernelState {
         logging::info_u64("ipc_reply_delivered", self.counters.ipc_reply_delivered);
 
         logging::info_u64("task_killed_user_pf", self.counters.task_killed_user_pf);
+        logging::info_u64("task_killed_demo_injected", self.counters.task_killed_demo_injected);
         logging::info("=== End of Counters Dump ===");
     }
 }
@@ -2491,6 +2644,10 @@ fn log_event_to_vga(ev: LogEvent) {
                     logging::info_u64("addr", addr);
                     logging::info_u64("err", err);
                     logging::info_u64("rip", rip);
+                }
+                TaskKillReason::DemoInjected { code } => {
+                    logging::info("reason = DemoInjected");
+                    logging::info_u64("code", code);
                 }
             }
         }
