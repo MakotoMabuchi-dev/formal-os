@@ -22,9 +22,9 @@
 // - open/closed は endpoint の仕様として扱い、invariant でも検知する。
 
 use super::{
-    trace, BlockedReason, EndpointId, KernelState, LogEvent, TaskId, TaskState, IPC_DEMO_EP0, MAX_ENDPOINTS, MAX_TASKS,
+    trace, AddressSpaceKind, BlockedReason, EndpointId, KernelState, LogEvent, TaskId, TaskState, IPC_DEMO_EP0,
+    MAX_ENDPOINTS, MAX_TASKS,
 };
-use super::AddressSpaceKind;
 
 /// reply エラーコード（Dead partner を待っていた等）
 pub const IPC_ERR_DEAD_PARTNER: u64 = 0xDEAD_DEAD_DEAD_DEAD;
@@ -197,7 +197,6 @@ impl KernelState {
             return;
         }
 
-        // close マーク（再入を避ける）
         if self.endpoints[ep.0].is_closed {
             return;
         }
@@ -215,7 +214,7 @@ impl KernelState {
             }
         }
 
-        // 2) send_queue rescue（全員）
+        // 2) send_queue rescue
         while self.endpoints[ep.0].sq_len > 0 {
             let last = self.endpoints[ep.0].sq_len - 1;
             let send_idx = self.endpoints[ep.0].send_queue[last];
@@ -229,7 +228,7 @@ impl KernelState {
             }
         }
 
-        // 3) reply_queue rescue（全員）
+        // 3) reply_queue rescue
         while self.endpoints[ep.0].rq_len > 0 {
             let last = self.endpoints[ep.0].rq_len - 1;
             let widx = self.endpoints[ep.0].reply_queue[last];
@@ -273,24 +272,44 @@ impl KernelState {
     // -------------------------------------------------------------------------
 
     fn ipc_recv_fastpath(&mut self, ep: EndpointId, recv_idx: usize) -> bool {
-        let send_idx_opt = {
-            let e = &mut self.endpoints[ep.0];
-            e.dequeue_sender()
-        };
+        // sender を取り出す。壊れた要素（state/blocked_reason 不整合）は捨てて次を試す。
+        let send_idx = loop {
+            let send_idx_opt = {
+                let e = &mut self.endpoints[ep.0];
+                e.dequeue_sender()
+            };
 
-        let send_idx = match send_idx_opt {
-            Some(i) => i,
-            None => return false,
-        };
+            let idx = match send_idx_opt {
+                Some(i) => i,
+                None => return false,
+            };
 
-        if send_idx >= self.num_tasks {
-            crate::logging::error("ipc_recv_fastpath: dequeued sender idx out of range");
-            return false;
-        }
-        if self.tasks[send_idx].state == TaskState::Dead {
-            crate::logging::error("ipc_recv_fastpath: dequeued sender is DEAD; abort deliver");
-            return false;
-        }
+            if idx >= self.num_tasks {
+                crate::logging::error("ipc_recv_fastpath: dequeued sender idx out of range; drop");
+                continue;
+            }
+            if self.tasks[idx].state == TaskState::Dead {
+                crate::logging::error("ipc_recv_fastpath: dequeued sender is DEAD; drop");
+                continue;
+            }
+
+            // send_queue に居る sender は Blocked(IpcSend) のはず
+            match self.tasks[idx].blocked_reason {
+                Some(BlockedReason::IpcSend { ep: sep }) if sep == ep => {
+                    if self.tasks[idx].state != TaskState::Blocked {
+                        crate::logging::error("ipc_recv_fastpath: sender state is not BLOCKED; drop");
+                        crate::logging::info_u64("task_id", self.tasks[idx].id.0);
+                        continue;
+                    }
+                    break idx;
+                }
+                _ => {
+                    crate::logging::error("ipc_recv_fastpath: sender blocked_reason mismatch; drop");
+                    crate::logging::info_u64("task_id", self.tasks[idx].id.0);
+                    continue;
+                }
+            }
+        };
 
         let msg = match self.tasks[send_idx].pending_send_msg.take() {
             Some(m) => m,
@@ -300,14 +319,11 @@ impl KernelState {
             }
         };
 
-        let recv_id = self.tasks[recv_idx].id;
         let send_id = self.tasks[send_idx].id;
+        let recv_id = self.tasks[recv_idx].id;
 
         // sender -> reply wait
-        self.tasks[send_idx].state = TaskState::Blocked;
-        self.tasks[send_idx].blocked_reason = Some(BlockedReason::IpcReply { partner: recv_id, ep });
-        self.tasks[send_idx].time_slice_used = 0;
-
+        self.block_task(send_idx, BlockedReason::IpcReply { partner: recv_id, ep });
         {
             let e = &mut self.endpoints[ep.0];
             e.enqueue_reply_waiter(send_idx);
@@ -337,10 +353,15 @@ impl KernelState {
         self.counters.ipc_recv_slow += 1;
         trace::trace_ipc_path(trace::IpcPathEvent::RecvSlow);
 
-        self.block_current(BlockedReason::IpcRecv { ep });
+        // ★修正: current_task 依存をやめて recv_idx を明示して block
+        self.block_task(recv_idx, BlockedReason::IpcRecv { ep });
+
         self.endpoints[ep.0].recv_waiter = Some(recv_idx);
 
         self.push_event(LogEvent::IpcRecvBlocked { task: recv_id, ep });
+
+        // ★FIX: ring3_mailbox だけ抑制。ring3_mailbox_loop は schedule 必須。
+        #[cfg(not(feature = "ring3_mailbox"))]
         self.schedule_next_task();
     }
 
@@ -380,12 +401,14 @@ impl KernelState {
     // -------------------------------------------------------------------------
 
     fn ipc_send_fastpath(&mut self, ep: EndpointId, send_idx: usize, msg: u64) -> bool {
-        let recv_idx_opt = {
-            let e = &mut self.endpoints[ep.0];
-            e.recv_waiter.take()
-        };
+        if send_idx != self.current_task {
+            crate::logging::error("ipc_send_fastpath: send_idx != current_task; reject");
+            crate::logging::info_u64("send_idx", send_idx as u64);
+            crate::logging::info_u64("current_task", self.current_task as u64);
+            return false;
+        }
 
-        let recv_idx = match recv_idx_opt {
+        let recv_idx = match self.endpoints[ep.0].recv_waiter {
             Some(i) => i,
             None => return false,
         };
@@ -407,13 +430,18 @@ impl KernelState {
             }
         }
 
+        // OKなら消費
+        let _ = self.endpoints[ep.0].recv_waiter.take();
+
         let send_id = self.tasks[send_idx].id;
         let recv_id = self.tasks[recv_idx].id;
 
+        // receiver を READY へ
         self.wake_task_to_ready(recv_idx);
         self.tasks[recv_idx].last_msg = Some(msg);
 
-        self.block_current(BlockedReason::IpcReply { partner: recv_id, ep });
+        // sender は reply wait（block_current ではなく block_task）
+        self.block_task(send_idx, BlockedReason::IpcReply { partner: recv_id, ep });
         {
             let e = &mut self.endpoints[ep.0];
             e.enqueue_reply_waiter(send_idx);
@@ -428,11 +456,29 @@ impl KernelState {
 
         self.push_event(LogEvent::IpcDelivered { from: send_id, to: recv_id, ep, msg });
 
+        // ★重要: ring3_mailbox_loop では schedule 必須（current_task が Blocked のまま tick を終えない）
+        #[cfg(feature = "ring3_mailbox_loop")]
         self.schedule_next_task();
+
+        // ring3_mailbox（単発）は schedule しない（CR3切替を避ける目的）
+        #[cfg(all(feature = "ring3_mailbox", not(feature = "ring3_mailbox_loop")))]
+        trace::trace_ipc_path(trace::IpcPathEvent::SendFast);
+
+        // それ以外は通常通り schedule
+        #[cfg(not(any(feature = "ring3_mailbox", feature = "ring3_mailbox_loop")))]
+        self.schedule_next_task();
+
         true
     }
 
     fn ipc_send_slowpath(&mut self, ep: EndpointId, send_idx: usize, msg: u64) {
+        if send_idx != self.current_task {
+            crate::logging::error("ipc_send_slowpath: send_idx != current_task; reject");
+            crate::logging::info_u64("send_idx", send_idx as u64);
+            crate::logging::info_u64("current_task", self.current_task as u64);
+            return;
+        }
+
         let send_id = self.tasks[send_idx].id;
 
         self.counters.ipc_send_slow += 1;
@@ -440,13 +486,25 @@ impl KernelState {
 
         self.tasks[send_idx].pending_send_msg = Some(msg);
 
-        self.block_current(BlockedReason::IpcSend { ep });
+        // current_task依存の block_current をやめ、明示 idx の block_task にする
+        self.block_task(send_idx, BlockedReason::IpcSend { ep });
         {
             let e = &mut self.endpoints[ep.0];
             e.enqueue_sender(send_idx);
         }
 
         self.push_event(LogEvent::IpcSendBlocked { task: send_id, ep });
+
+        // ★重要: ring3_mailbox_loop では schedule 必須
+        #[cfg(feature = "ring3_mailbox_loop")]
+        self.schedule_next_task();
+
+        // ring3_mailbox（単発）は schedule しない
+        #[cfg(all(feature = "ring3_mailbox", not(feature = "ring3_mailbox_loop")))]
+        trace::trace_ipc_path(trace::IpcPathEvent::SendSlow);
+
+        // それ以外は通常通り schedule
+        #[cfg(not(any(feature = "ring3_mailbox", feature = "ring3_mailbox_loop")))]
         self.schedule_next_task();
     }
 

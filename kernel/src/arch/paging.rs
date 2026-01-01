@@ -491,6 +491,21 @@ pub fn physical_memory_offset() -> u64 {
     PHYSICAL_MEMORY_OFFSET.load(Ordering::Relaxed)
 }
 
+/// physmap 経由で phys_u64 が current CR3 で引けるかを検証する（デバッグ用）
+pub fn debug_physmap_can_access_phys(phys_u64: u64) -> bool {
+    if !ENABLE_REAL_PAGING {
+        return true;
+    }
+
+    let off = PHYSICAL_MEMORY_OFFSET.load(Ordering::Relaxed);
+    let virt = VirtAddr::new(off + phys_u64);
+
+    unsafe {
+        let mapper = init_offset_page_table();
+        mapper.translate_addr(virt).is_some()
+    }
+}
+
 fn to_x86_flags(flags: PageFlags) -> PageTableFlags {
     let mut res = PageTableFlags::empty();
     if flags.contains(PageFlags::PRESENT) { res |= PageTableFlags::PRESENT; }
@@ -609,19 +624,57 @@ fn preflight_check_before_cr3_write(target: MyPhysFrame) {
             panic!("CR3 preflight failed (target missing RIP/RSP mapping)");
         }
 
-        // NOTE: RBP の失敗ログはノイズになりやすいので、いったん出さない。
         let _ = rbp_phys_tgt;
 
-        // physmap が target に存在すること
-        let pml4_phys = PhysAddr::new(target_phys_u64);
-        let pml4_virt = phys_to_virt(pml4_phys);
-        let pml4_phys_got = tgt_mapper.translate_addr(pml4_virt).map(|p| p.as_u64()).unwrap_or(0);
-        if pml4_phys_got != target_phys_u64 {
-            logging::error("CR3 preflight: physmap missing/broken in target root");
+        // -----------------------------------------------------------------
+        // physmap: “PML4 entry の存在” を current と target の両方で検証する
+        // - current が missing なら physmap_pml4_index 計算が間違っている可能性が高い
+        // - target が missing なら init_user_pml4_from_current のコピーが壊れている
+        // -----------------------------------------------------------------
+        let physmap_off = PHYSICAL_MEMORY_OFFSET.load(Ordering::Relaxed);
+        let physmap_pml4 = virt_layout::pml4_index(physmap_off);
+
+        let cur_pml4_ptr = active_level_4_table() as *const PageTable;
+
+        let tgt_pml4_phys = PhysAddr::new(target_phys_u64);
+        let tgt_pml4_virt = phys_to_virt(tgt_pml4_phys);
+        let tgt_pml4_ptr = tgt_pml4_virt.as_ptr::<PageTable>();
+
+        let cur_e = (&*cur_pml4_ptr)[physmap_pml4].clone();
+        let tgt_e = (&*tgt_pml4_ptr)[physmap_pml4].clone();
+
+        if cur_e.is_unused() || !cur_e.flags().contains(PageTableFlags::PRESENT) {
+            logging::error("CR3 preflight: current lacks physmap PML4 entry (physmap index calc likely wrong)");
+            logging::info_u64("physmap_pml4_index", physmap_pml4 as u64);
+            logging::info_u64("cur_addr", cur_e.addr().as_u64());
+            logging::info_u64("cur_flags", cur_e.flags().bits() as u64);
+            panic!("CR3 preflight failed (current physmap missing)");
+        }
+
+        if tgt_e.is_unused() || !tgt_e.flags().contains(PageTableFlags::PRESENT) {
+            logging::error("CR3 preflight: target lacks physmap PML4 entry");
+            logging::info_u64("physmap_pml4_index", physmap_pml4 as u64);
             logging::info_u64("target_pml4_phys", target_phys_u64);
-            logging::info_u64("target_pml4_virt", pml4_virt.as_u64());
-            logging::info_u64("translated_phys", pml4_phys_got);
-            panic!("CR3 preflight failed (physmap missing)");
+            logging::info_u64("tgt_addr", tgt_e.addr().as_u64());
+            logging::info_u64("tgt_flags", tgt_e.flags().bits() as u64);
+            panic!("CR3 preflight failed (target physmap missing)");
+        }
+
+        if tgt_e.flags().contains(PageTableFlags::USER_ACCESSIBLE) {
+            logging::error("CR3 preflight: physmap entry is USER_ACCESSIBLE in target (forbidden)");
+            logging::info_u64("physmap_pml4_index", physmap_pml4 as u64);
+            panic!("CR3 preflight failed (physmap user bit)");
+        }
+
+        // strong check: physmap PML4 entry が current と一致すること
+        if tgt_e.addr() != cur_e.addr() || tgt_e.flags() != cur_e.flags() {
+            logging::error("CR3 preflight: physmap PML4 entry mismatch (target vs current)");
+            logging::info_u64("physmap_pml4_index", physmap_pml4 as u64);
+            logging::info_u64("cur_addr", cur_e.addr().as_u64());
+            logging::info_u64("tgt_addr", tgt_e.addr().as_u64());
+            logging::info_u64("cur_flags", cur_e.flags().bits() as u64);
+            logging::info_u64("tgt_flags", tgt_e.flags().bits() as u64);
+            panic!("CR3 preflight failed (physmap pml4 mismatch)");
         }
 
         // guard(low) は user root では存在しない（仕様）
@@ -722,6 +775,25 @@ pub fn switch_address_space_quiet(frame: MyPhysFrame) {
     if now.start_address().as_u64() != frame.start_address().0 {
         panic!("CR3 write failed (readback mismatch)");
     }
+}
+
+/// logging を一切行わずに CR3 を書き換える（user CR3 中からの復帰用 / 一時切替用）
+///
+/// 重要:
+/// - ここでは readback 検証をしない（panic させない）
+/// - 安全性チェックは switch_address_space(Some(...)) 側（preflight）で行う
+pub fn switch_address_space_quiet_nocheck(frame: MyPhysFrame) {
+    use x86_64::structures::paging::{PhysFrame, Size4KiB};
+
+    let phys = PhysAddr::new(frame.start_address().0);
+    let x86_frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(phys);
+
+    let (_cur_frame, cur_flags) = Cr3::read();
+    crate::arch::interrupts::emergency_write_str("[CR3] before\n");
+    unsafe { Cr3::write(x86_frame, cur_flags); }
+    crate::arch::interrupts::emergency_write_str("[CR3] after\n");
+
+    // ★nocheck: readback しない / panic しない
 }
 
 pub fn switch_address_space(root: Option<MyPhysFrame>) {
@@ -925,7 +997,11 @@ unsafe fn apply_mem_action_with_mapper(
 ) -> Result<(), PagingApplyError> {
     match action {
         MemAction::Map { page, frame, flags } => {
-            logging::info("arch::paging::apply_mem_action: Map");
+            if root.is_some() {
+                logging::info("arch::paging::apply_mem_action_in_root: Map");
+            } else {
+                logging::info("arch::paging::apply_mem_action: Map");
+            }
 
             let mut virt_u64 = page.start_address().0;
             let phys_u64 = frame.start_address().0;
@@ -973,7 +1049,11 @@ unsafe fn apply_mem_action_with_mapper(
         }
 
         MemAction::Unmap { page } => {
-            logging::info("arch::paging::apply_mem_action: Unmap");
+            if root.is_some() {
+                logging::info("arch::paging::apply_mem_action_in_root: Unmap");
+            } else {
+                logging::info("arch::paging::apply_mem_action: Unmap");
+            }
 
             let mut virt_u64 = page.start_address().0;
 
@@ -1056,7 +1136,11 @@ pub fn init_user_pml4_from_current(new_root: MyPhysFrame) {
     let alias_base = virt_layout::KERNEL_ALIAS_DST_PML4_BASE_INDEX;
     let alias_cnt = {
         let n = ALIAS_COPY_COUNT.load(Ordering::Relaxed);
-        if n == 0 { virt_layout::KERNEL_ALIAS_MAX_COPY_COUNT } else { min(n, virt_layout::KERNEL_ALIAS_MAX_COPY_COUNT) }
+        if n == 0 {
+            virt_layout::KERNEL_ALIAS_MAX_COPY_COUNT
+        } else {
+            min(n, virt_layout::KERNEL_ALIAS_MAX_COPY_COUNT)
+        }
     };
 
     unsafe {
@@ -1069,7 +1153,9 @@ pub fn init_user_pml4_from_current(new_root: MyPhysFrame) {
 
         // 1) physmap
         for i in physmap_pml4..min(physmap_pml4 + PHYSMAP_PML4_COPY_COUNT, 256) {
-            if cur_p4[i].is_unused() { continue; }
+            if cur_p4[i].is_unused() {
+                continue;
+            }
             if cur_p4[i].flags().contains(PageTableFlags::USER_ACCESSIBLE) {
                 logging::error("init_user_pml4_from_current: physmap entry has USER_ACCESSIBLE; abort");
                 logging::info_u64("pml4_index", i as u64);
@@ -1078,9 +1164,27 @@ pub fn init_user_pml4_from_current(new_root: MyPhysFrame) {
             user_p4[i] = cur_p4[i].clone();
         }
 
+        // ★追加: physmap base entry の事後条件チェック（原因確定用）
+        if user_p4[physmap_pml4].is_unused()
+            || !user_p4[physmap_pml4].flags().contains(PageTableFlags::PRESENT)
+        {
+            logging::error("init_user_pml4_from_current: physmap base entry missing after copy");
+            logging::info_u64("physmap_pml4_index", physmap_pml4 as u64);
+
+            logging::info_u64("cur_entry_addr", cur_p4[physmap_pml4].addr().as_u64());
+            logging::info_u64("cur_entry_flags", cur_p4[physmap_pml4].flags().bits() as u64);
+
+            logging::info_u64("new_entry_addr", user_p4[physmap_pml4].addr().as_u64());
+            logging::info_u64("new_entry_flags", user_p4[physmap_pml4].flags().bits() as u64);
+
+            panic!("init_user_pml4_from_current: physmap entry missing (post-check)");
+        }
+
         // 2) kernel high-half
         for i in 256..512 {
-            if cur_p4[i].is_unused() { continue; }
+            if cur_p4[i].is_unused() {
+                continue;
+            }
             if cur_p4[i].flags().contains(PageTableFlags::USER_ACCESSIBLE) {
                 logging::error("init_user_pml4_from_current: kernel pml4 entry has USER_ACCESSIBLE; abort");
                 logging::info_u64("pml4_index", i as u64);
@@ -1092,8 +1196,12 @@ pub fn init_user_pml4_from_current(new_root: MyPhysFrame) {
         // 2.5) high-alias window
         for i in 0..alias_cnt {
             let idx = alias_base + i;
-            if idx >= 512 { break; }
-            if cur_p4[idx].is_unused() { continue; }
+            if idx >= 512 {
+                break;
+            }
+            if cur_p4[idx].is_unused() {
+                continue;
+            }
             if cur_p4[idx].flags().contains(PageTableFlags::USER_ACCESSIBLE) {
                 logging::error("init_user_pml4_from_current: alias window has USER_ACCESSIBLE; abort");
                 logging::info_u64("pml4_index", idx as u64);
@@ -1113,8 +1221,6 @@ pub fn init_user_pml4_from_current(new_root: MyPhysFrame) {
         logging::info_u64("alias_dst_base_pml4", alias_base as u64);
         logging::info_u64("alias_copy_count", alias_cnt as u64);
     }
-
-    // NOTE: user root 初期化直後の preflight は二重ログになりやすいので、いったん実施しない。
 }
 
 // -----------------------------------------------------------------------------
