@@ -32,9 +32,12 @@ mod pagetable_init;
 mod syscall;
 mod user_program;
 mod trace;
+mod state_ref;
 
 pub use entry::start;
 pub use syscall::Syscall;
+pub use state_ref::with_kernel_state;
+pub use syscall::mailbox_dispatch;
 
 use bootloader::BootInfo;
 use x86_64::registers::control::Cr3;
@@ -427,6 +430,12 @@ impl KernelState {
         }
 
         ks
+    }
+
+    /// entry.rs の ring3_* demo が同じフレームアロケータを共有するための出口。
+    /// （entry.rs 側で新しい PhysicalMemoryManager を作ると二重確保が起きる）
+    pub(crate) fn phys_mem_mut(&mut self) -> &mut PhysicalMemoryManager {
+        &mut self.phys_mem
     }
 
     fn push_event(&mut self, ev: LogEvent) {
@@ -926,6 +935,47 @@ impl KernelState {
         }
     }
 
+    /// ring3_mailbox_loop 用:
+    /// - ring3 の int80 を「Task1(User) が呼んだ」として扱う運用に合わせて、
+    ///   KernelState 側の current_task/state を最小限で整合させる。
+    ///
+    /// 目的:
+    /// - debug_check_invariants() の `current_task is not RUNNING` を止める
+    /// - tick の runtime/quantum 更新条件が自然に動くようにする
+    pub fn prepare_ring3_loop_current_task(&mut self) {
+        // この module 内の定数をそのまま参照する（super:: は不要/不可）
+        let t0 = TASK0_INDEX;
+        let t1 = TASK1_INDEX;
+
+        if t1 >= self.num_tasks {
+            logging::error("prepare_ring3_loop_current_task: TASK1_INDEX out of range");
+            self.should_halt = true;
+            return;
+        }
+
+        if self.tasks[t1].state == TaskState::Dead {
+            logging::error("prepare_ring3_loop_current_task: Task1 is DEAD; cannot enter ring3 loop");
+            self.should_halt = true;
+            return;
+        }
+
+        // いま current が RUNNING なら、それを Ready に戻す（Task0 想定）
+        if t0 < self.num_tasks && self.tasks[t0].state == TaskState::Running && t0 != t1 {
+            self.tasks[t0].state = TaskState::Ready;
+            self.tasks[t0].time_slice_used = 0;
+            self.tasks[t0].blocked_reason = None;
+        }
+
+        // ring3 を「Task1 が走っている」として扱う
+        self.current_task = t1;
+        self.tasks[t1].state = TaskState::Running;
+        self.tasks[t1].time_slice_used = 0;
+        self.tasks[t1].blocked_reason = None;
+
+        // ready_queue に Task1 が残っていたら消す（あっても動くが invariant 的に気持ち悪い）
+        let _ = self.remove_from_ready_queue(t1);
+    }
+
     pub fn bootstrap(&mut self) {
         logging::info("KernelState::bootstrap()");
         for _ in 0..5 {
@@ -962,18 +1012,24 @@ impl KernelState {
     }
 
     fn remove_from_ready_queue(&mut self, idx: usize) -> bool {
-        if idx >= self.num_tasks {
+        if self.rq_len == 0 {
             return false;
         }
-        for pos in 0..self.rq_len {
-            if self.ready_queue[pos] == idx {
-                let last = self.rq_len - 1;
-                self.ready_queue[pos] = self.ready_queue[last];
-                self.rq_len -= 1;
-                return true;
+        let mut write_pos = 0usize;
+        let mut removed = false;
+
+        for read_pos in 0..self.rq_len {
+            let v = self.ready_queue[read_pos];
+            if v == idx {
+                removed = true;
+                continue;
             }
+            self.ready_queue[write_pos] = v;
+            write_pos += 1;
         }
-        false
+
+        self.rq_len = write_pos;
+        removed
     }
 
     fn remove_from_wait_queue(&mut self, idx: usize) -> bool {
@@ -1261,31 +1317,54 @@ impl KernelState {
             return None;
         }
 
-        let mut best_pos: Option<usize> = None;
-        let mut best_idx: usize = 0;
-        let mut best_prio: u8 = 0;
+        // --- 修正2: ready_queue を Ready のみに掃除する（compaction）---
+        let mut write_pos: usize = 0;
+        for read_pos in 0..self.rq_len {
+            let idx = self.ready_queue[read_pos];
 
-        for pos in 0..self.rq_len {
+            if idx >= self.num_tasks {
+                continue;
+            }
+            if self.tasks[idx].state != TaskState::Ready {
+                continue;
+            }
+
+            self.ready_queue[write_pos] = idx;
+            write_pos += 1;
+        }
+        self.rq_len = write_pos;
+
+        if self.rq_len == 0 {
+            return None;
+        }
+
+        // --- 最高優先度を選ぶ ---
+        let mut best_pos: usize = 0;
+        let mut best_idx: usize = self.ready_queue[0];
+
+        if best_idx >= self.num_tasks {
+            // ここに来るのはほぼないが、念のため
+            self.rq_len = 0;
+            return None;
+        }
+
+        let mut best_prio: u8 = self.tasks[best_idx].priority;
+
+        for pos in 1..self.rq_len {
             let idx = self.ready_queue[pos];
-            if idx >= self.num_tasks { continue; }
-            if self.tasks[idx].state != TaskState::Ready { continue; }
-            let prio = self.tasks[idx].priority;
+            if idx >= self.num_tasks {
+                continue;
+            }
 
-            if best_pos.is_none() || prio > best_prio {
-                best_pos = Some(pos);
-                best_idx = idx;
+            let prio = self.tasks[idx].priority;
+            if prio > best_prio {
                 best_prio = prio;
+                best_idx = idx;
+                best_pos = pos;
             }
         }
 
-        let best_pos = match best_pos {
-            Some(p) => p,
-            None => {
-                self.rq_len = 0;
-                return None;
-            }
-        };
-
+        // swap-remove
         let last_pos = self.rq_len - 1;
         self.ready_queue[best_pos] = self.ready_queue[last_pos];
         self.rq_len -= 1;
@@ -1316,6 +1395,7 @@ impl KernelState {
 
     fn schedule_next_task(&mut self) {
         let prev_idx = self.current_task;
+        let prev_id = self.tasks[prev_idx].id;
 
         // VGA 切替（そのまま）
         {
@@ -1327,70 +1407,78 @@ impl KernelState {
         }
 
         // -------------------------------------------------------------
-        // 重要: ready が無いときに halt しない
-        // - Sleep がいれば wake を試みる
-        // - それでも無ければ “Idle(task0)” を RUNNING にして継続
+        // 0) ready_queue を “Ready のみ” に掃除（常に）
+        // -------------------------------------------------------------
+        self.compact_ready_queue_to_ready_only();
+
+        // -------------------------------------------------------------
+        // 1) prev が Running なら Ready に戻す（Idle は戻さない）
+        // -------------------------------------------------------------
+        if prev_idx < self.num_tasks && self.tasks[prev_idx].state == TaskState::Running && prev_idx != TASK0_INDEX {
+            self.tasks[prev_idx].state = TaskState::Ready;
+            self.tasks[prev_idx].blocked_reason = None;
+            self.tasks[prev_idx].time_slice_used = 0;
+            self.push_event(LogEvent::TaskStateChanged(prev_id, TaskState::Ready));
+            self.enqueue_ready(prev_idx);
+        }
+
+        // -------------------------------------------------------------
+        // 2) ready が無い → Sleep を 1つ起こす → それでも無いなら Idle
         // -------------------------------------------------------------
         if self.rq_len == 0 {
-            // Sleep waiter がいれば 1 つ起こす
             if self.wq_len > 0 {
                 logging::info("schedule_next_task: no ready tasks; try wake sleep waiter");
                 self.maybe_wake_one_sleep_task();
+                self.compact_ready_queue_to_ready_only();
             }
 
-            // wake により ready ができたなら通常スケジュールへ
             if self.rq_len == 0 {
                 logging::info("schedule_next_task: still no ready tasks; run idle(task0) and continue");
+                let idle_idx = TASK0_INDEX;
 
-                // current が RUNNING 以外なら、task0 を強制 RUNNING にして invariant を守る
-                if self.tasks[self.current_task].state != TaskState::Running {
-                    let idle_idx = TASK0_INDEX;
-
-                    // もし task0 が Dead なら致命的（設計上ありえない前提）
-                    if self.tasks[idle_idx].state == TaskState::Dead {
-                        logging::error("schedule_next_task: idle task is DEAD; halt-safe");
-                        self.should_halt = true;
-                        return;
-                    }
-
-                    // いまの current が Running なら Ready に戻しておく
-                    if self.tasks[prev_idx].state == TaskState::Running && prev_idx != idle_idx {
-                        let prev_id = self.tasks[prev_idx].id;
-                        self.tasks[prev_idx].state = TaskState::Ready;
-                        self.tasks[prev_idx].time_slice_used = 0;
-                        self.push_event(LogEvent::TaskStateChanged(prev_id, TaskState::Ready));
-                        self.enqueue_ready(prev_idx);
-                    }
-
-                    // idle を RUNNING に
-                    self.tasks[idle_idx].state = TaskState::Running;
-                    self.tasks[idle_idx].blocked_reason = None;
-                    self.tasks[idle_idx].time_slice_used = 0;
-                    self.current_task = idle_idx;
-
-                    let kernel_root = self.address_spaces[KERNEL_ASID_INDEX]
-                        .root_page_frame
-                        .expect("kernel root_page_frame must exist");
-                    arch::paging::switch_address_space_quiet(kernel_root);
-                    logging::set_vga_enabled(true);
-
-                    self.push_event(LogEvent::TaskSwitched(self.tasks[idle_idx].id));
-                    self.push_event(LogEvent::TaskStateChanged(self.tasks[idle_idx].id, TaskState::Running));
+                if self.tasks[idle_idx].state == TaskState::Dead {
+                    logging::error("schedule_next_task: idle task is DEAD; halt-safe");
+                    self.should_halt = true;
+                    return;
                 }
 
-                // “継続”するだけ
+                // ★最重要：current_task が指すタスクは必ず Running
+                self.tasks[idle_idx].state = TaskState::Running;
+                self.tasks[idle_idx].blocked_reason = None;
+                self.tasks[idle_idx].time_slice_used = 0;
+                self.current_task = idle_idx;
+
+                let kernel_root = self.address_spaces[KERNEL_ASID_INDEX]
+                    .root_page_frame
+                    .expect("kernel root_page_frame must exist");
+                arch::paging::switch_address_space_quiet(kernel_root);
+                logging::set_vga_enabled(true);
+
+                self.push_event(LogEvent::TaskSwitched(self.tasks[idle_idx].id));
+                self.push_event(LogEvent::TaskStateChanged(self.tasks[idle_idx].id, TaskState::Running));
                 return;
             }
         }
 
-        // ここから先は元のロジック（ready がある前提）
-        let prev_id = self.tasks[prev_idx].id;
-
-        if self.tasks[prev_idx].state == TaskState::Running {
-            self.tasks[prev_idx].state = TaskState::Ready;
-            self.tasks[prev_idx].time_slice_used = 0;
-            self.push_event(LogEvent::TaskStateChanged(prev_id, TaskState::Ready));
-            self.enqueue_ready(prev_idx);
+        // -------------------------------------------------------------
+        // 3) ready がある前提：選ぶ
+        // -------------------------------------------------------------
+        logging::info("sched: dump ready_queue before dequeue");
+        logging::info_u64("rq_len", self.rq_len as u64);
+        for pos in 0..self.rq_len {
+            let idx = self.ready_queue[pos];
+            logging::info_u64("rq[pos].task_index", idx as u64);
+            if idx < self.num_tasks {
+                let t = &self.tasks[idx];
+                logging::info_u64("rq[pos].task_id", t.id.0);
+                match t.state {
+                    TaskState::Ready => logging::info("rq[pos].state = Ready"),
+                    TaskState::Running => logging::info("rq[pos].state = Running"),
+                    TaskState::Blocked => logging::info("rq[pos].state = Blocked"),
+                    TaskState::Dead => logging::info("rq[pos].state = Dead"),
+                }
+                logging::info_u64("rq[pos].prio", t.priority as u64);
+            }
         }
 
         let next_idx = match self.dequeue_ready_highest_priority() {
@@ -1402,9 +1490,16 @@ impl KernelState {
             }
         };
 
+        if next_idx >= self.num_tasks {
+            logging::error("schedule_next_task: next_idx out of range; halt-safe");
+            self.should_halt = true;
+            return;
+        }
+
         let next_id = self.tasks[next_idx].id;
         let as_idx = self.tasks[next_idx].address_space_id.0;
 
+        // ★最重要：current_task を更新したら必ず state=Running
         self.tasks[next_idx].state = TaskState::Running;
         self.tasks[next_idx].time_slice_used = 0;
         self.tasks[next_idx].blocked_reason = None;
@@ -1437,6 +1532,22 @@ impl KernelState {
         self.push_event(LogEvent::TaskStateChanged(next_id, TaskState::Running));
     }
 
+    fn compact_ready_queue_to_ready_only(&mut self) {
+        let mut write_pos: usize = 0;
+        for read_pos in 0..self.rq_len {
+            let idx = self.ready_queue[read_pos];
+            if idx >= self.num_tasks {
+                continue;
+            }
+            if self.tasks[idx].state != TaskState::Ready {
+                continue;
+            }
+            self.ready_queue[write_pos] = idx;
+            write_pos += 1;
+        }
+        self.rq_len = write_pos;
+    }
+
     fn update_runtime_for(&mut self, ran_idx: usize) {
         if ran_idx >= self.num_tasks {
             logging::error("update_runtime_for: ran_idx out of range");
@@ -1460,11 +1571,7 @@ impl KernelState {
             return;
         }
 
-        // ---------------------------------------------------------------------
-        // 重要: Kernel task は IPC で BLOCK させない
-        // - ここで BLOCK すると「全タスク Blocked → halt」になりやすい
-        // - “would block” は last_reply にエラーを入れて RUNNING 継続
-        // ---------------------------------------------------------------------
+        // Kernel task は IPC で BLOCK させない（既存仕様）
         let as_idx = self.tasks[idx].address_space_id.0;
         if as_idx < self.num_tasks && self.address_spaces[as_idx].kind == AddressSpaceKind::Kernel {
             match reason {
@@ -1475,31 +1582,63 @@ impl KernelState {
                     logging::info_u64("task_id", id.0);
                     logging::info_u64("ep", ep.0 as u64);
 
-                    // 既存の “エラー返信” を流用（最小）
                     self.tasks[idx].last_reply = Some(IPC_ERR_DEAD_PARTNER);
-                    // ★重要: 送信待ちのゴミを残さない（invariant/観測の安定化）
                     self.tasks[idx].pending_send_msg = None;
                     return;
                 }
-                BlockedReason::Sleep => {
-                    // kernel の Sleep block は許可（必要なら）
-                }
+                BlockedReason::Sleep => {}
             }
         }
 
+        // ★ここから下は “正規入口” に寄せる
+        self.block_task(idx, reason);
+    }
+
+    /// 任意タスクを Blocked に落とす（ready_queue/wait_queue 整合性の唯一の入口）
+    fn block_task(&mut self, idx: usize, reason: BlockedReason) {
+        if idx >= self.num_tasks {
+            logging::error("block_task: idx out of range");
+            return;
+        }
+
+        let id = self.tasks[idx].id;
+
+        if self.tasks[idx].state == TaskState::Dead {
+            logging::error("block_task: called for DEAD task; ignore");
+            logging::info_u64("task_id", id.0);
+            return;
+        }
+
+        // Blocked に落とすなら ready_queue に居てはいけない
+        let _ = self.remove_from_ready_queue(idx);
+
+        // ★重要: すでに Blocked でも「理由の更新」を許可する（IpcSend -> IpcReply など）
+        if self.tasks[idx].state == TaskState::Blocked {
+            let prev_reason = self.tasks[idx].blocked_reason;
+
+            self.tasks[idx].blocked_reason = Some(reason);
+            self.tasks[idx].time_slice_used = 0;
+
+            self.push_event(LogEvent::TaskStateChanged(id, TaskState::Blocked));
+
+            // Sleep に遷移した時だけ wait_queue へ（多重 enqueue を避ける）
+            match (prev_reason, reason) {
+                (Some(BlockedReason::Sleep), BlockedReason::Sleep) => {}
+                (_, BlockedReason::Sleep) => self.enqueue_wait(idx),
+                _ => {}
+            }
+            return;
+        }
+
+        // ここからは Running/Ready などから Blocked へ落とす通常パス
         self.tasks[idx].state = TaskState::Blocked;
         self.tasks[idx].blocked_reason = Some(reason);
         self.tasks[idx].time_slice_used = 0;
 
         self.push_event(LogEvent::TaskStateChanged(id, TaskState::Blocked));
 
-        match reason {
-            BlockedReason::Sleep => {
-                self.enqueue_wait(idx);
-            }
-            BlockedReason::IpcRecv { .. }
-            | BlockedReason::IpcSend { .. }
-            | BlockedReason::IpcReply { .. } => {}
+        if let BlockedReason::Sleep = reason {
+            self.enqueue_wait(idx);
         }
     }
 
@@ -1510,25 +1649,36 @@ impl KernelState {
         if self.tasks[idx].state == TaskState::Dead {
             return;
         }
-        if self.tasks[idx].state != TaskState::Blocked {
-            logging::error("wake_task_to_ready: target is not BLOCKED");
+
+        // 既に Ready/Running なら何もしない（重複投入を防ぐ）
+        if self.tasks[idx].state == TaskState::Ready || self.tasks[idx].state == TaskState::Running {
+            self.tasks[idx].blocked_reason = None;
             return;
         }
 
-        self.remove_task_from_endpoints(idx);
-
-        if self.tasks[idx].blocked_reason == Some(BlockedReason::Sleep) {
-            let _ = self.remove_from_wait_queue(idx);
-        }
-
-        let id = self.tasks[idx].id;
-
+        // Blocked から戻す
         self.tasks[idx].state = TaskState::Ready;
         self.tasks[idx].blocked_reason = None;
         self.tasks[idx].time_slice_used = 0;
 
-        self.push_event(LogEvent::TaskStateChanged(id, TaskState::Ready));
-        self.enqueue_ready(idx);
+        // ready_queue に二重投入しない
+        if !self.ready_queue_contains(idx) {
+            if self.rq_len < MAX_TASKS {
+                self.ready_queue[self.rq_len] = idx;
+                self.rq_len += 1;
+            }
+        }
+
+        self.push_event(LogEvent::TaskStateChanged(self.tasks[idx].id, TaskState::Ready));
+    }
+
+    fn ready_queue_contains(&self, idx: usize) -> bool {
+        for pos in 0..self.rq_len {
+            if self.ready_queue[pos] == idx {
+                return true;
+            }
+        }
+        false
     }
 
     fn maybe_block_task(&mut self, ran_idx: usize) -> bool {
@@ -1543,16 +1693,7 @@ impl KernelState {
             return false;
         }
 
-        if self.tick_count != 0
-            && self.tick_count % 7 == 0
-            && self.tasks[ran_idx].id.0 == 2
-        {
-            logging::info("blocking current task (fake I/O wait)");
-            self.block_current(BlockedReason::Sleep);
-            self.schedule_next_task();
-            return true;
-        }
-
+        // デモ安定化: fake I/O wait を無効化（IPC/スケジューラ観測に集中）
         false
     }
 
@@ -1969,13 +2110,31 @@ impl KernelState {
             }
             KernelAction::MemDemo => {
                 logging::info("action = MemDemo");
-                self.do_mem_demo();
+
+                // ring3_mailbox_loop: IPC の loop 検証が主目的なので mem_demo は止める
+                #[cfg(feature = "ring3_mailbox_loop")]
+                {
+                    logging::info("mem_demo skipped (ring3_mailbox_loop)");
+                }
+
+                #[cfg(not(feature = "ring3_mailbox_loop"))]
+                {
+                    self.do_mem_demo();
+                }
             }
         }
 
         if ran_idx < self.num_tasks && self.tasks[ran_idx].state == TaskState::Dead {
             logging::info("tick: running task died in this tick; skip syscall/runtime/quantum updates");
             self.activity = next_activity;
+
+            // ★保険：tick 終了時に current_task が RUNNING でなければスケジュールして整合を回復
+            if self.current_task < self.num_tasks && self.tasks[self.current_task].state != TaskState::Running {
+                logging::error("tick: current_task not RUNNING at end-of-tick; forcing schedule");
+                logging::info_u64("current_task", self.current_task as u64);
+                self.schedule_next_task();
+            }
+
             self.debug_check_invariants();
             return;
         }
@@ -1983,7 +2142,20 @@ impl KernelState {
         // 1 tick あたり syscall 実行は最大 1 回
         // - do_mem_demo() が pending_syscall を積む
         // - user_step_issue_syscall() も積みうる（ただし「すでに積まれてたら return」）
-        self.user_step_issue_syscall(ran_idx);
+        // 1 tick あたり syscall 実行は最大 1 回
+        // - ring3_mailbox_loop では Task1(User) は ring3 側が int80 経由で駆動するため、
+        //   カーネル内 user_program が last_reply を消費しないように Task1 をスキップする。
+        #[cfg(feature = "ring3_mailbox_loop")]
+        {
+            if ran_idx != TASK1_INDEX {
+                self.user_step_issue_syscall(ran_idx);
+            }
+        }
+
+        #[cfg(not(feature = "ring3_mailbox_loop"))]
+        {
+            self.user_step_issue_syscall(ran_idx);
+        }
 
         if ran_idx == self.current_task {
             self.handle_pending_syscall_if_any();

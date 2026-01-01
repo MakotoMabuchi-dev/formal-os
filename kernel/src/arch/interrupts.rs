@@ -16,11 +16,11 @@
 //
 // ★ring3 MVP（安定版）:
 // - “RAX を ring3 に返す” は x86-interrupt だと保証しづらい（レジスタを触れない）のでやらない。
-// - 代わりに kernel が user stack ([rsp-8]) に直接書き、次の int80 でそれを読み出して確認する。
+// - 代わりに kernel が user stack (ret_slot) に直接書く。
 // - iretq 前は必ず user_root に戻す（CR3 が kernel のままだと命令フェッチで #PF する）。
 //
 // 実装メモ:
-// - paging 側の take_* が “消費” API の場合があるので、ここで roots をキャッシュして使う。
+// - ring3_* デモは paging 側に (user_root, kernel_root) を登録し、ここから参照する。
 
 #![allow(dead_code)]
 
@@ -57,9 +57,14 @@ static IDT_HIGH: Mutex<Option<InterruptDescriptorTable>> = Mutex::new(None);
 static INT80_COUNT: AtomicU64 = AtomicU64::new(0);
 
 // ---- ring3 demo roots cache ----
-// paging 側が “消費 API” の場合に備え、ここで保持して毎回使えるようにする
 static DEMO_USER_ROOT_PHYS: AtomicU64 = AtomicU64::new(0);
 static DEMO_KERNEL_ROOT_PHYS: AtomicU64 = AtomicU64::new(0);
+
+// ---- debug: sys31 output counter ----
+// 目的: ring3_mailbox_loop で “返信が毎回返る” を観測する。
+// ログが多いなら上限を設ける（例: 最初の 64 回まで出す）。
+static DBG_SYS31_COUNT: AtomicU64 = AtomicU64::new(0);
+const DBG_SYS31_LIMIT: u64 = 64;
 
 fn cache_demo_roots_if_needed() -> Option<(crate::mem::addr::PhysFrame, crate::mem::addr::PhysFrame)> {
     use crate::mem::addr::{PhysFrame, PAGE_SIZE};
@@ -70,7 +75,6 @@ fn cache_demo_roots_if_needed() -> Option<(crate::mem::addr::PhysFrame, crate::m
         return Some((PhysFrame::from_index(u / PAGE_SIZE), PhysFrame::from_index(k / PAGE_SIZE)));
     }
 
-    // paging 側の “消費しない” 取得を優先（あなたの paging.rs に合わせる）
     let (user_root, kernel_root) = paging::peek_ring3_demo_roots()?;
 
     DEMO_USER_ROOT_PHYS.store(user_root.start_address().0, Ordering::Relaxed);
@@ -78,9 +82,6 @@ fn cache_demo_roots_if_needed() -> Option<(crate::mem::addr::PhysFrame, crate::m
 
     Some((user_root, kernel_root))
 }
-
-// kernel が user stack に書く固定値（観測用）
-const INT80_WRITE_VAL: u64 = 0x1122_3344_5566_7788u64;
 
 pub fn init() {
     interrupts::without_interrupts(|| {
@@ -94,12 +95,11 @@ pub fn init() {
             .set_handler_fn(general_protection_fault_handler);
         idt.double_fault.set_handler_fn(double_fault_handler);
 
-        // ring3 MVP: int 0x80
+        // ring3: int 0x80
         unsafe {
             idt[0x80]
                 .set_handler_fn(int80_handler)
                 .set_privilege_level(PrivilegeLevel::Ring3)
-                // ★重要: IST で受ける（RSP0 依存を避ける）
                 .set_stack_index(gdt::PAGE_FAULT_IST_INDEX);
         }
 
@@ -219,28 +219,35 @@ fn set_exception_rip(stack_frame: &mut InterruptStackFrame, new_rip: u64) {
         let p_isf: *mut InterruptStackFrame = stack_frame as *mut InterruptStackFrame;
         let p_u8: *mut u8 = p_isf as *mut u8;
         let p_val: *mut InterruptStackFrameValue = p_u8 as *mut InterruptStackFrameValue;
-
         (*p_val).instruction_pointer = VirtAddr::new(new_rip);
     }
 }
 
-// ---- handlers ----
+// ---- int80 handler ----
 
 extern "x86-interrupt" fn int80_handler(stack_frame: InterruptStackFrame) {
+    #[cfg(feature = "ring3_demo")]
+    {
+        int80_handler_ring3_demo(stack_frame);
+        return;
+    }
+
+    int80_handler_mailbox(stack_frame);
+}
+
+#[cfg(feature = "ring3_demo")]
+fn int80_handler_ring3_demo(stack_frame: InterruptStackFrame) {
     let n = INT80_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
 
     let user_rip = stack_frame.instruction_pointer.as_u64();
     let user_rsp = stack_frame.stack_pointer.as_u64();
 
-    // mailbox ABI（user stack 上）
-    // [rsp-16]=sysno, [rsp-24]=a0, [rsp-32]=a1, [rsp-40]=a2, [rsp-48]=ret_slot
-    let p_sysno   = (user_rsp.wrapping_sub(16)) as *const u64;
-    let p_a0      = (user_rsp.wrapping_sub(24)) as *const u64;
-    let p_a1      = (user_rsp.wrapping_sub(32)) as *const u64;
-    let p_a2      = (user_rsp.wrapping_sub(40)) as *const u64;
+    let p_sysno = (user_rsp.wrapping_sub(16)) as *const u64;
+    let p_a0 = (user_rsp.wrapping_sub(24)) as *const u64;
+    let p_a1 = (user_rsp.wrapping_sub(32)) as *const u64;
+    let p_a2 = (user_rsp.wrapping_sub(40)) as *const u64;
     let p_retslot = (user_rsp.wrapping_sub(48)) as *mut u64;
 
-    // user が ret_slot を読んで [rsp-8] にコピーした想定の観測スロット
     let p_user_echo = (user_rsp.wrapping_sub(8)) as *const u64;
 
     let (user_root, kernel_root) = match paging::peek_ring3_demo_roots() {
@@ -251,12 +258,11 @@ extern "x86-interrupt" fn int80_handler(stack_frame: InterruptStackFrame) {
         }
     };
 
-    // 1回目：sysno/args を読んで ret_slot に書く → ring3 へ戻す
     if n == 1 {
         let sysno = paging::guarded_user_read_u64_in_root(user_root, kernel_root, p_sysno).unwrap_or(0);
-        let a0    = paging::guarded_user_read_u64_in_root(user_root, kernel_root, p_a0).unwrap_or(0);
-        let a1    = paging::guarded_user_read_u64_in_root(user_root, kernel_root, p_a1).unwrap_or(0);
-        let a2    = paging::guarded_user_read_u64_in_root(user_root, kernel_root, p_a2).unwrap_or(0);
+        let a0 = paging::guarded_user_read_u64_in_root(user_root, kernel_root, p_a0).unwrap_or(0);
+        let a1 = paging::guarded_user_read_u64_in_root(user_root, kernel_root, p_a1).unwrap_or(0);
+        let a2 = paging::guarded_user_read_u64_in_root(user_root, kernel_root, p_a2).unwrap_or(0);
 
         emergency_write_str("[INT80] syscall enter\n");
         emergency_write_str(" rip="); emergency_write_hex_u64(user_rip);
@@ -268,18 +274,13 @@ extern "x86-interrupt" fn int80_handler(stack_frame: InterruptStackFrame) {
         emergency_write_str(" a2="); emergency_write_hex_u64(a2);
         emergency_write_str("\n");
 
-        // MVP: sysno==1 は add3、それ以外は 0
         let ret = if sysno == 1 { a0.wrapping_add(a1).wrapping_add(a2) } else { 0 };
-
-        // ret_slot に書く（戻り値はレジスタで返さない：mailbox で返す）
         let _ = paging::guarded_user_rw_u64_in_root(user_root, kernel_root, p_retslot, ret);
 
-        // iretq 前に user_root へ戻す（命令フェッチ事故を避ける）
         paging::switch_address_space_quiet(user_root);
         return;
     }
 
-    // 2回目：ring3 が ret_slot を読んで [rsp-8] に書いた値を kernel が読む → ring3 に戻す
     if n == 2 {
         emergency_write_str("[INT80] verify user_echo\n");
         emergency_write_str(" rip="); emergency_write_hex_u64(user_rip);
@@ -287,7 +288,6 @@ extern "x86-interrupt" fn int80_handler(stack_frame: InterruptStackFrame) {
         emergency_write_str("\n");
 
         let echo = paging::guarded_user_read_u64_in_root(user_root, kernel_root, p_user_echo).unwrap_or(0);
-
         emergency_write_str(" echo="); emergency_write_hex_u64(echo);
         emergency_write_str("\n");
 
@@ -295,7 +295,6 @@ extern "x86-interrupt" fn int80_handler(stack_frame: InterruptStackFrame) {
         return;
     }
 
-    // 3回目：最後にもう一回読んで表示して停止（停止点）
     emergency_write_str("[INT80] final\n");
     let echo = paging::guarded_user_read_u64_in_root(user_root, kernel_root, p_user_echo).unwrap_or(0);
     emergency_write_str(" echo="); emergency_write_hex_u64(echo);
@@ -304,10 +303,57 @@ extern "x86-interrupt" fn int80_handler(stack_frame: InterruptStackFrame) {
     crate::arch::halt_loop();
 }
 
-extern "x86-interrupt" fn page_fault_handler(
-    mut stack_frame: InterruptStackFrame,
-    error_code: PageFaultErrorCode,
-) {
+fn int80_handler_mailbox(stack_frame: InterruptStackFrame) {
+    let user_rsp = stack_frame.stack_pointer.as_u64();
+
+    // mailbox ABI offsets
+    const OFF_SYSNO: u64 = 16;
+    const OFF_A0: u64 = 24;
+    const OFF_A1: u64 = 32;
+    const OFF_A2: u64 = 40;
+    const OFF_RET: u64 = 48;
+
+    let p_sysno = (user_rsp.wrapping_sub(OFF_SYSNO)) as *const u64;
+    let p_a0 = (user_rsp.wrapping_sub(OFF_A0)) as *const u64;
+    let p_a1 = (user_rsp.wrapping_sub(OFF_A1)) as *const u64;
+    let p_a2 = (user_rsp.wrapping_sub(OFF_A2)) as *const u64;
+    let p_retslot = (user_rsp.wrapping_sub(OFF_RET)) as *mut u64;
+
+    let (user_root, kernel_root) = match cache_demo_roots_if_needed() {
+        Some(v) => v,
+        None => {
+            emergency_write_str("[INT80] roots: NONE\n");
+            crate::arch::halt_loop();
+        }
+    };
+
+    let sysno = paging::guarded_user_read_u64_in_root(user_root, kernel_root, p_sysno).unwrap_or(0);
+    let a0 = paging::guarded_user_read_u64_in_root(user_root, kernel_root, p_a0).unwrap_or(0);
+    let a1 = paging::guarded_user_read_u64_in_root(user_root, kernel_root, p_a1).unwrap_or(0);
+    let a2 = paging::guarded_user_read_u64_in_root(user_root, kernel_root, p_a2).unwrap_or(0);
+
+    let ret = crate::kernel::with_kernel_state(|ks| crate::kernel::mailbox_dispatch(ks, sysno, a0, a1, a2))
+        .unwrap_or(0);
+
+    // sysno=31 の戻り値を N 回まで emergency に出す（観測用）
+    if sysno == 31 {
+        let c = DBG_SYS31_COUNT.fetch_add(1, Ordering::Relaxed);
+        if c < DBG_SYS31_LIMIT {
+            emergency_write_str("[INT80] sys31 ret=");
+            emergency_write_hex_u64(ret);
+            emergency_write_str("\n");
+        }
+    }
+
+    let _ = paging::guarded_user_rw_u64_in_root(user_root, kernel_root, p_retslot, ret);
+
+    // iretq 前に user_root に戻す
+    paging::switch_address_space_quiet(user_root);
+}
+
+// ---- exception handlers ----
+
+extern "x86-interrupt" fn page_fault_handler(mut stack_frame: InterruptStackFrame, error_code: PageFaultErrorCode) {
     interrupts::disable();
 
     let cr2 = Cr2::read().unwrap_or(VirtAddr::new(0)).as_u64();
@@ -338,10 +384,7 @@ extern "x86-interrupt" fn page_fault_handler(
     crate::arch::halt_loop();
 }
 
-extern "x86-interrupt" fn general_protection_fault_handler(
-    stack_frame: InterruptStackFrame,
-    error_code: u64,
-) {
+extern "x86-interrupt" fn general_protection_fault_handler(stack_frame: InterruptStackFrame, error_code: u64) {
     interrupts::disable();
 
     emergency_write_str("[EXC] #GP err=");
@@ -355,10 +398,7 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     crate::arch::halt_loop();
 }
 
-extern "x86-interrupt" fn double_fault_handler(
-    stack_frame: InterruptStackFrame,
-    error_code: u64,
-) -> ! {
+extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame, error_code: u64) -> ! {
     interrupts::disable();
 
     emergency_write_str("[EXC] #DF err=");

@@ -22,26 +22,29 @@ evil_ipc = []
 pf_demo = []
 
 # --- IPC demo 専用（観測性・再現性のため） ---
-# - slow send を 1 回に固定し、以後は recv_waiter が居る時だけ send する
-# - Task1 の kick send を無効化してノイズを消す
 ipc_demo_single_slow = []
 
 # --- IPC 解析用（観測性を仕様にする） ---
-# syscall 境界の最小トレース（IPC の入口・出口）
 ipc_trace_syscall = []
-
-# send が fast/slow のどちらで処理されたか等 “path” まで追う拡張トレース
-# ipc_trace_syscall を内包して、paths を付けたら最低限の trace も必ず出るようにする
 ipc_trace_paths = ["ipc_trace_syscall"]
 
 # --- 互換 alias（古い呼び名が残ってても壊さない） ---
 evil_mem_double_map = ["evil_double_map"]
 
-# --- kill cleanup を検証するためのテスト用 ---
+# --- kill / IPC テスト用 ---
 kill_cleanup_test = []
-
 dead_partner_test = []
-
 endpoint_close_test = []
 
+# --- ring3 系（回帰テストと新経路の分離） ---
+# ring3_demo:
+# - “固定の検証ハーネス” (INT80_COUNT 1/2/3 回目でログが揃う)
+# - mailbox_dispatch 経路は使わない（壊さない最優先）
 ring3_demo = []
+
+# ring3_mailbox:
+# - ring3 に入り、int80 は “mailbox_dispatch 経路” を通す
+# - ただしログはハーネス方式で確認できる（回帰しやすい）
+ring3_mailbox = []
+ring3_mailbox_loop = []
+ring3_mailbox_loop_skip_rx = []
